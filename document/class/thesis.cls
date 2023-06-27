@@ -13,14 +13,14 @@
 \ProvidesClass{class/thesis}[2021/04/29 Template for theses]
 
 % Use book class as base
-\LoadClass[12pt,twoside,a4paper]{book}
+\LoadClass[12pt,onside,openany,a4paper]{book}
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % Packages
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-\RequirePackage[left=3cm, right=2.5cm, top=3cm, bottom=2.5cm]{geometry}
+\RequirePackage[left=2.5cm, right=2.5cm, top=3cm, bottom=2.5cm]{geometry}
 
 \RequirePackage[utf8]{inputenc}
 \RequirePackage[T1]{fontenc}
@@ -89,6 +89,7 @@
 \newcommand{\translatedepartment}{}
 \newcommand{\translatedeclaration}{}
 \newcommand{\translatedeclarationtitle}{}
+\newcommand{\translatedlistofalgorithms}{}
 
 \addto\captionsenglish{
   \SetAlgorithmName{Algorithm}{Algorithm}{List of Algorithms}
@@ -103,12 +104,13 @@
   \renewcommand{\translatefrom}{from}
   \renewcommand{\translateuniversityname}{Heinrich Heine University Düsseldorf}
   \renewcommand{\translatedepartment}{Department Operating Systems}
+  \renewcommand{\translatedlistofalgorithms}{List of Algorithms}
   \renewcommand{\translatedeclarationtitle}{Statutory Declaration}
   \renewcommand{\translatedeclaration}{I hereby state that I have written this {\thesistypename} independently and that I have not used any sources or aids other than those declared. All passages taken from the literature have been marked as such. This thesis has not yet been submitted to any examination authority in the same or a similar form.}
 }
 
 \addto\captionsngerman{
-  \SetAlgorithmName{Algorithmus}{Algorithmus}{Algorithmenverzeichniss}
+  \SetAlgorithmName{Algorithmus}{Algorithmus}{Algorithmenverzeichnis}
   \renewcommand{\chaptername}{Kapitel}
   \renewcommand{\translatemastersthesis}{Masterarbeit}
   \renewcommand{\translatebachelorsthesis}{Bachelorarbeit}
@@ -120,6 +122,7 @@
   \renewcommand{\translatefrom}{aus}
   \renewcommand{\translateuniversityname}{Heinrich-Heine-Universität Düsseldorf}
   \renewcommand{\translatedepartment}{Abteilung Betriebssysteme}
+  \renewcommand{\translatedlistofalgorithms}{Algorithmenverzeichnis}
   \renewcommand{\translatedeclarationtitle}{Ehrenwörtliche Erklärung}
   \renewcommand{\translatedeclaration}{Hiermit versichere ich, die vorliegende {\thesistypename} selbstständig verfasst und keine anderen als die angegebenen Quellen und Hilfsmittel benutzt zu haben. Alle Stellen, die aus den Quellen entnommen wurden, sind als solche kenntlich gemacht worden. Diese Arbeit hat in gleicher oder ähnlicher Form noch keiner Prüfungsbehörde vorgelegen.}
 }
@@ -217,33 +220,34 @@
 
 \newenvironment{thesis}
 {
-  
+
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
   % Global options
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-  
+
   \setlength{\parindent}{0pt}
-  
+
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
   % Disable fancy headers
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-  
+
   \pagestyle{empty}
   \pagenumbering{gobble}
-  
+
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
   % Title page
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-  
+
   \thesiscover
+  \clearpage
 
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
   % Table of contents
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
   \tableofcontents
-  \cleardoublepage
-  
+  \clearpage
+
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
   % Re-enable fancy headers
   %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -252,30 +256,34 @@
   \pagestyle{thesis}
 }
 {
+  \addcontentsline{toc}{chapter}{\bibname}
   \printbibliography
-  \cleardoublepage
-  
+  \clearpage
+
   \ifthenelse{\equal{\@listoffiguresenabled}{true}}
   {%
+    \addcontentsline{toc}{chapter}{\listfigurename}
     \listoffigures
-    \cleardoublepage
+    \clearpage
   }%
   {}
-  
+
   \ifthenelse{\equal{\@listoftablesenabled}{true}}
   {%
+    \addcontentsline{toc}{chapter}{\listtablename}
     \listoftables
-    \cleardoublepage
+    \clearpage
   }%
   {}
-  
+
   \ifthenelse{\equal{\@listofalgorithmsenabled}{true}}
   {%
+    \addcontentsline{toc}{chapter}{\translatedlistofalgorithms}
     \listofalgorithms
-    \cleardoublepage
+    \clearpage
   }%
   {}
-  
+
   \declaration
 }
 
@@ -285,9 +293,8 @@
 
 \newcommand{\thesiscover}
 {
+  \newgeometry{left=2.5cm,right=2.5cm,top=3cm}
   \begin{titlepage}
-
-    \newgeometry{left=2.5cm,right=2.5cm,top=3cm}
 
     \begin{center}
 
@@ -300,15 +307,8 @@
       \vspace{0.75cm}
 
       % Thesis title
-      \rule{\textwidth}{0.25mm}\\
-      \vspace{-5pt}
-      \rule{\textwidth}{0.8mm}\\
-
-      {\Huge \textsc{\@title\\}}
-
-      \rule{\textwidth}{0.8mm}\\
-      \vspace{-5pt}
-      \rule{\textwidth}{0.25mm}
+      \vspace{4.5em}
+      {\Huge \@title\\}
 
       \vspace{7.5em}
 
@@ -346,7 +346,7 @@
     \end{center}
 
   \end{titlepage}
-  \clearpage{\pagestyle{empty}\cleardoublepage}
+  \restoregeometry
 }
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -357,13 +357,6 @@
 {
   \bibliography{\literaturebibtexdatei}
   \bibliographystyle{plain}
-
-  \addcontentsline{toc}{chapter}{Literaturverzeichnis}
-  \cleardoublepage
-  \bibliography{\literaturebibtexdatei}
-  \bibliographystyle{plain}
-
-  \clearpage{\pagestyle{empty}\cleardoublepage}
 }
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -372,26 +365,27 @@
 
 \newcommand{\declaration}
 {
-  \cleardoublepage
-  \pagestyle{empty}
-  \huge
-  \noindent\textbf{\translatedeclarationtitle}
 
-  \large
-  \vspace{3cm}
-  {\noindent\translatedeclaration}
+    \thispagestyle{empty}
+    \pagenumbering{gobble}
 
-  \vspace{4cm}
-  \begin{center}
-    \begin{tabular}{lc}
-      Düsseldorf, \@date \hspace{1.5cm} & \hspace{7cm} \\[-10pt]
-                                        & \hrulefill \\
-                                        & \@author
-\\
-    \end{tabular}
-  \end{center}
+    \vspace*{6em}
 
-  \clearpage{\pagestyle{empty}\cleardoublepage}
+    \huge
+    \noindent\textbf{\translatedeclarationtitle}
+
+    \large
+    \vspace{3cm}
+    {\noindent\translatedeclaration}
+
+    \vspace{4cm}
+    \begin{center}
+      \begin{tabular}{lc}
+        Düsseldorf, \@date \hspace{1.5cm} & \hspace{7cm} \\[-10pt]
+        & \hrulefill \\
+        & \@author \\
+      \end{tabular}
+    \end{center}
 }
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
