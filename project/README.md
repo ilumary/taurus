@@ -1,7 +1,7 @@
 <h1>
   <br>
   <br>
-  Taurus
+  Taurus (Bachelor Thesis)
   <br>
 </h1>
 
@@ -19,7 +19,6 @@
 ## Key Features (In Development)
 
 * QUIC 1-RTT Handshake 
-* 0-RTT Connection Resumption
 * Full TLS 1.3 Integration using <a href="https://github.com/rustls/rustls">rustls</a>  
 * Server and Client API for easy integration with HTTP/3 or other Application Protocols
 
@@ -29,15 +28,15 @@ Building requires a recent version of rustc (1.72.0) :
 
 ```bash
 # Clone this repository
-$ git clone https://github.com/ilumary/taurus
-$ cd taurus
+$ git clone https://git.hhu.de/bsinfo/thesis/ba-chbri104.git
+$ cd ba-chbri104/project/
 
 # Run
 $ cargo run
 ```
 
 > **Note**
-> Due to me not having access to a Windows computer, Windows can't officially be supported. But this being Rust, one can expect this to run normal under Windows.
+> Windows can't be officially supported. Rust should work cross platform though.
 
 ## Credits
 
@@ -49,13 +48,6 @@ This software uses the following open source packages:
 ## Collaborators
 
 [ilumary](https://github.com/ilumary) - Me
-
-## Support
-
-<a href="paypal.me/christophbritsch">
-	<img src="https://www.paypalobjects.com/webstatic/de_DE/i/de-pp-logo-150px.png" width="150">
-</a>
-
 
 ## License
 
