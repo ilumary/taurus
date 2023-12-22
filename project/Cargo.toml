@@ -1,0 +1,19 @@
+[package]
+name = "taurus"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "quic"
+path = "src/quic/lib.rs"
+
+[[bin]]
+name = "quic_bin"
+path = "src/main.rs"
+
+[dependencies]
+octets = "0.2.0"
+rustls = {version = "0.21.7", features = ["quic"]}
+rcgen = "0.12.0"
