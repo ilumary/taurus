@@ -1,19 +1,30 @@
 #![allow(dead_code)]
 
+mod quic_error;
+mod transport_parameters;
+
 use octets::{BufferTooShortError, OctetsMut};
+use rand::RngCore;
 use rustls::quic::{Connection as RustlsConnection, HeaderProtectionKey, Keys, Version};
-use std::net::{SocketAddr, UdpSocket};
+use std::{
+    collections::HashMap,
+    fmt,
+    net::{SocketAddr, UdpSocket},
+};
 
 const LS_TYPE_BIT: u8 = 0x80;
 const TYPE_MASK: u8 = 0x30;
 const PKT_NUM_LENGTH_MASK: u8 = 0x03;
 
 const MAX_PKT_NUM_LEN: usize = 4;
+const MAX_CID_SIZE: usize = 20;
 const SAMPLE_LEN: usize = 16;
 
 //most systems default to IPv6
 const MAX_PACKET_SIZE_IPV4: usize = 1472;
 const MAX_PACKET_SIZE_IPV6: usize = 1330;
+
+type Handle = usize;
 
 /*
  * Primary object in library. Can be contructed as client or server. Can accept incoming
@@ -21,7 +32,14 @@ const MAX_PACKET_SIZE_IPV6: usize = 1330;
  */
 pub struct Endpoint {
     socket: UdpSocket,
+    socket_addr: SocketAddr,
+
+    //server config for rustls. Will have to be updated to allow client side endpoint
     server_config: Option<rustls::ServerConfig>,
+
+    //stores connection handles
+    conn_db: HashMap<ConnectionId, Handle>,
+    connections: Vec<Connection>,
 }
 
 impl Endpoint {
@@ -46,7 +64,10 @@ impl Endpoint {
 
         Endpoint {
             socket: UdpSocket::bind(addr).expect("Error: couldn't bind UDP socket to address"),
+            socket_addr: addr.parse().unwrap(),
             server_config: Some(server_cfg),
+            conn_db: HashMap::new(),
+            connections: Vec::new(),
         }
     }
 
@@ -54,9 +75,10 @@ impl Endpoint {
         panic!("Client endpoint not yet implemented!")
     }
 
+    // handles a single incoming UDP datagram
     pub fn recv(&mut self) {
-        // TODO: handle coalescing inital, 0-rtt and handshake packets
-        let mut buffer = [0u8; MAX_PACKET_SIZE_IPV6];
+        // TODO: handle coalescing inital, 0-rtt and handshake packets, max udp packet size is 65kb
+        let mut buffer = [0u8; 65536];
 
         let (size, src_addr) = match self.socket.recv_from(&mut buffer) {
             Ok((size, src_addr)) => (size, src_addr),
@@ -76,28 +98,38 @@ impl Endpoint {
             Err(error) => panic!("Error: {}", error),
         };
 
+        //match connection if one already exists
+        if let Some(h) =
+            self.get_connection_handle(&head.dcid, &src_addr, ((head.hf & LS_TYPE_BIT) >> 7) != 0)
+        {
+            //connection exists, pass packet to connection
+            println!("Found existing connection for {}", &head.dcid);
+            match self.connections.get_mut(h).unwrap().recv() {
+                Ok(()) => return,
+                Err(error) => panic!("Error processing packet: {}", error),
+            }
+        }
+
+        //handle new connection
+
         //get initial keys
         let ikp = Keys::initial(Version::V1, &head.dcid.id, rustls::Side::Server);
 
         match head.decrypt(&mut octet_buffer, ikp.remote.header) {
-            Ok(_) => (),
+            Ok(_) => {
+                head.debug_print();
+            }
             Err(error) => panic!("Error: {}", error),
         }
 
-        head.debug_print();
-
-        //println!("\n{:x?}", octet_buffer); //offset #1c = 28
-
         let (header_raw, mut payload_cipher) = octet_buffer.split_at(head.length).unwrap();
-        //println!("\nHEAD DECRYPTED\n{:x?}", header_raw);
-        //println!("{:x?}", payload_cipher);
 
         //cut off trailing 0s from buffer
         let (mut payload_cipher, _) = payload_cipher
             .split_at(head.packet_length - head.packet_num_length)
             .unwrap();
 
-        // payload cipher must be exact size without zeros from the buffer beeing to big!
+        //payload cipher must be exact size without zeros from the buffer beeing to big!
         match ikp.remote.packet.decrypt_in_place(
             head.packet_num.into(),
             header_raw.as_ref(),
@@ -107,8 +139,9 @@ impl Endpoint {
             Err(error) => panic!("Error decrypting packet body {}", error),
         };
 
-        println!("\nBODY DECRYPTED\n{:x?}", header_raw);
-        println!("{:x?}", payload_cipher);
+        let new_connection_handle = self.connections.len();
+        let loc_cid = ConnectionId::generate_with_length(head.dcid.len());
+        let orig_dcid = head.dcid.clone();
 
         let mut conn = RustlsConnection::Server(
             rustls::quic::ServerConnection::new(
@@ -125,18 +158,19 @@ impl Endpoint {
                 Ok(0x06) => {
                     // CRYPTO_FRAME
                     println!("Discovered Crypto frame...");
-                    //let _ = octet_buffer.get_u8();
-                    //let offset = octet_buffer.get_varint().unwrap();
-                    //let length = octet_buffer.get_varint().unwrap();
-                    //println!("0x06 off:{:?} len:{:?}", offset, length);
-                    //let frame = octet_buffer.get_bytes(length as usize).unwrap();
-                    //println!("\nCrypto Frame:\n{:x?}", frame);
-                    match conn.read_hs(octet_buffer.as_ref()) {
+                    let frame = octet_buffer.get_u8().unwrap();
+                    let off = octet_buffer.get_varint().unwrap();
+                    let len = octet_buffer.get_varint().unwrap();
+                    let tp = transport_parameters::TransportParameter::decode(&mut octet_buffer)
+                        .unwrap();
+                    println!("{}", tp);
+
+                    /*match conn.read_hs(octet_buffer.as_ref()) {
                         Ok(_) => (),
                         Err(error) => panic!("Error while consuming handshake data {}", error),
                     };
 
-                    println!("{:x?}", conn.quic_transport_parameters());
+                    println!("{:x?}", conn.quic_transport_parameters());*/
                     break;
                 }
                 Ok(0x00) => {
@@ -147,12 +181,33 @@ impl Endpoint {
         }
     }
 
-    pub fn _send(&mut self) {}
+    fn get_connection_handle(
+        &self,
+        dcid: &ConnectionId,
+        _remote: &SocketAddr,
+        _is_inital_or_0rtt: bool,
+    ) -> Option<Handle> {
+        //TODO check for inital dcids, only remote for cid-less connections
+        if dcid.len() != 0 {
+            if let Some(c) = self.conn_db.get(dcid) {
+                return Some(*c);
+            }
+        }
+        None
+    }
+
+    fn create_connection(&mut self) -> Result<Handle, quic_error::Error> {
+        Ok(0)
+    }
+
+    pub fn _send() {}
 }
 
 pub struct Connection {
     // tls13 session via rustls
-    tls_session: RustlsConnection,
+    tls_session: Option<RustlsConnection>,
+    next_secrets: Option<rustls::quic::Secrets>,
+    handshake_data_received: bool,
 
     // Connection Identifiers
     scids: Vec<ConnectionId>,
@@ -161,7 +216,7 @@ pub struct Connection {
     // First Destination Connection Id
     fdcid: ConnectionId,
     // Retry Source Connection Id
-    rscid: ConnectionId,
+    rscid: Option<ConnectionId>,
 
     next_packet_num: u64,
 
@@ -180,6 +235,43 @@ pub struct Connection {
     handshake_done_ackd: bool,
 
     initial_keyset: Option<Keys>,
+}
+
+impl Connection {
+    pub fn new() -> Self {
+        Connection {
+            tls_session: None,
+            next_secrets: None,
+            handshake_data_received: false,
+            scids: Vec::new(),
+            dcids: Vec::new(),
+            fdcid: vec![0, 0, 0, 0].into(),
+            rscid: None,
+            next_packet_num: 1,
+            phys_address: SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                1234,
+            ),
+            recved: 0,
+            sent: 0,
+            lost: 0,
+            initial_keyset_generated: false,
+            handshake_done: false,
+            handshake_done_sent: false,
+            handshake_done_ackd: false,
+            initial_keyset: None,
+        }
+    }
+
+    pub fn recv(&mut self) -> Result<(), quic_error::Error> {
+        Ok(())
+    }
+
+    pub fn accept() -> Result<(), quic_error::Error> {
+        Ok(())
+    }
+
+    pub fn _send() {}
 }
 
 struct Header {
@@ -318,15 +410,41 @@ impl Header {
     }
 }
 
+#[derive(Eq, Hash, PartialEq, Clone)]
 struct ConnectionId {
     id: Vec<u8>,
 }
 
 impl ConnectionId {
-    /// Creates a new connection ID from the given vector.
     #[inline]
     pub const fn from_vec(cid: Vec<u8>) -> Self {
         Self { id: cid }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.id.len()
+    }
+
+    pub fn generate_with_length(length: usize) -> Self {
+        assert!(length <= MAX_CID_SIZE);
+        let mut b = [0u8; MAX_CID_SIZE];
+        rand::thread_rng().fill_bytes(&mut b[..length]);
+        ConnectionId::from_vec(b[..length].into())
+    }
+}
+
+impl fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "0x{}",
+            self.id
+                .iter()
+                .map(|val| format!("{:x}", val))
+                .collect::<Vec<String>>()
+                .join("")
+        )
     }
 }
 
