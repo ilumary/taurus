@@ -413,3 +413,6 @@ $RECYCLE.BIN/
 
 # Ignore compiled pdf document
 thesis.pdf
+
+#ignore saved reference
+old_reference

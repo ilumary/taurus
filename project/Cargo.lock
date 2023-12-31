@@ -233,6 +233,7 @@ dependencies = [
  "octets",
  "rand",
  "rcgen",
+ "ring",
  "rustls",
 ]
 

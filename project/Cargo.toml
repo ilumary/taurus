@@ -18,3 +18,4 @@ octets = "0.2.0"
 rustls = {version = "0.21.7", features = ["quic"]}
 rcgen = "0.12.0"
 rand = "0.8.5"
+ring = "0.17.7"

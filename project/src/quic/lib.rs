@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod quic_error;
+mod token;
 mod transport_parameters;
 
 use octets::{BufferTooShortError, OctetsMut};
@@ -27,7 +28,7 @@ const MAX_PACKET_SIZE_IPV6: usize = 1330;
 type Handle = usize;
 
 /*
- * Primary object in library. Can be contructed as client or server. Can accept incoming
+ * Primary object in library. Can act as client or server. Can accept incoming
  * connections or connect to a server.
  */
 pub struct Endpoint {
@@ -36,6 +37,8 @@ pub struct Endpoint {
 
     //server config for rustls. Will have to be updated to allow client side endpoint
     server_config: Option<rustls::ServerConfig>,
+    //RFC 2104, used to generate reset tokens from connection ids
+    hmac_reset_key: ring::hmac::Key,
 
     //stores connection handles
     conn_db: HashMap<ConnectionId, Handle>,
@@ -62,10 +65,14 @@ impl Endpoint {
             .unwrap();
         server_cfg.max_early_data_size = u32::MAX;
 
+        let mut hmac_reset_key = [0u8; 64];
+        rand::thread_rng().fill_bytes(&mut hmac_reset_key);
+
         Endpoint {
             socket: UdpSocket::bind(addr).expect("Error: couldn't bind UDP socket to address"),
             socket_addr: addr.parse().unwrap(),
             server_config: Some(server_cfg),
+            hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
             conn_db: HashMap::new(),
             connections: Vec::new(),
         }
@@ -140,14 +147,30 @@ impl Endpoint {
         };
 
         let new_connection_handle = self.connections.len();
-        let loc_cid = ConnectionId::generate_with_length(head.dcid.len());
+        let initial_scid = ConnectionId::generate_with_length(head.dcid.len());
         let orig_dcid = head.dcid.clone();
 
-        let mut conn = RustlsConnection::Server(
+        let mut transport_config = transport_parameters::TransportConfig::default();
+        transport_config
+            .original_destination_connection_id(orig_dcid.id())
+            .initial_source_connection_id(initial_scid.id())
+            .stateless_reset_token(
+                token::StatelessResetToken::new(&self.hmac_reset_key, &initial_scid)
+                    .token
+                    .to_vec(),
+            );
+
+        //Allocate byte buffer and encode transport config to create rustls connection
+        let mut buf = [0u8; 1024];
+        let mut param_buffer = OctetsMut::with_slice(&mut buf);
+        transport_config.encode(&mut param_buffer).unwrap();
+        let (data, _) = param_buffer.split_at(param_buffer.off()).unwrap();
+
+        let conn = RustlsConnection::Server(
             rustls::quic::ServerConnection::new(
                 std::sync::Arc::new(self.server_config.as_ref().unwrap().clone()),
                 rustls::quic::Version::V1,
-                vec![],
+                data.to_vec(),
             )
             .unwrap(),
         );
@@ -411,7 +434,7 @@ impl Header {
 }
 
 #[derive(Eq, Hash, PartialEq, Clone)]
-struct ConnectionId {
+pub struct ConnectionId {
     id: Vec<u8>,
 }
 
@@ -424,6 +447,16 @@ impl ConnectionId {
     #[inline]
     pub fn len(&self) -> usize {
         self.id.len()
+    }
+
+    #[inline]
+    pub fn as_arr(&self) -> &[u8] {
+        &self.id
+    }
+
+    #[inline]
+    pub fn id(&self) -> &Vec<u8> {
+        &self.id
     }
 
     pub fn generate_with_length(length: usize) -> Self {
