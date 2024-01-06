@@ -1,12 +1,13 @@
-#![allow(dead_code)]
-
 mod quic_error;
 mod token;
 mod transport_parameters;
 
 use octets::{BufferTooShortError, OctetsMut};
 use rand::RngCore;
-use rustls::quic::{Connection as RustlsConnection, HeaderProtectionKey, Keys, Version};
+use rustls::{
+    quic::{Connection as RustlsConnection, HeaderProtectionKey, Keys, Version},
+    Side,
+};
 use std::{
     collections::HashMap,
     fmt,
@@ -122,7 +123,7 @@ impl Endpoint {
         //get initial keys
         let ikp = Keys::initial(Version::V1, &head.dcid.id, rustls::Side::Server);
 
-        match head.decrypt(&mut octet_buffer, ikp.remote.header) {
+        match head.decrypt(&mut octet_buffer, &ikp.remote.header) {
             Ok(_) => {
                 head.debug_print();
             }
@@ -146,16 +147,15 @@ impl Endpoint {
             Err(error) => panic!("Error decrypting packet body {}", error),
         };
 
-        let new_connection_handle = self.connections.len();
-        let initial_scid = ConnectionId::generate_with_length(head.dcid.len());
+        let initial_local_scid = ConnectionId::generate_with_length(head.dcid.len());
         let orig_dcid = head.dcid.clone();
 
         let mut transport_config = transport_parameters::TransportConfig::default();
         transport_config
             .original_destination_connection_id(orig_dcid.id())
-            .initial_source_connection_id(initial_scid.id())
+            .initial_source_connection_id(initial_local_scid.id())
             .stateless_reset_token(
-                token::StatelessResetToken::new(&self.hmac_reset_key, &initial_scid)
+                token::StatelessResetToken::new(&self.hmac_reset_key, &initial_local_scid)
                     .token
                     .to_vec(),
             );
@@ -175,8 +175,145 @@ impl Endpoint {
             .unwrap(),
         );
 
-        // handle frames
-        loop {
+        let new_ch = self
+            .create_connection(
+                Side::Server,
+                orig_dcid,
+                head.scid,
+                initial_local_scid,
+                conn,
+                ikp,
+                src_addr,
+            )
+            .unwrap();
+
+        //accept new connection
+        match self.connections.get_mut(new_ch).unwrap().accept() {
+            Ok(()) => (),
+            Err(error) => panic!("Error processing packet: {}", error),
+        }
+    }
+
+    fn get_connection_handle(
+        &self,
+        dcid: &ConnectionId,
+        _remote: &SocketAddr,
+        _is_inital_or_0rtt: bool,
+    ) -> Option<Handle> {
+        //TODO check for inital dcids, only remote for cid-less connections
+        if dcid.len() != 0 {
+            if let Some(c) = self.conn_db.get(dcid) {
+                return Some(*c);
+            }
+        }
+        None
+    }
+
+    fn create_connection(
+        &mut self,
+        side: Side,
+        inital_dcid: ConnectionId,
+        inital_scid: ConnectionId,
+        inital_loc_scid: ConnectionId,
+        tls_session: RustlsConnection,
+        inital_keyset: Keys,
+        remote: SocketAddr,
+    ) -> Result<Handle, quic_error::Error> {
+        //generate new handle
+        let new_connection_handle = self.connections.len();
+        self.conn_db
+            .insert(inital_dcid.clone(), new_connection_handle)
+            .unwrap();
+
+        self.connections.push(Connection::new(
+            side,
+            tls_session,
+            inital_keyset,
+            inital_dcid,
+            inital_scid,
+            inital_loc_scid,
+            remote,
+        ));
+
+        Ok(new_connection_handle)
+    }
+
+    //terminate all connections
+    pub fn _close_endpoint() {}
+
+    pub fn _send() {}
+}
+
+pub struct Connection {
+    //side
+    side: Side,
+
+    //tls13 session via rustls
+    tls_session: RustlsConnection,
+    next_secrets: Option<rustls::quic::Secrets>,
+    handshake_data_received: bool,
+    initial_keyset: Keys,
+
+    //active connection ids
+    active_cids: Vec<ConnectionId>,
+
+    // First received dcid
+    initial_dcid: ConnectionId,
+    // First received scid
+    initial_remote_scid: ConnectionId,
+    // First generated scid after handshake receive
+    initial_local_scid: ConnectionId,
+    // Retry Source Connection Id
+    rscid: Option<ConnectionId>,
+
+    next_packet_num: u64,
+
+    // Physical address of connection peer
+    remote: SocketAddr,
+
+    // Packet stats
+    recved: u64,
+    sent: u64,
+    lost: u64,
+
+    //0-Rtt enabled
+    zero_rtt_enabled: bool,
+}
+
+impl Connection {
+    pub fn new(
+        side: Side,
+        tls_session: RustlsConnection,
+        initial_keyset: Keys,
+        initial_dcid: ConnectionId,
+        initial_remote_scid: ConnectionId,
+        initial_local_scid: ConnectionId,
+        remote_address: SocketAddr,
+    ) -> Self {
+        Connection {
+            side,
+            tls_session,
+            next_secrets: None,
+            handshake_data_received: false,
+            initial_keyset,
+            active_cids: vec![initial_remote_scid.clone()],
+            initial_dcid,
+            initial_remote_scid,
+            initial_local_scid,
+            rscid: None,
+            next_packet_num: 1,
+            remote: remote_address,
+            recved: 0,
+            sent: 0,
+            lost: 0,
+            zero_rtt_enabled: false,
+        }
+    }
+
+    //maybe return "answer" struct which is again handled in endpoint to avoid passing endoint
+    //reference to connection
+    pub fn recv(&mut self) -> Result<(), quic_error::Error> {
+        /*loop {
             match octet_buffer.peek_u8() {
                 Ok(0x06) => {
                     // CRYPTO_FRAME
@@ -197,100 +334,16 @@ impl Endpoint {
                     break;
                 }
                 Ok(0x00) => {
-                    break;
+                    continue;
                 }
                 _ => panic!("Fatal Error while parsing frames: unknown frame type"),
             }
-        }
-    }
+        }*/
 
-    fn get_connection_handle(
-        &self,
-        dcid: &ConnectionId,
-        _remote: &SocketAddr,
-        _is_inital_or_0rtt: bool,
-    ) -> Option<Handle> {
-        //TODO check for inital dcids, only remote for cid-less connections
-        if dcid.len() != 0 {
-            if let Some(c) = self.conn_db.get(dcid) {
-                return Some(*c);
-            }
-        }
-        None
-    }
-
-    fn create_connection(&mut self) -> Result<Handle, quic_error::Error> {
-        Ok(0)
-    }
-
-    pub fn _send() {}
-}
-
-pub struct Connection {
-    // tls13 session via rustls
-    tls_session: Option<RustlsConnection>,
-    next_secrets: Option<rustls::quic::Secrets>,
-    handshake_data_received: bool,
-
-    // Connection Identifiers
-    scids: Vec<ConnectionId>,
-    dcids: Vec<ConnectionId>,
-
-    // First Destination Connection Id
-    fdcid: ConnectionId,
-    // Retry Source Connection Id
-    rscid: Option<ConnectionId>,
-
-    next_packet_num: u64,
-
-    // Physical address of connection peer
-    phys_address: SocketAddr,
-
-    // Packet stats
-    recved: u64,
-    sent: u64,
-    lost: u64,
-
-    // Handshake progress
-    initial_keyset_generated: bool,
-    handshake_done: bool,
-    handshake_done_sent: bool,
-    handshake_done_ackd: bool,
-
-    initial_keyset: Option<Keys>,
-}
-
-impl Connection {
-    pub fn new() -> Self {
-        Connection {
-            tls_session: None,
-            next_secrets: None,
-            handshake_data_received: false,
-            scids: Vec::new(),
-            dcids: Vec::new(),
-            fdcid: vec![0, 0, 0, 0].into(),
-            rscid: None,
-            next_packet_num: 1,
-            phys_address: SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-                1234,
-            ),
-            recved: 0,
-            sent: 0,
-            lost: 0,
-            initial_keyset_generated: false,
-            handshake_done: false,
-            handshake_done_sent: false,
-            handshake_done_ackd: false,
-            initial_keyset: None,
-        }
-    }
-
-    pub fn recv(&mut self) -> Result<(), quic_error::Error> {
         Ok(())
     }
 
-    pub fn accept() -> Result<(), quic_error::Error> {
+    pub fn accept(&mut self) -> Result<(), quic_error::Error> {
         Ok(())
     }
 
@@ -319,7 +372,7 @@ impl Header {
     pub fn decrypt(
         &mut self,
         b: &mut octets::OctetsMut,
-        header_key: HeaderProtectionKey,
+        header_key: &HeaderProtectionKey,
     ) -> Result<(), BufferTooShortError> {
         let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN + SAMPLE_LEN)?;
         let (mut pn_cipher, sample) = pn_and_sample.split_at(MAX_PKT_NUM_LEN)?;
