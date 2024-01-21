@@ -12,3 +12,16 @@ impl StatelessResetToken {
         Self { token: result }
     }
 }
+
+impl From<Vec<u8>> for StatelessResetToken {
+    fn from(v: Vec<u8>) -> Self {
+        StatelessResetToken {
+            token: v.try_into().unwrap_or_else(|v: Vec<u8>| {
+                panic!(
+                    "Error converting vec of length {} to array of length 0x10",
+                    v.len()
+                )
+            }),
+        }
+    }
+}

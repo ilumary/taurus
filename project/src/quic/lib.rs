@@ -1,7 +1,12 @@
+mod frame;
 mod quic_error;
 mod token;
 mod transport_parameters;
 
+use crate::frame::Frame;
+use frame::{
+    AckFrame, ConnectionCloseFrame, CryptoFrame, NewConnectionIdFrame, NewTokenFrame, StreamFrame,
+};
 use octets::{BufferTooShortError, OctetsMut};
 use rand::RngCore;
 use rustls::{
@@ -101,6 +106,8 @@ impl Endpoint {
 
         //println!("\nRAW\n{:x?}", octet_buffer); // offset 0
 
+        //check if most significant bit is 1 or 0, if 0 => short packet => have to get cid len
+        //somehow
         let mut head: Header = match Header::parse_from_bytes(&mut octet_buffer, 0) {
             Ok(h) => h,
             Err(error) => panic!("Error: {}", error),
@@ -112,7 +119,12 @@ impl Endpoint {
         {
             //connection exists, pass packet to connection
             println!("Found existing connection for {}", &head.dcid);
-            match self.connections.get_mut(h).unwrap().recv() {
+            match self
+                .connections
+                .get_mut(h)
+                .unwrap()
+                .recv(&head, &mut octet_buffer)
+            {
                 Ok(()) => return,
                 Err(error) => panic!("Error processing packet: {}", error),
             }
@@ -121,7 +133,7 @@ impl Endpoint {
         //handle new connection
 
         //get initial keys
-        let ikp = Keys::initial(Version::V1, &head.dcid.id, rustls::Side::Server);
+        let ikp = Keys::initial(Version::V1, &head.dcid.id, Side::Server);
 
         match head.decrypt(&mut octet_buffer, &ikp.remote.header) {
             Ok(_) => {
@@ -175,20 +187,31 @@ impl Endpoint {
             .unwrap(),
         );
 
+        let initial_space: PacketSpace = PacketSpace {
+            keys: Some(Keys::initial(Version::V1, &head.dcid.id, Side::Server)),
+            ..PacketSpace::new()
+        };
+
         let new_ch = self
             .create_connection(
                 Side::Server,
                 orig_dcid,
-                head.scid,
+                head.scid.clone(),
                 initial_local_scid,
                 conn,
                 ikp,
+                initial_space,
                 src_addr,
             )
             .unwrap();
 
         //accept new connection
-        match self.connections.get_mut(new_ch).unwrap().accept() {
+        match self
+            .connections
+            .get_mut(new_ch)
+            .unwrap()
+            .accept(&head, &mut payload_cipher)
+        {
             Ok(()) => (),
             Err(error) => panic!("Error processing packet: {}", error),
         }
@@ -217,13 +240,20 @@ impl Endpoint {
         inital_loc_scid: ConnectionId,
         tls_session: RustlsConnection,
         inital_keyset: Keys,
+        initial_space: PacketSpace,
         remote: SocketAddr,
     ) -> Result<Handle, quic_error::Error> {
         //generate new handle
         let new_connection_handle = self.connections.len();
-        self.conn_db
+        if let Some(v) = self
+            .conn_db
             .insert(inital_dcid.clone(), new_connection_handle)
-            .unwrap();
+        {
+            panic!(
+                "Error: extremly unlikely event of identical cid {} from two different hosts",
+                v
+            )
+        }
 
         self.connections.push(Connection::new(
             side,
@@ -233,6 +263,7 @@ impl Endpoint {
             inital_scid,
             inital_loc_scid,
             remote,
+            initial_space,
         ));
 
         Ok(new_connection_handle)
@@ -254,6 +285,9 @@ pub struct Connection {
     handshake_data_received: bool,
     initial_keyset: Keys,
 
+    //connection state
+    state: ConnectionState,
+
     //active connection ids
     active_cids: Vec<ConnectionId>,
 
@@ -266,7 +300,8 @@ pub struct Connection {
     // Retry Source Connection Id
     rscid: Option<ConnectionId>,
 
-    next_packet_num: u64,
+    packet_spaces: [PacketSpace; 3],
+    current_space: usize,
 
     // Physical address of connection peer
     remote: SocketAddr,
@@ -289,6 +324,7 @@ impl Connection {
         initial_remote_scid: ConnectionId,
         initial_local_scid: ConnectionId,
         remote_address: SocketAddr,
+        initial_space: PacketSpace,
     ) -> Self {
         Connection {
             side,
@@ -296,12 +332,14 @@ impl Connection {
             next_secrets: None,
             handshake_data_received: false,
             initial_keyset,
+            state: ConnectionState::Handshake,
             active_cids: vec![initial_remote_scid.clone()],
             initial_dcid,
             initial_remote_scid,
             initial_local_scid,
             rscid: None,
-            next_packet_num: 1,
+            packet_spaces: [initial_space, PacketSpace::new(), PacketSpace::new()],
+            current_space: 0,
             remote: remote_address,
             recved: 0,
             sent: 0,
@@ -312,45 +350,154 @@ impl Connection {
 
     //maybe return "answer" struct which is again handled in endpoint to avoid passing endoint
     //reference to connection
-    pub fn recv(&mut self) -> Result<(), quic_error::Error> {
-        /*loop {
-            match octet_buffer.peek_u8() {
-                Ok(0x06) => {
-                    // CRYPTO_FRAME
-                    println!("Discovered Crypto frame...");
-                    let frame = octet_buffer.get_u8().unwrap();
-                    let off = octet_buffer.get_varint().unwrap();
-                    let len = octet_buffer.get_varint().unwrap();
-                    let tp = transport_parameters::TransportParameter::decode(&mut octet_buffer)
-                        .unwrap();
-                    println!("{}", tp);
-
-                    /*match conn.read_hs(octet_buffer.as_ref()) {
-                        Ok(_) => (),
-                        Err(error) => panic!("Error while consuming handshake data {}", error),
-                    };
-
-                    println!("{:x?}", conn.quic_transport_parameters());*/
-                    break;
-                }
-                Ok(0x00) => {
-                    continue;
-                }
-                _ => panic!("Fatal Error while parsing frames: unknown frame type"),
-            }
-        }*/
-
+    //processes a single packet
+    pub fn recv(
+        &mut self,
+        header: &Header,
+        payload: &mut OctetsMut<'_>,
+    ) -> Result<(), quic_error::Error> {
         Ok(())
     }
 
-    pub fn accept(&mut self) -> Result<(), quic_error::Error> {
+    pub fn accept(
+        &mut self,
+        header: &Header,
+        payload: &mut OctetsMut<'_>,
+    ) -> Result<(), quic_error::Error> {
         Ok(())
+    }
+
+    pub fn _process(&mut self) {}
+
+    pub fn _handle_payload(&mut self, data: &mut OctetsMut<'_>) {
+        while data.peek_u8().is_ok() {
+            let frame_code = data.get_u8().unwrap();
+            match frame_code {
+                0x00 => continue, //PADDING
+                0x01 => continue, //PING
+                0x02 | 0x03 => {
+                    let _ack = AckFrame::from_bytes(&frame_code, data);
+                } //ACK
+                0x04 => {
+                    let _stream_id = data.get_varint().unwrap();
+                    let _application_protocol_error_code = data.get_varint().unwrap();
+                    let _final_size = data.get_varint().unwrap();
+                } //RESET_STREAM
+                0x05 => {
+                    let _stream_id = data.get_varint().unwrap();
+                    let _application_protocol_error_code = data.get_varint().unwrap();
+                } //STOP_SENDING
+                0x06 => {
+                    let _crypto_frame = CryptoFrame::from_bytes(&frame_code, data);
+                } //CRYPTO
+                0x07 => {
+                    if self.side != Side::Server {
+                        let _new_token = NewTokenFrame::from_bytes(&frame_code, data);
+                    } else {
+                        //Quic Error: ProtocolViolation
+                    }
+                } //NEW_TOKEN
+                0x08..=0x0f => {
+                    let stream_frame = StreamFrame::from_bytes(&frame_code, data);
+                    let (_, mut stream_data) = data.split_at(data.off()).unwrap();
+
+                    //isolate stream data if offset is present
+                    if stream_frame.offset.is_some() {
+                        (stream_data, _) = data
+                            .split_at(stream_frame.offset.unwrap() as usize)
+                            .unwrap();
+                    }
+
+                    println!(
+                        "stream_id {:#x} len {:#x} data {:?}",
+                        stream_frame.stream_id,
+                        stream_data.len(),
+                        stream_data
+                    );
+                } //STREAM
+                0x10 => {
+                    let _max_data = data.get_varint().unwrap();
+                } //MAX_DATA
+                0x11 => {
+                    let _stream_id = data.get_varint().unwrap();
+                    let _max_data = data.get_varint().unwrap();
+                } //MAX_StREAM_DATA
+                0x12 => {
+                    let _maximum_streams = data.get_varint().unwrap();
+                } //MAX_STREAMS (bidirectional)
+                0x13 => {
+                    let _maximum_streams = data.get_varint().unwrap();
+                } //MAX_STREAMS (unidirectional)
+                0x14 => {
+                    let _maximum_data = data.get_varint().unwrap();
+                } //DATA_BLOCKED
+                0x15 => {
+                    let _stream_id = data.get_varint().unwrap();
+                    let _maximum_stream_data = data.get_varint().unwrap();
+                } //STREAM_DATA_BLOCKED
+                0x16 => {
+                    let _maximum_streams = data.get_varint().unwrap();
+                } //STREAMS_BLOCKED (bidirectional)
+                0x17 => {
+                    let _maximum_streams = data.get_varint().unwrap();
+                } //STREAMS_BLOCKED (unidirectional)
+                0x18 => {
+                    let _new_connection_id = NewConnectionIdFrame::from_bytes(&frame_code, data);
+                } //NEW_CONNECTION_ID
+                0x19 => {
+                    let _sequence_number = data.get_varint().unwrap();
+                } //RETIRE_CONNECTION_ID
+                0x1a => {
+                    let _path_challenge_data = data.get_u64().unwrap();
+                } //PATH_CHALLENGE
+                0x1b => {
+                    let _path_response_data = data.get_u64().unwrap();
+                } //PATH_RESPONSE
+                0x1c | 0x1d => {
+                    let _connection_close = ConnectionCloseFrame::from_bytes(&frame_code, data);
+                } //CONNECTION_CLOSE_FRAME
+                0x1e => {
+                    //self.handshake_done = true;
+                } // HANDSHAKE_DONE
+                _ => panic!("Error while processing frames"),
+            }
+        }
     }
 
     pub fn _send() {}
 }
 
-struct Header {
+pub enum ConnectionState {
+    Handshake,
+    Connected,
+    Terminated,
+    Emtpying,
+    Empty,
+}
+
+//RFC 9000 section 12.3. we have 3 packet number spaces: initial, handshake & 1-RTT
+pub struct PacketSpace {
+    keys: Option<Keys>,
+
+    max_recved_pkt_num: usize,
+
+    max_acked_pkt: Option<usize>,
+
+    next_pkt_num: usize,
+}
+
+impl PacketSpace {
+    pub fn new() -> Self {
+        Self {
+            keys: None,
+            max_recved_pkt_num: 0,
+            max_acked_pkt: None,
+            next_pkt_num: 0,
+        }
+    }
+}
+
+pub struct Header {
     hf: u8, //header form and version specific bits
     version: u32,
     dcid: ConnectionId,
@@ -364,7 +511,7 @@ struct Header {
     //packet length including packet_num
     packet_length: usize,
 
-    //header length in bytes
+    //header length including packet_num
     length: usize,
 }
 
@@ -413,7 +560,7 @@ impl Header {
             let dcid = b.get_bytes(dcid_len)?;
 
             return Ok(Header {
-                hf: hf,
+                hf,
                 version: 0,
                 dcid: dcid.to_vec().into(),
                 scid: ConnectionId::default(),
@@ -449,7 +596,7 @@ impl Header {
         let pkt_length = b.get_varint()?;
 
         Ok(Header {
-            hf: hf,
+            hf,
             version: v,
             dcid: dcid.into(),
             scid: scid.into(),
