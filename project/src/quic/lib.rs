@@ -10,7 +10,9 @@ use frame::{
 use octets::{BufferTooShortError, OctetsMut};
 use rand::RngCore;
 use rustls::{
-    quic::{Connection as RustlsConnection, HeaderProtectionKey, Keys, Version},
+    quic::{
+        Connection as RustlsConnection, HeaderProtectionKey, KeyChange, Keys, PacketKeySet, Version,
+    },
     Side,
 };
 use std::{
@@ -27,9 +29,9 @@ const MAX_PKT_NUM_LEN: usize = 4;
 const MAX_CID_SIZE: usize = 20;
 const SAMPLE_LEN: usize = 16;
 
-//most systems default to IPv6
-const MAX_PACKET_SIZE_IPV4: usize = 1472;
-const MAX_PACKET_SIZE_IPV6: usize = 1330;
+const SPACE_ID_INITIAL: u8 = 0x01;
+const SPACE_ID_HANDSHAKE: u8 = 0x02;
+const SPACE_ID_DATA: u8 = 0x03;
 
 type Handle = usize;
 
@@ -150,14 +152,20 @@ impl Endpoint {
             .unwrap();
 
         //payload cipher must be exact size without zeros from the buffer beeing to big!
-        match ikp.remote.packet.decrypt_in_place(
-            head.packet_num.into(),
-            header_raw.as_ref(),
-            payload_cipher.as_mut(),
-        ) {
-            Ok(_) => (),
-            Err(error) => panic!("Error decrypting packet body {}", error),
+        let dec_len = {
+            let decrypted_payload_raw = match ikp.remote.packet.decrypt_in_place(
+                head.packet_num.into(),
+                header_raw.as_ref(),
+                payload_cipher.as_mut(),
+            ) {
+                Ok(p) => p,
+                Err(error) => panic!("Error decrypting packet body {}", error),
+            };
+            decrypted_payload_raw.len()
         };
+
+        //truncate payload to length returned by decrypting packet payload
+        let mut payload = OctetsMut::with_slice(payload_cipher.as_mut()[..dec_len].as_mut());
 
         let initial_local_scid = ConnectionId::generate_with_length(head.dcid.len());
         let orig_dcid = head.dcid.clone();
@@ -210,7 +218,7 @@ impl Endpoint {
             .connections
             .get_mut(new_ch)
             .unwrap()
-            .accept(&head, &mut payload_cipher)
+            .accept(&head, &mut payload)
         {
             Ok(()) => (),
             Err(error) => panic!("Error processing packet: {}", error),
@@ -282,8 +290,11 @@ pub struct Connection {
     //tls13 session via rustls
     tls_session: RustlsConnection,
     next_secrets: Option<rustls::quic::Secrets>,
-    handshake_data_received: bool,
+
+    prev_1rtt_keys: Option<PacketKeySet>,
+    next_1rtt_keys: Option<PacketKeySet>,
     initial_keyset: Keys,
+    zero_rtt_keyset: Option<Keys>,
 
     //connection state
     state: ConnectionState,
@@ -300,8 +311,9 @@ pub struct Connection {
     // Retry Source Connection Id
     rscid: Option<ConnectionId>,
 
+    // Packet number spaces, inital, handshake, 1-RTT
     packet_spaces: [PacketSpace; 3],
-    current_space: usize,
+    current_space: u8,
 
     // Physical address of connection peer
     remote: SocketAddr,
@@ -330,7 +342,9 @@ impl Connection {
             side,
             tls_session,
             next_secrets: None,
-            handshake_data_received: false,
+            next_1rtt_keys: None,
+            prev_1rtt_keys: None,
+            zero_rtt_keyset: None,
             initial_keyset,
             state: ConnectionState::Handshake,
             active_cids: vec![initial_remote_scid.clone()],
@@ -339,7 +353,7 @@ impl Connection {
             initial_local_scid,
             rscid: None,
             packet_spaces: [initial_space, PacketSpace::new(), PacketSpace::new()],
-            current_space: 0,
+            current_space: SPACE_ID_INITIAL,
             remote: remote_address,
             recved: 0,
             sent: 0,
@@ -348,120 +362,168 @@ impl Connection {
         }
     }
 
-    //maybe return "answer" struct which is again handled in endpoint to avoid passing endoint
-    //reference to connection
-    //processes a single packet
+    //fully decrypts packet header and payload, does tls stuff and passes packet to process_payload
     pub fn recv(
         &mut self,
         header: &Header,
         payload: &mut OctetsMut<'_>,
     ) -> Result<(), quic_error::Error> {
+        self.process_payload(payload);
+
+        // if space is handshake, call to write crypto after processing payload
+
         Ok(())
     }
 
+    //accepts new connection, passes payload to process_payload
     pub fn accept(
         &mut self,
         header: &Header,
         payload: &mut OctetsMut<'_>,
     ) -> Result<(), quic_error::Error> {
+        self.process_payload(payload);
+        self.generate_crypto_data();
         Ok(())
     }
 
-    pub fn _process(&mut self) {}
-
-    pub fn _handle_payload(&mut self, data: &mut OctetsMut<'_>) {
-        while data.peek_u8().is_ok() {
-            let frame_code = data.get_u8().unwrap();
+    fn process_payload(&mut self, payload: &mut OctetsMut<'_>) {
+        while payload.peek_u8().is_ok() {
+            let frame_code = payload.get_u8().unwrap();
             match frame_code {
                 0x00 => continue, //PADDING
                 0x01 => continue, //PING
                 0x02 | 0x03 => {
-                    let _ack = AckFrame::from_bytes(&frame_code, data);
+                    let _ack = AckFrame::from_bytes(&frame_code, payload);
                 } //ACK
                 0x04 => {
-                    let _stream_id = data.get_varint().unwrap();
-                    let _application_protocol_error_code = data.get_varint().unwrap();
-                    let _final_size = data.get_varint().unwrap();
+                    let _stream_id = payload.get_varint().unwrap();
+                    let _application_protocol_error_code = payload.get_varint().unwrap();
+                    let _final_size = payload.get_varint().unwrap();
                 } //RESET_STREAM
                 0x05 => {
-                    let _stream_id = data.get_varint().unwrap();
-                    let _application_protocol_error_code = data.get_varint().unwrap();
+                    let _stream_id = payload.get_varint().unwrap();
+                    let _application_protocol_error_code = payload.get_varint().unwrap();
                 } //STOP_SENDING
                 0x06 => {
-                    let _crypto_frame = CryptoFrame::from_bytes(&frame_code, data);
+                    let crypto_frame = CryptoFrame::from_bytes(&frame_code, payload);
+                    self.process_crypto_data(&crypto_frame);
                 } //CRYPTO
                 0x07 => {
                     if self.side != Side::Server {
-                        let _new_token = NewTokenFrame::from_bytes(&frame_code, data);
+                        let _new_token = NewTokenFrame::from_bytes(&frame_code, payload);
                     } else {
                         //Quic Error: ProtocolViolation
                     }
                 } //NEW_TOKEN
                 0x08..=0x0f => {
-                    let stream_frame = StreamFrame::from_bytes(&frame_code, data);
-                    let (_, mut stream_data) = data.split_at(data.off()).unwrap();
+                    let stream_frame = StreamFrame::from_bytes(&frame_code, payload);
+                    let (_, mut stream_data) = payload.split_at(payload.off()).unwrap();
 
                     //isolate stream data if offset is present
                     if stream_frame.offset.is_some() {
-                        (stream_data, _) = data
+                        (stream_data, _) = payload
                             .split_at(stream_frame.offset.unwrap() as usize)
                             .unwrap();
                     }
 
                     println!(
-                        "stream_id {:#x} len {:#x} data {:?}",
+                        "stream_id {:#x} len {:#x} data {:#x?}",
                         stream_frame.stream_id,
                         stream_data.len(),
                         stream_data
                     );
                 } //STREAM
                 0x10 => {
-                    let _max_data = data.get_varint().unwrap();
+                    let _max_data = payload.get_varint().unwrap();
                 } //MAX_DATA
                 0x11 => {
-                    let _stream_id = data.get_varint().unwrap();
-                    let _max_data = data.get_varint().unwrap();
+                    let _stream_id = payload.get_varint().unwrap();
+                    let _max_data = payload.get_varint().unwrap();
                 } //MAX_StREAM_DATA
                 0x12 => {
-                    let _maximum_streams = data.get_varint().unwrap();
+                    let _maximum_streams = payload.get_varint().unwrap();
                 } //MAX_STREAMS (bidirectional)
                 0x13 => {
-                    let _maximum_streams = data.get_varint().unwrap();
+                    let _maximum_streams = payload.get_varint().unwrap();
                 } //MAX_STREAMS (unidirectional)
                 0x14 => {
-                    let _maximum_data = data.get_varint().unwrap();
+                    let _maximum_data = payload.get_varint().unwrap();
                 } //DATA_BLOCKED
                 0x15 => {
-                    let _stream_id = data.get_varint().unwrap();
-                    let _maximum_stream_data = data.get_varint().unwrap();
+                    let _stream_id = payload.get_varint().unwrap();
+                    let _maximum_stream_data = payload.get_varint().unwrap();
                 } //STREAM_DATA_BLOCKED
                 0x16 => {
-                    let _maximum_streams = data.get_varint().unwrap();
+                    let _maximum_streams = payload.get_varint().unwrap();
                 } //STREAMS_BLOCKED (bidirectional)
                 0x17 => {
-                    let _maximum_streams = data.get_varint().unwrap();
+                    let _maximum_streams = payload.get_varint().unwrap();
                 } //STREAMS_BLOCKED (unidirectional)
                 0x18 => {
-                    let _new_connection_id = NewConnectionIdFrame::from_bytes(&frame_code, data);
+                    let _new_connection_id = NewConnectionIdFrame::from_bytes(&frame_code, payload);
                 } //NEW_CONNECTION_ID
                 0x19 => {
-                    let _sequence_number = data.get_varint().unwrap();
+                    let _sequence_number = payload.get_varint().unwrap();
                 } //RETIRE_CONNECTION_ID
                 0x1a => {
-                    let _path_challenge_data = data.get_u64().unwrap();
+                    let _path_challenge_data = payload.get_u64().unwrap();
                 } //PATH_CHALLENGE
                 0x1b => {
-                    let _path_response_data = data.get_u64().unwrap();
+                    let _path_response_data = payload.get_u64().unwrap();
                 } //PATH_RESPONSE
                 0x1c | 0x1d => {
-                    let _connection_close = ConnectionCloseFrame::from_bytes(&frame_code, data);
+                    let _connection_close = ConnectionCloseFrame::from_bytes(&frame_code, payload);
                 } //CONNECTION_CLOSE_FRAME
                 0x1e => {
                     //self.handshake_done = true;
                 } // HANDSHAKE_DONE
-                _ => panic!("Error while processing frames"),
+                _ => eprintln!(
+                    "Error while processing frames: unrecognised frame {:#x} at {:#x}",
+                    frame_code,
+                    payload.off()
+                ),
             }
         }
+    }
+
+    fn process_crypto_data(&mut self, crypto_frame: &CryptoFrame) {
+        match self.tls_session.read_hs(crypto_frame.data()) {
+            Ok(()) => println!("Successfully read handshake data"),
+            Err(err) => eprintln!("Error reading crypto data: {}", err),
+        }
+    }
+
+    fn generate_crypto_data(&mut self) {
+        let mut buf = Vec::new();
+        let kc = match self.tls_session.write_hs(&mut buf) {
+            Some(kc) => kc,
+            None => panic!("Error writing handshake data"),
+        };
+
+        let keys = match kc {
+            KeyChange::Handshake { keys } => keys,
+            KeyChange::OneRtt { keys, next } => {
+                self.next_secrets = Some(next);
+                keys
+            }
+        };
+
+        if (self.current_space + 1) == SPACE_ID_DATA {
+            self.next_1rtt_keys = Some(
+                self.next_secrets
+                    .as_mut()
+                    .expect("handshake should be completed and next secrets availible")
+                    .next_packet_keys(),
+            )
+        }
+
+        //"upgrade" to next packet number space with new keying material
+        self.packet_spaces[(self.current_space + 1) as usize].keys = Some(keys);
+
+        //advance space
+        self.current_space += 1;
+
+        println!("{:#x?}", buf);
     }
 
     pub fn _send() {}

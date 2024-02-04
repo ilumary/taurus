@@ -4,6 +4,8 @@ pub trait Frame {
     fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self;
 
     //fn to_bytes(&self, frame_code: &u8, bytes: &mut octets::OctetsMut<'_>);
+
+    //fn len(&self)
 }
 
 pub struct AckFrame {
@@ -51,7 +53,6 @@ impl Frame for AckFrame {
 
 pub struct CryptoFrame {
     offset: u64,
-    length: u64,
     crypto_data: Vec<u8>,
 }
 
@@ -60,11 +61,35 @@ impl Frame for CryptoFrame {
         let offset = bytes.get_varint().unwrap();
         let length = bytes.get_varint().unwrap();
 
+        let mut crypto_data: Vec<u8> = self::CryptoFrame::encode_frame_header(offset, length);
+
+        crypto_data.append(&mut bytes.get_bytes(length as usize).unwrap().to_vec());
+
         CryptoFrame {
             offset,
-            length,
-            crypto_data: bytes.get_bytes(length as usize).unwrap().to_vec(),
+            crypto_data,
         }
+    }
+}
+
+impl CryptoFrame {
+    pub fn data(&self) -> &[u8] {
+        self.crypto_data.as_ref()
+    }
+
+    pub fn len(&self) -> usize {
+        self.crypto_data.len()
+    }
+
+    fn encode_frame_header(offset: u64, length: u64) -> Vec<u8> {
+        //0x06 + 2 MAX_VARINT
+        let mut header: Vec<u8> = vec![0; 9];
+        let mut oct = octets::OctetsMut::with_slice(&mut header);
+        oct.put_u8(0x06).unwrap();
+        oct.put_varint(offset).unwrap();
+        oct.put_varint(length).unwrap();
+
+        oct.buf()[0..oct.off()].to_vec()
     }
 }
 
