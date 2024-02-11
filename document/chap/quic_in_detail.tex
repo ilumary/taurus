@@ -1,15 +1,48 @@
 \chapter{QUIC In Detail}
 
+QUIC is a transport layer network protocol. Although initially proposed to be an acronym for "Quick UDP Internet Connections", QUIC is just the name\cite[10]{rfc9000}. It represents the next step in offering reliable, ordered and error checked data transport for connection-oriented web applications that traditionally relied on TCP. Improvements include enhanced performance, better security through the direct integration of TLS 1.3 and more flexibility by decoupling an endpoint from the physical interface address through the use of seperate Connection Identifiers. 
+
+Initially conceptualized by Jim Roskind at Google in 2012 and publicly disclosed in 2013 as experimentation, QUIC formally materialized in 2016 at an IETF meeting. QUIC version 1.0 was officially standardised in May 2021 across RFC's 8999\cite{rfc8999}, 9000\cite{rfc9000}, 9001\cite{rfc9001} and 9002\cite{rfc9002}. Its design aims to prevent protocol ossification, ensuring its continued evolution, unlike TCP, which has experienced notable ossification.
+
+Today, QUIC plays a pivotal role in internet communication, being utilized in over half of the connections from the Chrome web browser to Google's servers. Notably, major web browsers such as Microsoft Edge (post-version series 1.x, a descendant of the open-source Chromium browser), Firefox, and Safari have extended support for QUIC.
+
 \section{Historic Background}
+
+In May 1974, 50 years ago, Vint Cerf and Bob Kahn outlined a protocol for network resource sharing via packet switching between network nodes. The resulting protocol, detailed in RFC 675 (Specification of Internet Transmission Control Program), was authored by Vint Cerf, Yogen Dalal, and Carl Sunshine, and released in December 1974. At the core of this model was the Transmission Control Program, encompassing both connection-oriented links and datagram services between hosts. Over time, the monolithic Transmission Control Program underwent a transformation into a modular architecture, giving rise to the Transmission Control Protocol (TCP), Internet Control Message Protocol (ICMP) and the Internet Protocol (IP). This architectural shift led to the emergence of a networking model informally known as TCP/IP, although it was formally referred to as the Internet Protocol Suite. Over time, a number of changes have been made to the original TCP specification in RFC 793 to adapt to the increasingly changing nature of the internet. Updates to RFC 793 have been made in, but are not limited to RFCs 879, 2873, 6093, 6429, 6528, and 6691.
+
+[Roughly explain TCP]
+
+\subsection{Problems of TCP}
+
+problems of TCP (Head of Line Blocking, Delay due to connection setup (3-RTT + TLS 1-RTT), Fixed IP Address per Connection Endpoint, Coupling between Congestion Control and reliable Delivery)
+
+Other Protocols that tried to fix the same problem (Stream TCP, Transaction TCP, RTP)
+
+\subsection{Present Day}
+
+Today, the internet has widely outgrown the original design goals and transformed into a complex system of 
+
+In the past decades, the internet has grown both in performance and complexity beyond the original design goals of the data transmission protocols which are still in use today.
+Key contributors are the introduction of IP enabled mobile devices and the widespread availability of radio technology based publicly usable access networks, which, due to their physical properties, have an inherent tendency for losing connections. The ability of mobile devices to join and leave network access points was also not considered in the original protocol design. These factors contribute to frequent termination and re-establishment of sessions, resulting in invalidation of protocol state data kept at the endpoints and enforcing time and resource intense re-establishment of sessions from scratch.
+The specialization of protocols for specific purposes causes the need to combine various protocols to achieve the required functionality set, e.g. running transmission sessions over separately established encrypted tunnels or keeping content related state transfer on top of transmission protocol states. The need to run session establishment of each involved protocol separately in sequence further contributes to time and resource consumption.
+The growing complexity of services, employing modern design paradigms such as meshing, service-based architecture and microservices, enhances the impact of these design shortcomings, as the number of sessions and the number of endpoints to which they are established is further increased. To increase efficiency in general, but specifically for mobile devices making use of less powerful hardware and their dependency on battery power, as well as enabling new architectural concepts on server side, while maintaining customer experience when growing service meshes, a new, more efficient approach on network stack level was needed.
+ 
+QUIC is the approach to solve this growing efficiency gap. It’s central concept is to abstract established protocols for security and transport, thus allowing to keep the installed base while at the same time introducing a completely redesigned state management. The newly introduced state management allows to move from state keeping transport layer protocol (tcp) to a stateless (udp) and combine security and transport related state management in a combined protocol message flows. QUICs native protocol information elements allow handling of session state independent from the classical transport layer and enables <tbd: wie sagt man dazu, dass man die sessions wieder aufwecken oder ihren Zustand zwischen Endpunkten übertragen kann?>.
+
+[Emergence of QUIC]
 
 \section{Architecture}
 
-\section{Transport}
+Fundamentals, Basic Concepts \& Ideas, Packets, Headers, Streams, Connection Migration, Flow Control, 0-RTT, Connection Termination
+
+\section{Connection}
+
+Handshake (1-RTT), ConnectionIDs, Optional Version Negotiation, (coalesced) Packets(with different Headers, Payload with different Frames), Streams, Connection Migration, Flow Control, 0-RTT, Connection Termination (Stream draining)
+
+\section{Error Handling \& Recovery}
+
+Ack-based Loss Detection \& Recovery, Protocol Errors, Connection Termination
 
 \section{Security}
 
-\section{Multiplexing}
-
-\section{Error Handling}
-
-\section{Comparison to TCP}
+TLS Integration into QUIC, renewing keysets, different keysets for 0-RTT and 1-RTT, Partial Header Protection, Full Payload Protection
