@@ -2,8 +2,15 @@
 
 \section{Terms \& Definitions}
 
+\begin{itemize}
+ \item Variable Sized Integer \label{variable_sized_integer}
+ \item Explicit Congestion Notification (ECN) \label{ecn}
+ \item ACK Range. An ACK range specifies a continuous sequence of packets that have been successfully received by the receiver. When a receiver acknowledges data, it doesn't necessarily need to acknowledge each packet individually. Instead, it can efficiently transmit an ACK with a range, indicating that it has received all packets within that range, from a starting point to an ending point. \label{ack_range}
+ \item Connection Identifier (cid) Uses Source and Destination cids. scid and dcid change switch between two endpoints\label{cid}
+ \item ClientHello
+ \item ServerHello
+\end{itemize}
+
 \section{Fundamentals of networking protocols}
 
 \section{TCP \& UDP}
-
-\section{Introduction to QUIC}

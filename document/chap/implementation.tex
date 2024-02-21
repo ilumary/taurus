@@ -1,15 +1,25 @@
 \chapter{Implementation}
 
-\section{Choice of Rust \& Scope}
+\section{Choice of Rust \& Scope of Implementation}
 
 \section{Development Environment \& External Libraries}
 
-\section{Basic Program Layout}
+\section{Library Layout}
 
-\section{Server \& Client Endpoints}
-
-\section{Connections}
+Connection and Endpoint as main parts of the Library. Designed to allow stateless packet handling in endpoint.
 
 \section{Packets}
 
+(coalesced) packets, header struct, partial parse of header, decrypting, encrypring, frame parsing
+
+\section{Connection}
+
+connection accepting, structure of packet that goes through connection, connection handling, streams, connection flow, sending
+
+\section{Error Handling}
+
+quic errors, implementation specific errors
+
 \section{Testing \& Validating}
+
+tested code, validating
