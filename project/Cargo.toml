@@ -14,7 +14,7 @@ name = "quic_bin"
 path = "src/main.rs"
 
 [dependencies]
-octets = "0.2.0"
+octets = "0.3.0"
 rustls = {version = "0.21.7", features = ["quic"]}
 rcgen = "0.12.0"
 rand = "0.8.5"

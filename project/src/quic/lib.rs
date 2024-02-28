@@ -1,5 +1,6 @@
 mod frame;
 mod quic_error;
+mod stream;
 mod token;
 mod transport_parameters;
 
@@ -19,6 +20,7 @@ use std::{
     collections::HashMap,
     fmt,
     net::{SocketAddr, UdpSocket},
+    sync::Arc,
 };
 
 const LS_TYPE_BIT: u8 = 0x80;
@@ -72,6 +74,7 @@ impl Endpoint {
             .with_single_cert(vec![certificate.clone()], pkey)
             .unwrap();
         server_cfg.max_early_data_size = u32::MAX;
+        server_cfg.alpn_protocols = vec!["hq-29".into()];
 
         let mut hmac_reset_key = [0u8; 64];
         rand::thread_rng().fill_bytes(&mut hmac_reset_key);
@@ -110,7 +113,7 @@ impl Endpoint {
 
         //check if most significant bit is 1 or 0, if 0 => short packet => have to get cid len
         //somehow
-        let mut head: Header = match Header::parse_from_bytes(&mut octet_buffer, 0) {
+        let mut head: Header = match Header::parse_from_bytes(&mut octet_buffer, 8) {
             Ok(h) => h,
             Err(error) => panic!("Error: {}", error),
         };
@@ -125,7 +128,7 @@ impl Endpoint {
                 .connections
                 .get_mut(h)
                 .unwrap()
-                .recv(&head, &mut octet_buffer)
+                .recv(&mut head, &mut octet_buffer)
             {
                 Ok(()) => return,
                 Err(error) => panic!("Error processing packet: {}", error),
@@ -195,9 +198,9 @@ impl Endpoint {
             .unwrap(),
         );
 
-        let initial_space: PacketSpace = PacketSpace {
+        let initial_space: PacketNumberSpace = PacketNumberSpace {
             keys: Some(Keys::initial(Version::V1, &head.dcid.id, Side::Server)),
-            ..PacketSpace::new()
+            ..PacketNumberSpace::new(true)
         };
 
         let new_ch = self
@@ -248,7 +251,7 @@ impl Endpoint {
         inital_loc_scid: ConnectionId,
         tls_session: RustlsConnection,
         inital_keyset: Keys,
-        initial_space: PacketSpace,
+        initial_space: PacketNumberSpace,
         remote: SocketAddr,
     ) -> Result<Handle, quic_error::Error> {
         //generate new handle
@@ -280,17 +283,16 @@ impl Endpoint {
     //terminate all connections
     pub fn _close_endpoint() {}
 
-    pub fn _send() {}
+    pub fn _handle_event() {}
 }
 
-pub struct Connection {
+struct Connection {
     //side
     side: Side,
 
-    //tls13 session via rustls
+    //tls13 session via rustls and keying material
     tls_session: RustlsConnection,
     next_secrets: Option<rustls::quic::Secrets>,
-
     prev_1rtt_keys: Option<PacketKeySet>,
     next_1rtt_keys: Option<PacketKeySet>,
     initial_keyset: Keys,
@@ -312,7 +314,7 @@ pub struct Connection {
     rscid: Option<ConnectionId>,
 
     // Packet number spaces, inital, handshake, 1-RTT
-    packet_spaces: [PacketSpace; 3],
+    packet_spaces: [PacketNumberSpace; 3],
     current_space: u8,
 
     // Physical address of connection peer
@@ -336,7 +338,7 @@ impl Connection {
         initial_remote_scid: ConnectionId,
         initial_local_scid: ConnectionId,
         remote_address: SocketAddr,
-        initial_space: PacketSpace,
+        initial_space: PacketNumberSpace,
     ) -> Self {
         Connection {
             side,
@@ -352,7 +354,11 @@ impl Connection {
             initial_remote_scid,
             initial_local_scid,
             rscid: None,
-            packet_spaces: [initial_space, PacketSpace::new(), PacketSpace::new()],
+            packet_spaces: [
+                initial_space,
+                PacketNumberSpace::new(true),
+                PacketNumberSpace::new(false),
+            ],
             current_space: SPACE_ID_INITIAL,
             remote: remote_address,
             recved: 0,
@@ -365,9 +371,11 @@ impl Connection {
     //fully decrypts packet header and payload, does tls stuff and passes packet to process_payload
     pub fn recv(
         &mut self,
-        header: &Header,
+        header: &mut Header,
         payload: &mut OctetsMut<'_>,
     ) -> Result<(), quic_error::Error> {
+        //decrypt header and payload
+
         self.process_payload(payload);
 
         // if space is handshake, call to write crypto after processing payload
@@ -382,11 +390,25 @@ impl Connection {
         payload: &mut OctetsMut<'_>,
     ) -> Result<(), quic_error::Error> {
         self.process_payload(payload);
+
+        println!(
+            "wr {:?} ww {:?} ih {:?} tpp: {:?}",
+            self.tls_session.wants_read(),
+            self.tls_session.wants_write(),
+            self.tls_session.is_handshaking(),
+            self.tls_session.quic_transport_parameters().unwrap(),
+        );
+
         self.generate_crypto_data();
+
+        // generate crypto data again for ee, cert, cv, fin
         Ok(())
     }
 
+    // TODO change to just &Octets, because we dont need to modify the buffer after decrypting
     fn process_payload(&mut self, payload: &mut OctetsMut<'_>) {
+        //TODO check if packet is ack eliciting
+
         while payload.peek_u8().is_ok() {
             let frame_code = payload.get_u8().unwrap();
             match frame_code {
@@ -487,19 +509,44 @@ impl Connection {
     }
 
     fn process_crypto_data(&mut self, crypto_frame: &CryptoFrame) {
+        println!("Crypto Frame Data: {:x?}", crypto_frame.vec());
+
         match self.tls_session.read_hs(crypto_frame.data()) {
             Ok(()) => println!("Successfully read handshake data"),
-            Err(err) => eprintln!("Error reading crypto data: {}", err),
+            Err(err) => {
+                eprintln!("Error reading crypto data: {}", err);
+                eprintln!("{:?}", self.tls_session.alert().unwrap());
+            }
+        }
+
+        let has_server_name = match self.tls_session {
+            RustlsConnection::Client(_) => false,
+            RustlsConnection::Server(ref session) => session.server_name().is_some(),
+        };
+
+        if self.tls_session.alpn_protocol().is_some()
+            || has_server_name
+            || !self.tls_session.is_handshaking()
+        {
+            println!("Handshake data has been read and proccessed successfully");
+            let _ = true;
         }
     }
 
     fn generate_crypto_data(&mut self) {
-        let mut buf = Vec::new();
-        let kc = match self.tls_session.write_hs(&mut buf) {
+        //get mutable reference to crypto buffer
+        let buf: &mut Vec<u8> = self.packet_spaces[self.current_space as usize]
+            .outstanding_crypto_data
+            .as_mut()
+            .unwrap();
+
+        //writing handshake data prompts a keychange because the packet number spce is promoted
+        let kc = match self.tls_session.write_hs(buf) {
             Some(kc) => kc,
             None => panic!("Error writing handshake data"),
         };
 
+        //get keys from keychange
         let keys = match kc {
             KeyChange::Handshake { keys } => keys,
             KeyChange::OneRtt { keys, next } => {
@@ -508,6 +555,7 @@ impl Connection {
             }
         };
 
+        // if space id is DATA, only the packet payload keys update, not the header keys
         if (self.current_space + 1) == SPACE_ID_DATA {
             self.next_1rtt_keys = Some(
                 self.next_secrets
@@ -520,13 +568,15 @@ impl Connection {
         //"upgrade" to next packet number space with new keying material
         self.packet_spaces[(self.current_space + 1) as usize].keys = Some(keys);
 
+        println!(
+            "Is this the Server Hello with len {:x?}: {:x?}",
+            buf.len(),
+            buf.to_vec()
+        );
+
         //advance space
         self.current_space += 1;
-
-        println!("{:#x?}", buf);
     }
-
-    pub fn _send() {}
 }
 
 pub enum ConnectionState {
@@ -538,21 +588,27 @@ pub enum ConnectionState {
 }
 
 //RFC 9000 section 12.3. we have 3 packet number spaces: initial, handshake & 1-RTT
-pub struct PacketSpace {
+pub struct PacketNumberSpace {
     keys: Option<Keys>,
 
-    max_recved_pkt_num: usize,
+    outstanding_acks: Vec<u64>,
 
-    max_acked_pkt: Option<usize>,
+    outstanding_crypto_data: Option<Vec<u8>>,
 
-    next_pkt_num: usize,
+    max_acked_pkt: Option<u64>,
+
+    next_pkt_num: u64,
 }
 
-impl PacketSpace {
-    pub fn new() -> Self {
+impl PacketNumberSpace {
+    pub fn new(with_crypto_buffer: bool) -> Self {
         Self {
             keys: None,
-            max_recved_pkt_num: 0,
+            outstanding_acks: Vec::new(),
+            outstanding_crypto_data: match with_crypto_buffer {
+                true => Some(Vec::new()),
+                false => None,
+            },
             max_acked_pkt: None,
             next_pkt_num: 0,
         }

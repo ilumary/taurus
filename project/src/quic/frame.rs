@@ -3,7 +3,7 @@ use crate::{token::StatelessResetToken, ConnectionId};
 pub trait Frame {
     fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self;
 
-    //fn to_bytes(&self, frame_code: &u8, bytes: &mut octets::OctetsMut<'_>);
+    //fn to_bytes(&self, bytes: &mut octets::OctetsMut<'_>);
 
     //fn len(&self)
 }
@@ -59,15 +59,10 @@ pub struct CryptoFrame {
 impl Frame for CryptoFrame {
     fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self {
         let offset = bytes.get_varint().unwrap();
-        let length = bytes.get_varint().unwrap();
-
-        let mut crypto_data: Vec<u8> = self::CryptoFrame::encode_frame_header(offset, length);
-
-        crypto_data.append(&mut bytes.get_bytes(length as usize).unwrap().to_vec());
 
         CryptoFrame {
             offset,
-            crypto_data,
+            crypto_data: bytes.get_bytes_with_varint_length().unwrap().to_vec(),
         }
     }
 }
@@ -77,19 +72,12 @@ impl CryptoFrame {
         self.crypto_data.as_ref()
     }
 
-    pub fn len(&self) -> usize {
-        self.crypto_data.len()
+    pub fn vec(&self) -> &Vec<u8> {
+        &self.crypto_data
     }
 
-    fn encode_frame_header(offset: u64, length: u64) -> Vec<u8> {
-        //0x06 + 2 MAX_VARINT
-        let mut header: Vec<u8> = vec![0; 9];
-        let mut oct = octets::OctetsMut::with_slice(&mut header);
-        oct.put_u8(0x06).unwrap();
-        oct.put_varint(offset).unwrap();
-        oct.put_varint(length).unwrap();
-
-        oct.buf()[0..oct.off()].to_vec()
+    pub fn len(&self) -> usize {
+        self.crypto_data.len()
     }
 }
 
@@ -141,6 +129,15 @@ impl Frame for StreamFrame {
             length,
             fin_bit_set,
         }
+    }
+
+    //fn to_bytes()
+}
+
+impl StreamFrame {
+    fn _to_bytes_with_data(&self, data: &[u8], bytes: &mut octets::OctetsMut) {
+        //self.to_bytes();
+        //bytes.put_bytes(data);
     }
 }
 

@@ -8,37 +8,22 @@ pub struct Error {
     msg: String,
 }
 
+macro_rules! quic_error {
+    ($name:ident, $code:expr) => {
+        pub fn $name<T>(reason: T) -> Self
+        where
+            T: Into<String>,
+        {
+            Self {
+                code: $code,
+                msg: reason.into(),
+            }
+        }
+    };
+}
+
 impl Error {
-    //TODO create makro
-    pub fn INTERNAL_FATAL_ERROR<T>(reason: T) -> Self
-    where
-        T: Into<String>,
-    {
-        Self {
-            code: 0x00,
-            msg: reason.into(),
-        }
-    }
-
-    pub fn CRYPTO_ERROR<T>(reason: T) -> Self
-    where
-        T: Into<String>,
-    {
-        Self {
-            code: 0x01,
-            msg: reason.into(),
-        }
-    }
-
-    pub fn PARSE_ERROR<T>(reason: T) -> Self
-    where
-        T: Into<String>,
-    {
-        Self {
-            code: 0x02,
-            msg: reason.into(),
-        }
-    }
+    quic_error!(fatal, 0x00);
 }
 
 impl fmt::Display for Error {
@@ -51,4 +36,29 @@ impl SError for Error {
     fn description(&self) -> &str {
         &self.msg
     }
+}
+
+enum QuicTransportErrors {
+    NoError = 0x00,
+    InternalError = 0x01,
+    ConnectionRefused = 0x02,
+    FlowControlError = 0x03,
+    StreamLimitError = 0x04,
+    StreamStateError = 0x05,
+    FinalSizeError = 0x06,
+    FrameEncodingError = 0x07,
+    TransportParameterError = 0x08,
+    ConnectionIdLimitError = 0x09,
+    ProtocolViolation = 0x0a,
+    InvalidToken = 0x0b,
+    ApplicationError = 0x0c,
+    CryptoBufferExceeded = 0x0d,
+    KeyUpdateError = 0x0e,
+    AeadLimitReached = 0x0f,
+    NoViablePath = 0x10,
+}
+
+// 0x0100 - 0x01ff
+struct CryptoError {
+    code: u64,
 }
