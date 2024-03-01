@@ -515,16 +515,139 @@ During a connection, many things can go wrong. Error handling and recovery are c
 
 \subsection{Loss Detection \& Recovery}
 
-Like its predecessor TCP, QUIC uses an acknowledgement-based loss detection approach.
+Like its predecessor TCP, QUIC uses an acknowledgement-based loss detection approach to ensure reliability while transferring data. Packets are identified by their sequentially increasing packet numbers. A packet must not be acknowledged until packet protection has been successfully removed and all frames contained in the packet have been processed. A packet is ack-eliciting if it contains at least one other frame except acknowledgements itself, PADDING or CONNECTION\_CLOSE. Each acknowledgment is sent inside an ACK frame, encoded either as type 0x02 or type 0x03, carry acknowledgment ranges to identify acknowledged packets. Additionally, type 0x03 ACK frames include information about Explicit Congestion Notification (ECN) feedback. The content of ACK frames, as depicted in Figure \ref{ack_frame}, contain the Type, Largest Acknowledged, ACK Delay, ACK Range Count, First ACK Range, ACK Ranges, and optionally ECN Counts. 
+
+\begin{figure}[htb]
+    \centering      
+\begin{verbatim}
+ACK Frame {                            ACK Range {
+  Type (i) = 0x02..0x03,                   Gap (i),
+  Largest Acknowledged (i),                ACK Range Length (i),
+  ACK Delay (i),                       }
+  ACK Range Count (i),        
+  First ACK Range (i),        
+  ACK Range (..) ...,         
+  [ECN Counts (..)],          
+}
+\end{verbatim}
+    \caption{ACK Frame (left) \cite[106]{rfc9000}, ACK Range (right) \cite[107]{rfc9000}}
+    \label{ack_frame}
+\end{figure}
+
+Largest Acknowledged represents the highest packet number the peer is acknowledging, while the ACK Delay field encodes the acknowledgment delay in microseconds. Moreover, ACK frames may contain an arbitrary number of additional ACK Ranges, which consist of alternating Gap and ACK Range Length values in descending packet number order. Each ACK range acknowledges a contiguous range of packets. The Gap field signifies the number of contiguous unacknowledged packets preceding the packet number one lower than the smallest in the preceding ACK Range. The ACK Range Length field indicates the number of contiguous acknowledged packets preceding the largest packet number. Furthermore, if the ACK frame type is 0x03, ECN feedback is included, providing insights into the number of packets received with specific ECN codepoints (ECT0, ECT1, ECN-CE) in the packet number space of the ACK frame. ECN counts are maintained separately for each packet number space. Figure \ref{ack_frame_example} shows an example ACK frame for a provided number of successfully received packets.
+
+\begin{figure}[htb]
+    \centering
+\begin{verbatim}
+Received packet numbers: [5, 6, 7, 8, 10, 11, 12, 13, 14, 17, 18, 19, 20]
+
+ACK Frame {
+  Type = 0x02,
+  Largest Acknowledged = 20,
+  ACK Delay (i),  //ommitted for this example
+  ACK Range Count = 2,
+  First ACK Range = 3,        
+  Gap = 2,
+  Ack Range Length = 5,
+  Gap = 1,
+  Ack Range Length = 4,
+}
+\end{verbatim}
+    \caption{Example ACK frame}
+    \label{ack_frame_example}
+\end{figure}
+
+An endpoint should attempt to include an ACK frame with every packet sent to aid in timely loss detection at the peer. 
+
+QUIC employs two types of thresholds for determining packet loss. First, packet number-based thresholds compare the sequence number of in-flight packets with the acknowledged packet. If the in-flight packet's sequence number is smaller than the acknowledged packet by a certain threshold ($x - t$), it is marked as lost. Second, time-based thresholds assess the time elapsed since the acknowledged packet was sent. If an in-flight packet was sent before a certain time threshold ($t -− t_0$), it is declared lost. These thresholds allow for some tolerance for packet reordering and aim to prevent unnecessary retransmissions without compromising congestion control performance.
+
+To detect tail packet losses, QUIC initializes a Probe Timeout (PTO) timer whenever a packet requiring acknowledgment is sent. This timer incorporates factors such as smoothed network RTT, RTT variation, and maximum acknowledgment delay. When the PTO timer expires, the sender sends a new packet as a probe to elicit acknowledgments, potentially retransmitting some in-flight data to minimize redundant retransmissions.
+
+QUIC packets that are determined to be lost are not retransmitted whole; instead, the information carried in lost packets is sent again in new frames which are packed into new outgoing packets, each assigned new packet numbers unrelated to the lost ones. Retransmitted data can still be contextualized by examining the offset parameter in the frame headers. This process ensures reliable ordered byte-stream delivery, akin to TCP's functionality, despite packet loss occurrences.
 
 \subsection{Protocol or Application Errors}
 
-\subsection{Other Errors \& Failures}
+One key aspect of QUIC's error handling is its reliance on error codes and connection states to communicate and manage errors effectively. When errors occur, QUIC endpoints may close the connection using the defined transport error codes, allowing the peer to understand the nature of the problem. These error codes cover a wide range of scenarios, including connection establishment failures, packet decryption errors, and protocol violations, providing comprehensive diagnostic information to facilitate error resolution. QUIC transport error codes can be used in a CONNECTION\_CLOSE frame with a type of 0x1c.
 
-QUIC is a resiliant protocol which safely ensures reliable data transmission over the internet.
+\begin{table}[H]
+\begin{center}
+    \begin{tabular}{| l | l | p{75mm} |}
+    \hline
+    Error Code & Name & Description \\ \hline
+    0x00 & NO\_ERROR & An endpoint uses this with CONNECTION\_CLOSE to signal that the connection is being closed abruptly in the absence of any error. \\ \hline
+    0x01 & INTERNAL\_ERROR & The endpoint encountered an internal error and cannot continue with the connection. \\ \hline
+    0x02 & CONNECTION\_REFUSED & The server refused to accept a new connection. \\ \hline
+    0x03 & FLOW\_CONTROL\_ERROR & An endpoint received more data than it permitted in its
+advertised data limits. \\ \hline
+    0x04 & STREAM\_LIMIT\_ERROR & An endpoint received a frame for a stream identifier that exceeded its advertised stream limit for the corresponding stream type. \\ \hline
+    0x05 & STREAM\_STATE\_ERROR & An endpoint received a frame for a stream that was not in a state that permitted that frame. \\ \hline
+    0x0a & PROTOCOL\_VIOLATION & An endpoint detected an error with protocol compliance that was not covered by more specific error codes. \\ \hline
+    0x0c & APPLICATION\_ERROR & The application or application protocol caused the connection to
+be closed. \\ \hline
+    0x0f & AEAD\_LIMIT\_REACHED & An endpoint has reached the confidentiality or integrity limit
+for the AEAD algorithm used by the given connection. \\ \hline
+    0x10 & NO\_VIABLE\_PATH & An endpoint has determined that the network path is incapable of supporting QUIC. \\ \hline
+    \end{tabular}
+\end{center}
+\caption{A Selection of QUIC Transport Error Codes \cite[121]{rfc9000}}
+\label{tabelle_transport_error_codes}
+\end{table}
 
-If a protocol error occurs, the connection may be terminated either immediately or instant.
+In addition to handling protocol-level errors, QUIC also provides mechanisms for applications to detect and respond to errors specific to their use cases. By leveraging QUIC's extensibility and flexibility, applications can define custom error codes and error handling logic tailored to their requirements. This enables applications to gracefully handle errors such as resource exhaustion, application-layer protocol violations, or user-defined conditions, enhancing the overall robustness and resilience of QUIC-based applications. Application-defined error codes can be utilized for various purposes, including the RESET\_STREAM frame, the STOP\_SENDING frame, and the CONNECTION\_CLOSE frame with a type of 0x1d (\ref{table_frame_types}).
 
 \section{Security} \label{security}
 
-TLS Integration into QUIC, renewing keysets, different keysets for 0-RTT and 1-RTT, Partial Header Protection, Full Payload Protection
+QUIC operates under the assumption of a threat model described in existing security considerations, addressing both passive and active attacks. Passive attackers can intercept packets, while active attackers can manipulate or inject packets into the network, potentially altering packet routes.
+Attackers are further categorized as on-path or off-path, depending on their ability to intercept and manipulate packets. On-path attackers have direct access to packet routes, enabling various forms of interference, including modification and packet dropping. Off-path attackers, though unable to directly manipulate packet routes, can still intercept and inject packets into the network.
+The handshake process in QUIC leverages TLS 1.3, inheriting its cryptographic properties and protections like continuously renewing keysets or different protection levels for different packet types. Any compromise in the TLS handshake could impact the security guarantees provided by QUIC. Moreover, QUIC incorporates defenses against denial-of-service (DoS) attacks during the handshake, such as address validation and server-side DoS prevention mechanisms.
+Packet protection in QUIC employs authenticated encryption, ensuring the integrity and confidentiality of transmitted data. While both on-path and off-path attackers can passively observe packets, active attacks are mitigated by cryptographic protection, preventing unauthorized modifications to packet payloads.
+Connection migration capabilities in QUIC allow endpoints to transition between network paths while maintaining security. Path validation mechanisms help mitigate address spoofing attacks, limiting the impact of packet interception and manipulation.
+
+\subsection{Security Considerations by QUIC}
+
+In its specification, QUIC lists several considerations which had an impact on its design, including known attacks and countermeasures\cite{rfc9000}. These encompass but are not limited to the following:
+
+\begin{itemize}
+    \item \textbf{Amplification Attacks} exploit an address validation token to spoof the same address for a 0-RTT connection. An attacker is then able to direct a server to send data towards a victim endpoint. Mitigation involves limiting token usage and lifetime.
+    \item \textbf{Optimistic ACK Attacks} involve an endpoint acknowledging packets which it did not received and can lead to the congestion controller permitting excessive sending rates. Endpoints may close the connection upon detecting this behavior.
+    \item \textbf{Explicit Congestion Notification Attacks} are performed by manipulating ECN fields in the IP Header to influence the sender's rate of transmission. Therefore endpoints may ignore ECN fields until at least one QUIC packet from the IP packet is processed without errors.
+    \item \textbf{Targeted Attacks by Routing} can be prevented by limiting the ability of an attacker to target a new connection to a particular server instance.
+\end{itemize}
+
+\subsection{Tested Attacks}
+
+\begin{table}[H]
+\begin{center}
+    \begin{tabular}{| p{40mm} | l | p{60mm} | l |}
+    \hline
+    \textbf{Attack Name} & \textbf{Type} & \textbf{Impact} & \textbf{Reference} \\ \hline
+    Source-Address Token Replay Attack & Replay & Server DoS & \cite{quic_security_2} \\ \hline
+    Packet Manipulation Attack & Manipulation & Connection establishment failure / server load & \cite{quic_security_1} \cite{quic_security_2} \\ \hline
+    Crypto Stream Offset Attack & Manipulation & Connection establishment failure & \cite{quic_security_1} \\ \hline
+    Randomized Packet Fuzzing & Fuzzing & Possible server crash & \cite{quic_security_3} \\ \hline
+    \end{tabular}
+\end{center}
+\caption{A selection of tested attacks against QUIC}
+\label{table_tested_attacks}
+\end{table}
+
+\subsubsection{Source-Address Token Replay Attack}
+
+The Source-Address Token Replay Attack exploits the vulnerability of the initial token, which is designed to prevent packet spoofing by verifying that a connection request originates from the claimed IP address. The token is generated by the server as part of the server reject message and contains encrypted information about the client's IP address and current time. In order to establish a 0-RTT connection, a client must provide a valid token in its 
+ClientHello message before encryption is established.
+However, since the token must be presented prior to encryption, any attacker capable of intercepting network traffic can gather tokens, enabling them to spoof connection requests from a specific host for a limited time, typically 24 hours. This attack works by monitoring the network for ServerReject messages from the targeted server, each containing a new token sent to a client. Upon detecting a new token, the attacker captures it along with the public key and the client's IP address, then initiates repeated spoofed 0-RTT connection attempts using random connection IDs from the same client.
+To the target server, these spoofed requests appear legitimate, as the token is replayed from a genuine connection with an actual client at the forged IP address. Consequently, the server proceeds to establish a new connection, generating initial and forward secure encryption keys and sending an ServerHello message, under the impression that it has completed the connection establishment with the falsified client.
+
+\subsubsection{Packet Manipulation Attack}
+
+Unencrypted QUIC packets lack protection against adversarial tampering. If an attacker assumes the role of a MiTM by gaining access to the communication channel, they can manipulate unprotected parameters such as the connection identifier or source address token through fabrication. This manipulation can result in the client and server deriving different initial keys, causing the connection establishment to fail. Subsequently, the server prompts the client to renegotiate the connection establishment, but due to the protocol's low round-trip time, the adversary can once again manipulate packets, leading to an endless loop of connection establishment attempts for the client. Consequently, the client's quality of experience is significantly diminished, potentially resulting in connection abandonment.
+
+A potential solution would require a signature of all the unencrypted fields. Though that is not only possible but also a proven technique in preventing tampering, it incurs a significant computing overhead which could then again be taken advantage of in a Denial of Service attack.
+
+\subsubsection{Crypto Stream Offset Attack}
+
+In QUIC, all handshake messages constitute a continuous byte-stream. If a MiTM adversary gains access to the communication channel and inserts random data to disrupt this byte-stream, they can effectively disrupt the entire stream and halt the connection establishment process. Consequently the legitimate user is denied access to the intended web service and may have to revert to using TLS/TCP, resulting in increased RTT. In both scenarios, while the server's quality of service may remain unaffected, the client's quality of experience suffers a decline.
+
+\subsubsection{Randomized Packet Fuzzing}
+
+Fuzzing involves supplying programs with randomized inputs and observing how they behave in response. G.S. Reen \cite{quic_security_3} uses the self developed \textit{DPIFuzz}, a stateless fuzzing framework, to test different open-source QUIC implementations by duplicating packet numbers or randomizing stream offsets and identifiers. Fuzzing attacks in general do not aim at gaining access to confidential data, but to produce undefined behaviour and exploit unchecked edge cases. Therefore this attack could only be used in an attack against a server as it requires full access to the decrypted packets. Nevertheless, it presents a considerable security issue because G.S. Reen was able to crash multiple QUIC implementations.

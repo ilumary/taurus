@@ -1,25 +1,246 @@
 \chapter{Implementation}
 
-\section{Choice of Rust \& Scope of Implementation}
+This chapter covers a implementation of the QUIC protocol in Rust as standalone program including its design and source code. Provided code examples may be simplified from the original implementation. 
 
-\section{Development Environment \& External Libraries}
+\section{Design Decisions}
 
-\section{Library Layout}
+The implementation of QUIC is written in Rust (\lstinline{v1.72.0}). The decision had two main reasons.
+\begingroup
+\renewcommand\labelenumi{(\theenumi)}
+\begin{enumerate}
+\item \textbf{Performance and Safety:} Rust offers exceptional performance and its built-in ownership system prevents memory leaks and data races. This is highly beneficial for building efficient and error-free programs. Furthermore, Rust's static typing guarantees memory safety at compile time, significantly reducing the risk of security vulnerabilities and crashes.
+\item \textbf{Rich Ecosystem and Ease of Use:} Rust boasts a mature ecosystem of well-maintained libraries. These libraries integrate seamlessly into the project through Rust's included packet manager, Cargo. Additionally, compared to C/C++, Rust offers significant advantages in platform independence. Building and testing source-code is simpler and less error-prone thanks to Cargo and Rust's built-in testing frameworks.
+\end{enumerate}
+\endgroup
 
-Connection and Endpoint as main parts of the Library. Designed to allow stateless packet handling in endpoint.
+The implementation works as standalone program, exposing just a server endpoint, and relies on the Rust standard library (std). The latter is essential, because the std provides a complete UDP socket and the possibility to utilise numerous external libraries (\ref{ext_libs}).
+
+\subsection{Scope}
+
+A complete QUIC implementation presents a major challenge, considering the extent of QUIC and the time limitation of this thesis. Therefore only a subset of the QUIC specification is going to be implemented. This includes:
+
+\begin{itemize}
+    \item Sending and receiving of QUIC packets through a server endpoint
+    \item Decrypting and encrypting the header and payload of QUIC packets
+    \item Parsing and processing of all header types and packet payload, mainly comprised of CRYPTO, ACK and STREAM frames
+    \item Constructing packets, including acknowledgements for received packets and crypto data used in the handshake
+    \item Accepting incoming connections, including a full TLS 1.3 1-RTT handshake
+    \item Packet handling and management through all three packet number spaces
+\end{itemize}
+
+Due to the mentioned constraints of time and complexity, the following features could not be implemented:
+\begin{itemize}
+    \item 0-RTT handshake
+    \item Ack-based loss detection, congestion and flow control
+    \item Version negotiation and retry packets
+\end{itemize} 
+
+\subsection{Program Layout}
+
+The program layout follows the by Rust encouraged modularisation of logic into binaries, libraries and modules. The entry point of the program lies in the \code{main.rs} file which contains the main function. This file is compiled into a standalone binary executable.
+
+\begin{figure}[htb]
+    \centering
+\begin{verbatim}
+project
+   |- Cargo.toml
+   |- Cargo.lock
+   |- README.md
+   |- src/
+       |- main.rs
+       |- quic/
+           |- lib.rs
+           |- frame.rs
+           |- stream.rs
+           |- [...]
+\end{verbatim}
+    \caption{Source code directory tree}
+    \label{source_code_tree}
+\end{figure}
+
+The project leverages an internal library named \code{quic} located in the dedicated \code{src/quic} folder. Internal libraries encapsulate several modules, each contained in its own file, and can be used within the context of the overlying binary. A rust library can only be accessed through the \code{lib.rs} file, which exposes all public functionality through the dedicated namespace, in this case \code{quic::}. 
+
+This modular structure separates the main program logic (implemented in \code{main.rs}) from the reusable functionalities provided by the \code{quic} library. This increases code organization, reusability, and maintainability of the project.
+
+\subsection{Development Environment}
+
+The development environment for this project utilizes the Rust compiler version 1.72.0 on macOS 14.2 (Sonoma). However, due to Rust's inherent portability, the compiled binary can run on any platform that supports the mentioned Rust compiler version.
+
+\subsubsection{Testing}
+
+Testing the QUIC library and the overlying server binary has to be done in two different ways. Firstly, rusts built-in unit testing framework is used to test single functions of the library for their intended functionality. However, simply unit testing parts of the QUIC library does not offer the required level of testing coverage. To test for full protocol functionality, a complete QUIC implementation is needed which acts as client and simulates authentic packets with requests and answers. To achieve this, the open-source QUIC implementation quinn\footnote{\url{https://github.com/quinn-rs/quinn}} is used which provides a simple client example out of the box. This setup has the additional benefit of locality, which means that client and server will connect only over the local host and therefore packet loss and connection timeouts can be disregarded initially for the quic library implementation.
+
+\subsubsection{External Libraries} \label{ext_libs}
+
+\begin{table}[H]
+\begin{center}
+    \begin{tabular}{| l | l | p{100mm} | l |}
+    \hline
+    \textbf{Name} & \textbf{Version} & \textbf{Purpose} & \textbf{Reference} \\ \hline
+    rustls & 0.21.7 & Full TLS 1.3 Implementation with API specifically for QUIC & \cite{rustls} \\ \hline
+    octets & 0.3.0 & Zero-copy mutable byte buffer wrapper & \cite{octets} \\ \hline
+    rcgen & 0.12.0 & Generate self signed X.509 certificates & \cite{rcgen} \\ \hline
+    ring & 0.17.7 & Using HMAC to generate reset tokens from connection ids & \cite{ring} \\ \hline
+    \end{tabular}
+\end{center}
+\caption{External Libraries}
+\label{ext_libs}
+\end{table}
+
+\section{QUIC Library} \label{quic_lib}
+
+The QUIC library is designed to work on two levels: the endpoint and the connections. An endpoint can manage multiple connections and handles incoming packets. Arriving packets are either matched to an existing connection and handed off or, in the case of initial packets, decrypted inside the endpoint and then handed off into a newly created connection. This saves the endpoint from having to keep the state of each connection and therefore allows for stateless packet handling in the endpoint. This is also made possible because the initial keying material is derived from the initial destination connection id. In the case of an existing connection, packets are decrypted inside the connection as vastly more complex keying material is needed which is only kept inside the connection context. This allows for a nearly perfect distinction between contexts. 
+
+\subsection{Endpoint}
+
+The endpoint structure holds the endpoint itself, a optional server config in case the endpoint assumes the role of a server, a randomly generated hmac reset key to generate reset tokens, a vector which stores the connections itself and a hash map which uses the connection id as key to store connection handles. A connection handle is a plain type alias for a \code{usize} and simply refers to the index of a connection inside the vector. This approach allows for more efficient and faster code because handles can easily be copied and passed around without having to copy the whole \code{Connection} object every time. Also through the inherent design of Rust it is impossible to just create an arbitrary number of pointers every time a connection is needed. 
+
+(One may argue that using a HashMap also introduces a costly operation)
+
+(Endpoint struct may be extended by outer shell to be server or client)
+
+\begin{codeblock}{lib.rs (Endpoint)}{Rust}
+  \begin{rustcode}
+    pub struct Endpoint {
+        socket: UdpSocket,
+
+        //server config for rustls
+        server_config: Option<rustls::ServerConfig>,
+        //RFC 2104, used to generate reset tokens from connection ids
+        hmac_reset_key: ring::hmac::Key,
+
+        //stores connection handles
+        connections: Vec<Connection>,
+        conn_db: HashMap<ConnectionId, Handle>,
+    }
+  \end{rustcode}
+\end{codeblock}
+
+\subsection{Connection}
+
+The \code{Connection} struct encapsulates all required state information for a complete connection. 
+
+**Key Fields:**
+
+**General Connection Details:**
+
+- **side:** Specifies whether this is a client-side or server-side connection.
+- **remote:** Stores the peer's IP address and port.
+- **state:** Represents the current state of the QUIC connection, likely indicating its progress within the protocol's handshake and data transfer phases.
+- **recved, sent, lost:** Track packet statistics for received, sent, and lost packets, likely used for performance monitoring and congestion control.
+
+**TLS Security:**
+
+- **tls_session:** Represents the active TLS 1.3 session established for this QUIC connection, providing encryption and authentication.
+- **next_secrets, prev_1rtt_keys, next_1rtt_keys, initial_keyset, zero_rtt_keyset:** Manage keys and secrets used for encrypting and decrypting QUIC packets, ensuring confidentiality and integrity within different phases of the protocol.
+
+**Connection IDs and State Management:**
+
+- **active_cids:** Vector containing currently active connection IDs, used for identifying and tracking multiple connections.
+- **initial_dcid, initial_remote_scid, initial_local_scid, rscid:** Store various connection IDs exchanged during the handshake process, essential for connection setup and resilience.
+- **packet_spaces, current_space:** Manage packet number spaces within different protocol phases, ensuring reliable packet delivery and reordering protection.
+
+**Zero RTT Optimization:**
+
+- **zero_rtt_enabled:** Indicates whether 0-RTT (Zero Round-Trip Time) is enabled, potentially allowing faster connection establishment for subsequent connections.
+
+\begin{codeblock}{lib.rs (Connection)}{Rust}
+  \begin{rustcode}
+    struct Connection {
+        //side
+        side: Side,
+    
+        //tls13 session via rustls and keying material
+        tls_session: RustlsConnection,
+        next_secrets: Option<rustls::quic::Secrets>,
+        prev_1rtt_keys: Option<PacketKeySet>,
+        next_1rtt_keys: Option<PacketKeySet>,
+        initial_keyset: Keys,
+        zero_rtt_keyset: Option<Keys>,
+    
+        //connection state
+        state: ConnectionState,
+    
+        //active connection ids
+        active_cids: Vec<ConnectionId>,
+    
+        // First received dcid
+        initial_dcid: ConnectionId,
+        // First received scid
+        initial_remote_scid: ConnectionId,
+        // First generated scid after handshake receive
+        initial_local_scid: ConnectionId,
+        // Retry Source Connection Id
+        rscid: Option<ConnectionId>,
+    
+        // Packet number spaces, inital, handshake, 1-RTT
+        packet_spaces: [PacketSpace; 3],
+        current_space: u8,
+    
+        // Physical address of connection peer
+        remote: SocketAddr,
+    
+        // Packet stats
+        recved: u64,
+        sent: u64,
+        lost: u64,
+    
+        //0-Rtt enabled
+        zero_rtt_enabled: bool,
+    }
+  \end{rustcode}
+\end{codeblock}
+
+\begin{codeblock}{lib.rs (PacketNumberSpace)}{Rust}
+  \begin{rustcode}
+    pub struct PacketNumberSpace {
+        keys: Option<Keys>,
+    
+        outstanding_acks: Vec<u64>,
+    
+        outstanding_crypto_data: Option<Vec<u8>>,
+    
+        max_acked_pkt: Option<u64>,
+    
+        next_pkt_num: u64,
+    }
+  \end{rustcode}
+\end{codeblock}
 
 \section{Packets}
 
 (coalesced) packets, header struct, partial parse of header, decrypting, encrypring, frame parsing
 
+\begin{codeblock}{lib.rs (Header)}{Rust}
+  \begin{rustcode}
+    pub struct Header {
+        hf: u8, //header form and version specific bits
+        version: u32,
+        dcid: ConnectionId,
+        scid: ConnectionId,
+    
+        //The following fields are under header protection
+        packet_num: u32,
+        packet_num_length: usize,
+        token: Option<Vec<u8>>,
+    
+        //packet length including packet_num
+        packet_length: usize,
+    
+        //header length including packet_num
+        length: usize,
+    }
+  \end{rustcode}
+\end{codeblock}
+
 \section{Connection}
 
-connection accepting, structure of packet that goes through connection, connection handling, streams, connection flow, sending
+connection accepting, tls session, structure of packet that goes through connection, connection handling, streams, connection flow, sending
 
 \section{Error Handling}
 
 quic errors, implementation specific errors
 
-\section{Testing \& Validating}
+\section{Testing and Validation}
 
 tested code, validating
