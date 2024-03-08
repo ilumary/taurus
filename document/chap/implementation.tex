@@ -89,11 +89,25 @@ Testing the QUIC library and the overlying server binary has to be done in two d
 
 \section{QUIC Library} \label{quic_lib}
 
-The QUIC library is designed to work on two levels: the endpoint and the connections. An endpoint can manage multiple connections and handles incoming packets. Arriving packets are either matched to an existing connection and handed off or, in the case of initial packets, decrypted inside the endpoint and then handed off into a newly created connection. This saves the endpoint from having to keep the state of each connection and therefore allows for stateless packet handling in the endpoint. This is also made possible because the initial keying material is derived from the initial destination connection id. In the case of an existing connection, packets are decrypted inside the connection as vastly more complex keying material is needed which is only kept inside the connection context. This allows for a nearly perfect distinction between contexts. 
+The QUIC library is designed to work on two levels: the endpoint and the connection. An endpoint can manage multiple connections and handles
+incoming packets. Arriving packets are either matched to an existing connection and handed of, or in the case of initial packets, decrypted
+inside the endpoint and then handed of into a newly created connection. This saves the endpoint from having to retrieve the state of each connection
+and therefore allows for stateless packet handling in the endpoint. This is also made possible because the initial keying material is derived
+from the initial destination connection id. In the case of an existing connection, packets are decrypted inside the connection as vastly more
+complex keying material is needed which is only kept inside the connection context. This allows for a nearly perfect distinction between contexts.
+After handling a packet, a connection emits an event. A server or client implementation may act upon this event by either passing it into
+the endpoint as it is or by choosing another action, i.e. a server may choose to either ignore initial packets from clients or immediately close
+the connection if the endpoint is overloaded. In both ways, the endpoint retrieves the connection from the handle contained in the event and
+passes the event further down into the connection itself which then builds one or multiple, coalesced answer packets. 
 
 \subsection{Endpoint}
 
-The endpoint structure holds the endpoint itself, a optional server config in case the endpoint assumes the role of a server, a randomly generated hmac reset key to generate reset tokens, a vector which stores the connections itself and a hash map which uses the connection id as key to store connection handles. A connection handle is a plain type alias for a \inlinecode{usize} and simply refers to the index of a connection inside the vector. This approach allows for more efficient and faster code because handles can easily be copied and passed around without having to copy the whole \inlinecode{Connection} object every time. Also through the inherent design of Rust it is impossible to just create an arbitrary number of pointers every time a connection is needed. 
+The endpoint structure holds the endpoint itself, a optional server config in case the endpoint assumes the role of a server, a randomly generated
+hmac reset key to generate reset tokens, a vector which stores the connections itself and a hash map which uses the connection id as key to store
+connection handles. A connection handle is a plain type alias for a \inlinecode{usize} and simply refers to the index of a connection inside the
+vector. This approach allows for more efficient and faster code because handles can easily be copied and passed around without having to copy the
+whole \inlinecode{Connection} object every time. Also through the inherent design of Rust it is impossible to just create an arbitrary number of
+pointers every time a connection is needed. 
 
 (One may argue that using a HashMap also introduces a costly operation)
 
@@ -118,31 +132,17 @@ The endpoint structure holds the endpoint itself, a optional server config in ca
 
 \subsection{Connection}
 
-The \inlinecode{Connection} struct encapsulates all required state information for a complete connection. 
-
-Key Fields:
-
-General Connection Details:
-
-- side: Specifies whether this is a client-side or server-side connection.
-- remote: Stores the peer's IP address and port.
-- state: Represents the current state of the QUIC connection, likely indicating its progress within the protocol's handshake and data transfer phases.
-- recved, sent, lost: Track packet statistics for received, sent, and lost packets, likely used for performance monitoring and congestion control.
-
-TLS Security:
-
-- tls\_session: Represents the active TLS 1.3 session established for this QUIC connection, providing encryption and authentication.
-- next\_secrets, prev\_1rtt\_keys, next\_1rtt\_keys, initial\_keyset, zero\_rtt\_keyset: Manage keys and secrets used for encrypting and decrypting QUIC packets, ensuring confidentiality and integrity within different phases of the protocol.
-
-Connection IDs and State Management:
-
-- active\_cids: Vector containing currently active connection IDs, used for identifying and tracking multiple connections.
-- initial\_dcid, initial\_remote\_scid, initial\_local\_scid, rscid: Store various connection IDs exchanged during the handshake process, essential for connection setup and resilience.
-- packet\_spaces, current\_space: Manage packet number spaces within different protocol phases, ensuring reliable packet delivery and reordering protection.
-
-Zero RTT Optimization:
-
-- zero\_rtt\_enabled: Indicates whether 0-RTT (Zero Round-Trip Time) is enabled, potentially allowing faster connection establishment for subsequent connections.
+The \inlinecode{Connection} struct encapsulates all required state information for a complete connection. Key Fields include the \inlinecode{side},
+which is either \inlinecode{Server} or \inlinecode{Client}, the \inlinecode{remote} which stores the current IP address and port of the peer and the 
+\inlinecode{state} which represents the current connection state. To keep track of packet stats, the fields \inlinecode{recved}, \inlinecode{sent} and 
+\inlinecode{lost} are incremented accordingly. The \inlinecode{tls\_session} field encapsulates all functioinality of TLS1.3 and is the main object
+imported from rustls (\ref{ext_libs}). A rustls connection object is used to consume and generate handshake data, manage crypto material and check for
+any tls specific alerts or errors. In addition, the fields \inlinecode{next\_secrets}, \inlinecode{prev\_1rtt\_keys}, \inlinecode{next\_1rtt\_keys},
+\inlinecode{initial\_keyset} and \inlinecode{zero\_rtt\_keyset}, are used to keep track of specific crypto material which is kept outside of the packet
+number spaces. \inlinecode{initial\_dcid}, \inlinecode{initial\_remote\_scid}, \inlinecode{initial\_local\_scid} and \inlinecode{rscid} hold all connection
+ids which a connection needs to remember. For example, \inlinecode{initial\_dcid} is used in zero-rtt packets. All packet number spaces are kept inside
+\inlinecode{packet\_spaces}(\ref{packet_number_space}) with the current space being held inside \inlinecode{current\_space}. Lastly, \inlinecode{zero\_rtt\_enabled}
+dictates if a connection allows a zero rtt handshake, potentially allowing faster connection establishment for subsequent connection reestablishment.
 
 \begin{codeblock}{lib.rs (Connection)}{Rust}
   \begin{rustcode}
@@ -158,11 +158,7 @@ Zero RTT Optimization:
         initial_keyset: Keys,
         zero_rtt_keyset: Option<Keys>,
     
-        //connection state
         state: ConnectionState,
-    
-        //active connection ids
-        active_cids: Vec<ConnectionId>,
     
         // First received dcid
         initial_dcid: ConnectionId,
@@ -175,7 +171,7 @@ Zero RTT Optimization:
     
         // Packet number spaces, inital, handshake, 1-RTT
         packet_spaces: [PacketSpace; 3],
-        current_space: u8,
+        current_space: usize,
     
         // Physical address of connection peer
         remote: SocketAddr,
@@ -191,25 +187,90 @@ Zero RTT Optimization:
   \end{rustcode}
 \end{codeblock}
 
+\subsection{Packet Number Spaces}
+
+Each connection has three packet number spaces (initial, handshake, 1-rtt)(\ref{packet_number_space}). Each individual \inlinecode{PacketNumberSpace}
+keeps track of three aspects: The keyset specific to that packet number space, acknowledgements for in and outgoing packets and the next packet
+number. Additionally, two of the three packet number spaces, that is initial and handshake, have an outgoing crypto buffer. 
+
 \begin{codeblock}{lib.rs (PacketNumberSpace)}{Rust}
   \begin{rustcode}
     pub struct PacketNumberSpace {
         keys: Option<Keys>,
     
-        outstanding_acks: Vec<u64>,
+        outgoing_acks: Vec<u64>,
     
-        outstanding_crypto_data: Option<Vec<u8>>,
+        outgoing_crypto_data: Option<Vec<u8>>,
     
         max_acked_pkt: Option<u64>,
     
         next_pkt_num: u64,
     }
   \end{rustcode}
+  \label{packet_number_space}
+\end{codeblock}
+
+\subsection{Connection ID}
+
+Each connection id is represented by the respective \inlinecode{ConnectionId} struct. It merely contains a byte vector and derives from
+Eq, Hash, PartialEq and Clone to provide basic functionality like comparison to other connection ids without having to explicitly
+implement each method seperately. Additionally \inlinecode{ConnectionId} implements a method to retrieve its length
+(\inlinecode{len(\&self) -> usize}) and another to get an immutable reference \inlinecode{as\_slice(\&self) -> \&[u8]} to the underlying data.
+
+\begin{codeblock}{lib.rs (ConnectionId)}{Rust}
+    \begin{rustcode}
+        #[derive(Eq, Hash, PartialEq, Clone)]
+        pub struct ConnectionId {
+            id: Vec<u8>,
+        }
+    \end{rustcode}
+    \label{connection_id}
+\end{codeblock}
+
+A \inlinecode{ConnectionId} can be created by providing raw byte data, as default with size zero or as randomized id with a specified
+length.
+
+\begin{codeblock}{lib.rs (impl ConnectionId)}{Rust}
+    \begin{rustcode}
+        pub fn generate_with_length(length: usize) -> Self {
+            assert!(length <= MAX_CID_SIZE);
+            let mut b = [0u8; MAX_CID_SIZE];
+            rand::thread_rng().fill_bytes(&mut b[..length]);
+            ConnectionId::from_vec(b[..length].into())
+        }
+
+        #[inline]
+        pub const fn from_vec(cid: Vec<u8>) -> Self {
+            Self { id: cid }
+        }
+
+        #[inline]
+        fn default() -> Self {
+            Self::from_vec(Vec::new())
+        }
+    \end{rustcode}
+    \label{connection_id_generation}
 \end{codeblock}
 
 \section{Packets}
 
-(coalesced) packets, header struct, partial parse of header, decrypting, encrypring, frame parsing
+A packet on its own does not have a dedicated struct. Instead a buffer is declared once as a fixed sized array for every UDP datagram received
+and only the header and
+individual frames are constructed as seperate structs. Through the use of references and \inlinecode{OctetsMut} objects, which is a really small
+zero-copy wrapper, we avoid expensive copying while still maintaining 100\% memory safety. The stack buffer has a fixed size of 65536
+bytes, which is the maximum UDP datagram size. The advantage of this approach is that no dynamic memory allocation is needed. However,
+always using the maximum buffer size may implicate a major overhead in memory use which could become a concern should the server go into
+the thousands of open connections. Considering a fairly modern system with at least 16GB of RAM, one can simply calculate that the CPU
+would still be the first bottleneck by a long shot. Therefore the "lazy" approach has a significant advantage over the dynamic approach in
+that it offers superior performance and increased simplicity over minor memory efficiency gains.
+
+\subsection{Header}
+
+The \inlinecode{Header} struct contains all fields both long and short headers contain and is therfore used throughout thw whole library.
+The first header byte (\inlinecode{hf} = header form), which also includes the header type and packet specific bits, is saved without
+modification. Individual values may be extracted through bitshifting. Other fields include \inlinecode{version}, \inlinecode{dcid}, \inlinecode{scid},
+\inlinecode{packet\_num}, \inlinecode{packet\_num\_length}, \inlinecode{token} and \inlinecode{packet\_length}. The last field,
+\inlinecode{length}, does not stem from the specification but has been added for debug purposes.
 
 \begin{codeblock}{lib.rs (Header)}{Rust}
   \begin{rustcode}
@@ -233,13 +294,314 @@ Zero RTT Optimization:
   \end{rustcode}
 \end{codeblock}
 
+The implementation of \inlinecode{Header} provides important functionality to decode and decrypt a header and vice versa. The function
+\inlinecode{parse\_from\_bytes()}(\ref{header_parse_from_bytes}) takes a mutable reference to a \inlinecode{OctetsMut} object, which wraps the raw,
+received buffer, and
+a destination connection id length which has to be known when receiving short header packets as they do not dictate the length of the connection
+id in their header. The function returns either the decoded header inside a \inlinecode{Header} object or an \inlinecode{BufferTooShortError} which
+is provided by the \inlinecode{octets} crate. It is used to perform a partial decode of the header, that is parsing all fields that are not protected
+by QUICs partial
+header protection. To fill in the remaining fields, one has to call \inlinecode{decrypt()}(\ref{header_decrypt}) which takes a mutable reference to
+itself and a \inlinecode{OctetsMut} object and a reference to a \inlinecode{HeaderProtectionKey}. It returns just an error, should one occur, and utilizes
+\inlinecode{decrypt\_in\_place()} by rustls to decrypt the header and then fills in the remaining fields \inlinecode{packet\_num\_length} and
+\inlinecode{packet\_num}. The header form bit is also overwritten as it contains encrypted fields in its original state.
+
+\subsubsection{Parsing and Decrypting}
+
+\begin{codeblock}{lib.rs (Header)}{Rust}
+    \begin{rustcode}
+        pub fn parse_from_bytes(
+            b: &mut octets::OctetsMut,
+            dcid_len: usize,
+        ) -> Result<Header, BufferTooShortError> {
+            //get header form as raw byte
+            let hf = b.get_u8()?;
+
+            if ((hf & LS_TYPE_BIT) >> 7) == 0 {
+                [...] //short packet
+            }
+
+            let version = b.get_u32()?;
+
+            let dcid_length = b.get_u8()?;
+            let dcid = b.get_bytes(dcid_length as usize)?.to_vec();
+
+            let scid_length = b.get_u8()?;
+            let scid = b.get_bytes(scid_length as usize)?.to_vec();
+
+            let mut tok: Option<Vec<u8>> = None;
+
+            match (hf & TYPE_MASK) >> 4 {
+                0x00 => {
+                    // Initial
+                    tok = Some(b.get_bytes_with_varint_length()?.to_vec());
+                }
+                [...] //Zero-RTT, Handshake, Retry
+                _ => panic!("Fatal Error with packet type"),
+            }
+
+            let pkt_length = b.get_varint()?;
+
+            [...]
+        }
+    \end{rustcode}
+    \label{header_parse_from_bytes}
+\end{codeblock}
+
+The function \inlinecode{parse\_from\_bytes()}(\ref{header_parse_from_bytes}), shown slightly simplified, performs a partial decode of
+an encrypted header. The presented version shows all necessary code to decode an initial packet. The \inlinecode{octets} library
+enables an easy and readable way to step through a byte buffer, i.e. the function \inlinecode{get\_bytes\_with\_varint\_length()}
+decodes a variably encoded integer from the current offset and then gets that amount of bytes as a slice \inlinecode{\&[u8]} and
+\inlinecode{to\_vec()} then transforms the data into a vector.
+
+The \inlinecode{decrypt()}(\ref{header_decrypt}) function presents a greater challenge. When calling \inlinecode{decrypt()} the current pointer inside the
+buffer points at the start of the packet number which is encrypted. Additionally the length of the packet number is unknown as
+it is also encrypted inside the first byte of the header. However, when decrypting, we need the first 16 bytes of the payload
+because they are used as sample input. Therefore the buffer is first split after the maximal packet number length (four bytes)
+and the sample length. Then \inlinecode{decrypt\_in\_place()} is called on the \inlinecode{HeaderProtectionKey} and the
+previously seperated sample, the header form byte and the encrypted packet number are passed as paramters. As soon as the header
+form byte is decrypted, the packet number length can be extracted and subsequently the packet number can be read.
+
+\begin{codeblock}{lib.rs (Header)}{Rust}
+    \begin{rustcode}
+        pub fn decrypt(
+            &mut self,
+            b: &mut octets::OctetsMut,
+            header_key: &HeaderProtectionKey,
+        ) -> Result<(), BufferTooShortError> {
+            // get packet number and sampled payload cipher
+            let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN + SAMPLE_LEN)?;
+            let (mut pn_cipher, sample) = pn_and_sample.split_at(MAX_PKT_NUM_LEN)?;
+
+            match header_key.decrypt_in_place(sample.as_ref(), &mut self.hf, pn_cipher.as_mut()) {
+                Ok(_) => (),
+                Err(error) => panic!("Error decrypting header: {}", error),
+            }
+
+            self.packet_num_length = usize::from((self.hf & PKT_NUM_LENGTH_MASK) + 1);
+
+            self.length += self.packet_num_length;
+
+            self.packet_num = match self.packet_num_length {
+                1 => u32::from(b.get_u8()?),
+                2 => u32::from(b.get_u16()?),
+                3 => b.get_u24()?,
+                4 => b.get_u32()?,
+                _ => return Err(BufferTooShortError),
+            };
+
+            Ok(())
+        }
+    \end{rustcode}
+    \label{header_decrypt}
+\end{codeblock}
+
+\subsection{Payload}
+
+A packets payload does only consist of an arbitrary number of frames (\ref{table_frame_types}). To provide as much flexibility as possible
+while also considering code and library structure, I chose to utilise rusts \inlinecode{trait} feature. A \inlinecode{trait} can be
+applied to any struct and forces the implementation of the specified methods. It is similar to an \inlinecode{Interface} in Java.
+In this case, the \inlinecode{Frame} trait enforces
+the implementation of three functions: \inlinecode{from\_bytes()}, \inlinecode{to\_bytes()} and \inlinecode{len()}. These functions
+provide the basic functionality to read and write frames from a buffer. Most of the
+frames specified in Table \ref{table_frame_types} have a dedicated struct, for example the \inlinecode{CRYPTO} and \inlinecode{ACK} frames.
+The exception are frames which only consits of one to two data fields and therefore can be trivially read and written from and into
+a buffer, for example \inlinecode{PATH\_CHALLENGE}, \inlinecode{MAX\_STREAMS} and \inlinecode{MAX\_STREAM\_DATA} frames.
+
+\begin{codeblock}{frame.rs}{Rust}
+    \begin{rustcode}
+        pub trait Frame {
+            fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self;
+
+            fn to_bytes(&self, bytes: &mut octets::OctetsMut<'_>);
+
+            fn len(&self)
+        }
+    \end{rustcode}
+\end{codeblock}
+
+A frame which has the \inlinecode{Frame} trait enforced, is the \inlinecode{CRYPTO} frame. As per specification \cite[110]{rfc9000},
+it has the type field which is set to 0x06, an offset, a length and the actual data. The type field can be ommitted, as well as the
+length field because the data is copied into a vector of which we can directly get the length using the \inlinecode{len()} function.
+Writing the same frame to a buffer therefore presents only a trivial problem. All other frames with dedicated structs follow the same
+pattern.
+
+\begin{codeblock}{frame.rs (CRYPTO frame)}{Rust}
+    \begin{rustcode}
+        pub struct CryptoFrame {
+            offset: u64,
+            crypto_data: Vec<u8>,
+        }
+    \end{rustcode}
+\end{codeblock}
+
+\begin{codeblock}{frame.rs (CRYPTO frame)}{Rust}
+    \begin{rustcode}
+        impl Frame for CryptoFrame {
+            fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self {
+                let offset = bytes.get_varint().unwrap();
+
+                CryptoFrame {
+                    offset,
+                    crypto_data: bytes.get_bytes_with_varint_length().unwrap().to_vec(),
+                }
+            }
+
+            [...] //to_bytes(), len()
+        }
+    \end{rustcode}
+\end{codeblock}
+
+\subsection{Streams}
+
+\todo{do the damn streams}
+
+\subsection{Events}
+
+Events are omitted by a connection or the endpoint when a new packet arrives and may be acted upon in the application implementation. Each variation
+contains the according connection handle so than any event can be associated with the correct connection. 
+
+\begin{codeblock}{lib.rs (Event)}{Rust}
+    \begin{rustcode}
+        pub enum Event {
+            NewConnection(Handle),
+            Handshaking(Handle),
+            ConnectionEstablished(Handle),
+            DataExchange(Handle),
+            ConnectionClosed(Handle),
+        }
+    \end{rustcode}
+\end{codeblock}
+
 \section{Connection}
 
-connection accepting, tls session, structure of packet that goes through connection, connection handling, streams, connection flow, sending
+We will now look at how an examplary packet is being handled and moves through the library to gain a better understanding of its inner
+design. Incoming packets are always received in the \inlinecode{recv()} function inside the endpoint, as that is where the UDP socket lies.
+Immediately after that a partial header decode is performed, yielding an incomplete \inlinecode{Header} struct. The destination connection
+id is then used to query for an existing connection. If the latter yields a valid result, the packet and its partially
+decoded header are being passed down to the corresponding connection and the \inlinecode{recv()} function inside the connection is called.
+In this case the endpoint only returns the resulting event and any further processing is being performed within the context of the
+connection (\ref{known_conn}).
+
+\begin{figure}[h]
+    \centering
+    \begin{subfigure}[b]{1.0\textwidth}
+      \includegraphics[width=1.0\linewidth]{img/lib_design.png}
+    \end{subfigure}
+    \caption{Rough Library Outline of Data Flow and Event Handling}
+    \label{grafik_lib_design}
+\end{figure}
+
+\subsection{Initial packets} \label{initial_conn}
+
+If the query yields no valid result however, the packet is considered to be of the initial type. Any other type results in an error and the
+whole packet will be discarded. The endpoint now has to perform a number of steps to initialize the new connection and create all
+necessary configurations. Firstly, the initial keys are derived using rustls: \\
+\inlinecode{let ikp = Keys::initial(Version::V1, \&head.dcid.id, Side::Server);} \\
+With the resulting keyset, the header is decrypted (\ref{header_decrypt}) and the packet number, as well as the packet length fields are
+populated with the decrypted values. Through splitting we are now able to isolate the \inlinecode{payload\_cipher} and pass that to rustls
+with the correct key to gain access to the decrypted frames contained within the packet.
+
+\begin{codeblock}{lib.rs}{Rust}
+    \begin{rustcode}
+        let dec_len = {
+            let decrypted_payload_raw = match ikp.remote.packet.decrypt_in_place(
+                head.packet_num.into(),
+                header_raw.as_ref(),
+                payload_cipher.as_mut(),
+            ) {
+                Ok(p) => p,
+                Err(error) => panic!("Error decrypting packet body {}", error),
+            };
+            decrypted_payload_raw.len()
+        };
+    \end{rustcode}
+\end{codeblock}
+
+When decrypting the payload, the decrypted part is always smaller than the cipher text. That is why \inlinecode{decrypt\_in\_place()}
+returns only a part of the \inlinecode{payload\_cipher} as a slice. 
+
+After that, we have to initialize the QUIC transport parameters of our endpoint. Most of these parameters are set with default values
+except for the original destination connection id(1), the initial source connection id(2) and the stateless reset token(3). (1) can
+be obtained trivially from the decoded header, (2) has to be generated (\ref{handshake_cids}) randomly using \ref{connection_id_generation}
+and (3) is generated using the hmac reset key and the previsouly generated initial source connection id.
+
+\begin{codeblock}{lib.rs}{Rust}
+    \begin{rustcode}
+        let mut transport_config = transport_parameters::TransportConfig::default();
+        transport_config
+            .original_destination_connection_id(orig_dcid.id()) // (1)
+            .initial_source_connection_id(initial_local_scid.id()) // (2)
+            .stateless_reset_token( 
+                token::StatelessResetToken::new(&self.hmac_reset_key, &initial_local_scid)
+                    .token
+                    .to_vec(), // (3)
+            );
+    \end{rustcode}
+\end{codeblock}
+
+With the transport configuration parameters being set, the tls session of type \\ 
+\inlinecode{RustlsConnection::Server} can be initialized. In order to so it needs an \inlinecode{Arc} to the server config,
+the QUIC version being used and the encoded transport parameters.
+
+\begin{codeblock}{lib.rs}{Rust}
+    \begin{rustcode}
+        let conn = RustlsConnection::Server(
+            rustls::quic::ServerConnection::new(
+                std::sync::Arc::new(self.server_config.as_ref().unwrap().clone()),
+                rustls::quic::Version::V1,
+                transport_config_data.to_vec(),
+            )
+            .unwrap(),
+        );
+    \end{rustcode}
+\end{codeblock}
+        
+After the tls session is initialized, a \inlinecode{Connection} object will be created and is inserted into the endpoints
+connection vector. Additionally the new connection handle is created and can now be used to retrieve that connection. 
+The packet and its header are then being passed into that new connection to the \inlinecode{accept()} function.
+
+\begin{codeblock}{lib.rs}{Rust}
+    \begin{rustcode}
+        pub fn accept(
+            &mut self,
+            header: &Header,
+            payload: &mut OctetsMut<'_>,
+        ) -> Result<(), quic_error::Error> {
+            self.process_payload(header, payload);
+
+            self.generate_crypto_data();
+
+            Ok(())
+        }
+    \end{rustcode}
+\end{codeblock}
+
+This function starts by processing the packets data (\ref{process_payload}), which contains a CRYPTO frame which in turn
+contains the Client Hello message and generates the returning crypto data, in this case the Server Hello message using
+the tls session.
+
+After returning from the connection, the endpoint returns a \inlinecode{Event} of type \inlinecode{NewConnection} which
+contains the new connection handle.
+
+\subsection{Known Connection} \label{known_conn}
+
+If the incoming packet can be matched to an existing connection it is immediately passed into the corresponding object to
+the \inlinecode{recv()} function. By using the \inlinecode{current\_space} identifier, the correct \inlinecode{PacketNumberSpace}
+is retrieved.
+
+\subsection{Processing Payload} \label{process_payload}
+
+% process_payload(), read/write crypto data
+
+\subsection{Event Handling}
+
+
 
 \section{Error Handling}
 
 quic errors, implementation specific errors
+multiple levels of errors, tls errors, parsing errors, connection errors, protocol errors, application errors, implementation errors
 
 \section{Testing and Validation}
 
