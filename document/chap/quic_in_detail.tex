@@ -351,12 +351,12 @@ Short Header packets, on the other hand, contain a reduced set of fields compare
 
 The latency spin bit facilitates passive monitoring of latency from various observation points along the network path throughout a connection's lifespan. Upon receiving the spin value, the server mirrors it, while the client toggles it after one round-trip time (RTT). By measuring the time elapsed between successive spin bit toggles, on-path observers can estimate the end-to-end RTT of the connection. The presence of the spin bit is confined to 1-RTT packets, as the initial RTT of a connection can be calculated by observing the handshake.
 
-\subsection{Header \& Packet Protection} \label{packet_protection}
+\subsection{Header and Packet Protection} \label{packet_protection}
 
 QUIC, similarly to TLS over TCP, uses keys derived from the TLS handshake to encrypt and decrypt packets, utilizing the AEAD algorithm negotiated by TLS. Depending on their type, QUIC packets employ varying levels of protection:
 \begin{itemize}
     \item \textbf{Version Negotiation Packets} lack cryptographic protection entirely.
-    \item \textbf{Retry Packets} employ AEAD\_AES\_128\_GCM\todo{ref to definitions} to prevent inadvertent tampering and restrict the entities capable of producing a valid Retry.
+    \item \textbf{Retry Packets} employ AEAD\_AES\_128\_GCM (\ref{aead}) to prevent inadvertent tampering and restrict the entities capable of producing a valid Retry.
     \item \textbf{Initial Packets} utilize AEAD\_AES\_128\_GCM with keys derived from the Destination Connection ID field of the client's initial Initial packet and a publicly available salt in RFC 9001 \cite[20]{rfc9001}.
     \item \textbf{Other Packets} boast robust cryptographic protections ensuring confidentiality and integrity, utilizing keys and algorithms negotiated by TLS.
 \end{itemize}
@@ -371,11 +371,84 @@ QUIC uses a limit-based flow control scheme to prevent buffer overflows and ensu
     \item \textbf{Connection Flow Control} provides an overall limit for the entire connection, ensuring the receiver's buffer doesn't become overloaded. Receivers advertise the total data they can accept for all streams combined and senders must adhere to this limit as well, distributing data across streams within the allowed quota.
 \end{enumerate}
 A receiver must set initial limits for all streams through transport parameters during the handshake. Subsequently, a receiver sends MAX\_STREAM\_DATA frames or MAX\_DATA frames to the sender to advertise larger limits. Flow control limits are dynamic, adapting to network conditions and buffer availability. Receivers can decrease the window size upon congestion or increase it when buffer space permits, ensuring efficient resource utilization.
-\todo{Expand with math or figure}
 
 \subsection{Congestion Control} \label{congestion_control}
 
-\todo{include graphics}
+While QUIC's loss detection and congestion control algorithms share similarities with TCP, underlying protocol differences lead to some
+variations\cite{rfc9002}:
+
+\begin{itemize}
+    \item Clearer Loss Epochs: QUIC defines a loss epoch starting when a packet is lost and ending with the acknowledgement of any subsequent
+    packet. This contrasts with TCP, where epochs might linger for multiple round-trips due to gaps in the sequence number space.
+    \item No Reneging on Acknowledgements: QUIC acknowledgements, similar to TCP's Selective Acknowledgements (SACKs), are permanent, simplifying
+    implementation and reducing memory usage on the sender side.
+    \item Explicit Correction for Delayed Acknowledgements: QUIC accounts for delays between packet reception and acknowledgement, allowing for
+    more accurate round-trip time (RTT) estimations.
+    \item Probe Timeout (PTO) Replaces RTO and TLP: QUIC utilizes a PTO timer based on TCP's RTO concept but incorporates the peer's expected
+    acknowledgement delay for a more precise timeout. Unlike TCP, QUIC doesn't collapse the congestion window upon PTO expiration for a
+    single lost packet. This avoids unnecessary congestion control reductions.
+    \item Minimum Congestion Window of Two Packets: QUIC recommends a minimum congestion window of two packets to avoid potential delays caused
+    by waiting for a single packet acknowledgement after loss.
+    \item Handshake Packets Treated as Regular Packets: QUIC handles lost handshake packets just like any other data loss, unlike TCP's approach
+    of treating them as a sign of persistent congestion.
+\end{itemize}
+
+QUIC has two ways to detect packet loss, either by a missing acknowledgement or by timeout of the Probe Timeout (PTO) which is initialized
+whenever an ack-eliciting packet is sent (see Sec. \ref{loss_detection_recovery}).
+
+\subsubsection{Estimating Round Trip Times}
+
+An RTT sample is generated upon receiving an acknowledgement (ACK) frame that meets two criteria:
+First, It acknowledges the largest packet number not previously acknowledged.
+Second, At least one of the newly acknowledged packets triggered an acknowledgement (ack-eliciting frame).
+The RTT sample (\inlinecode{latest\_rtt}) is calculated by measuring the time elapsed since the largest acknowledged packet was sent.
+
+Additionally, the minimum rtt (\inlinecode{min\_rtt}) is tracked. The \inlinecode{min\_rtt} represents the sender's observation of the absolute
+minimum RTT for the connection. It is initialized to the first received RTT sample (\inlinecode{latest\_rtt}). Subsequent samples are compared
+to \inlinecode{min\_rtt}, and the lower value is retained.
+
+The Smoothed RTT (\inlinecode{smoothed\_rtt}) represents an exponentially weighted moving average of RTT samples, providing a more stable
+estimate than individual samples. The RTT Variation \inlinecode{rttvar} reflects the degree of fluctuation in observed RTT samples.
+
+\todo{provide mathematical examples}
+
+While calculating the rtt times, a sample may be adjusted based on acknowledgement delays reported by the peer. Furthermore, during the
+handshake, QUIC might ignore peer-reported delays or limit them to a maximum value to avoid
+biasing the RTT estimate. Lastly, QUIC may account for local processing delays (e.g., decryption) when calculating RTT samples.
+
+\subsubsection{Algorithms}
+
+The sender-side Congestion Control Algorithm specified in RFC 9002\cite[17]{rfc9002} shares similarities with TCP's
+NewReno\cite[]{rfc6582} but presents only a suggestion. Implementations have the flexibility of choosing their own algorithm such as
+Cubic\cite[]{rfc8312} or add improvements like HyStart++\cite[]{rfc9406}.
+
+\begin{figure}[h]
+    \centering
+    \begin{subfigure}[b]{1.0\textwidth}
+      \includegraphics[width=1.0\linewidth]{img/cc}
+    \end{subfigure}
+    \caption{Comparison of different CC Algorithms (HS = HyStart++) \cite[]{ccgraphic}}
+    \label{cc_comparison}
+\end{figure}
+
+QUIC uses a congestion window to limit the number of bytes in flight (unacknowledged packets) at any given time. A sender cannot
+transmit a packet that would exceed the congestion window which is adjusted dynamically based on network conditions. QUIC defines
+three congestion control states: Slow Start, Recovery, and Congestion Avoidance. Slow Start is used initially, the window grows
+exponentially to quickly probe the network capacity. The recovery is entered upon packet loss or ECN increase. The window is
+then reduced and slow start is re-initiated. During Congestion Avoidance, the window is gradually increased using Additive
+Increase Multiplicative Decrease (AIMD) to avoid further congestion.
+
+QUIC can detect persistent congestion when packet loss persists for a certain duration. Upon detection, the congestion window is
+drastically reduced to a minimum value similar to TCP's response on a timeout.
+
+QUIC recommends pacing packets to avoid overwhelming the network with bursts. Pacing algorithms spread packets evenly over time
+based on the congestion window and RTT (Round Trip Time). ACK packets (acknowledgments) are exempt from pacing to ensure timely delivery.
+If the sender has data to send but the number of bytes in flight is less than the window (due to application limitations or flow control),
+the window won't be increased. A pacing mechanism might also delay sending packets, leading to underutilization. However, the sender
+shouldn't be considered application limited in this case.
+
+Overall, QUIC's congestion control aims to achieve efficient data transfer by dynamically adjusting the sending rate based on network
+conditions while avoiding congestion collapse
 
 \subsection{0-RTT Connection} \label{zero_rtt}
 
@@ -386,8 +459,6 @@ To initiate a 0-RTT connection, the client sends a packet with a long header of 
 \todo{Servers may choose to only allow get requests}
 
 By allowing the client to send data in the first packet, the 0-RTT handshake significantly reduces the connection establishment latency, leading to faster transmission of data. Additionally, minimizing round trips and accelerating the connection setup process improves network resource utilization and reduces congestion, benefiting both clients and servers.
-
-\todo{include graphic of 0-rtt}
 
 \subsection{Connection Migration} \label{connection_migration}
 
@@ -509,11 +580,11 @@ In addition to the primary methods of connection termination, there are several 
 
 By addressing these considerations and following the specified procedures, QUIC implementations can effectively manage connection termination scenarios, ensuring the stability and reliability of the protocol in various network conditions.
 
-\section{Error Handling \& Recovery} \label{error_handling_recovery}
+\section{Error Handling and Recovery} \label{error_handling_recovery}
 
 During a connection, many things can go wrong. Error handling and recovery are critical aspects of any network protocol, ensuring reliability of communication in events such as packet loss, network congestion, and endpoint failures. QUIC employs many error handling and recovery mechanisms to address potential issues and mitigate the impact of errors during data transmission, for example QUIC's loss detection mechanisms, which enable the protocol to identify and respond to packet loss. Additionally, QUIC can detect and handle numerous other errors, propagate error information between endpoints and handle exceptional conditions such as protocol violations and connection failures. 
 
-\subsection{Loss Detection \& Recovery}
+\subsection{Loss Detection and Recovery} \label{loss_detection_recovery}
 
 Like its predecessor TCP, QUIC uses an acknowledgement-based loss detection approach to ensure reliability while transferring data. Packets are identified by their sequentially increasing packet numbers. A packet must not be acknowledged until packet protection has been successfully removed and all frames contained in the packet have been processed. A packet is ack-eliciting if it contains at least one other frame except acknowledgements itself, PADDING or CONNECTION\_CLOSE. Each acknowledgment is sent inside an ACK frame, encoded either as type 0x02 or type 0x03, carry acknowledgment ranges to identify acknowledged packets. Additionally, type 0x03 ACK frames include information about Explicit Congestion Notification (ECN) feedback. The content of ACK frames, as depicted in Figure \ref{ack_frame}, contain the Type, Largest Acknowledged, ACK Delay, ACK Range Count, First ACK Range, ACK Ranges, and optionally ECN Counts. 
 

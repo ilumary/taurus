@@ -1,16 +1,31 @@
 \chapter{Fundamentals}
 
-\section{Terms \& Definitions}
+\section{Terms and Definitions}
 
 \begin{itemize}
- \item Variable Sized Integer \label{variable_sized_integer}
- \item Explicit Congestion Notification (ECN) \label{ecn}
- \item ACK Range. An ACK range specifies a continuous sequence of packets that have been successfully received by the receiver. When a receiver acknowledges data, it doesn't necessarily need to acknowledge each packet individually. Instead, it can efficiently transmit an ACK with a range, indicating that it has received all packets within that range, from a starting point to an ending point. \label{ack_range}
- \item Connection Identifier (cid) Uses Source and Destination cids. scid and dcid change switch between two endpoints\label{cid}
- \item ClientHello
- \item ServerHello
+    \item \textbf{Endpoint:} An entity that can participate in a QUIC connection by generating, receiving, and processing QUIC packets. 
+    There are only two types of endpoints in QUIC: client and server.
+    \item \textbf{QUIC packet:} A complete processable unit of QUIC that can be encapsulated in a UDP datagram. One or more QUIC
+    packets can be encapsulated in a single UDP datagram.
+    \item \textbf{Variable Sized Integer} QUIC uses two most significant bits of the first byte to encode the base-2 logarithm of the
+    integer encoding length in bytes. The remaining bits store the integer value itself, in network byte order. This allows encoding
+    integers in 1, 2, 4, or 8 bytes, representing 6-, 14-, 30-, or 62-bit values. \label{variable_sized_integer}
+    \item \textbf{Explicit Congestion Notification (ECN)}: ECN is an optional mechanism within the Internet Protocol (IP) that allows
+    routers to signal incipient congestion to data senders before packet drops occur. This is achieved by routers setting a dedicated ECN
+    bit in the IP header of packets traversing congested paths. \label{ecn}
+    \item \textbf{ACK Range:} An ACK range specifies a continuous sequence of packets that have been successfully received by the receiver. When a
+    receiver acknowledges data, it doesn't necessarily need to acknowledge each packet individually. Instead, it can efficiently transmit an ACK
+    with a range, indicating that it has received all packets within that range, from a starting point to an ending point. \label{ack_range}
+    \item \textbf{Connection ID:} An identifier that is used to identify a QUIC connection at an endpoint. Each endpoint selects one
+    or more connection IDs for its peer to include in packets sent towards the endpoint. This value is opaque to the peer. \label{cid}
+    \item \textbf{Authenticated Encryption with Associated Data (AEAD):} AEAD is a cryptographic mode that builds upon Authenticated Encryption (AE).
+    AEAD allows messages to include Associated Data (AD) alongside the actual message to be encrypted. This associated
+    data is additional information that is not confidential but requires authenticity and integrity protection. In essence, AEAD authenticates the
+    confidentiality of the encrypted message and the integrity of both the message and the associated data. This makes AEAD suitable for scenarios
+    like network packets, where the header containing routing information needs to be integrity-protected and authenticated, while the payload
+    carrying the actual content is encrypted for confidentiality. \label{aead}
 \end{itemize}
 
-\section{Fundamentals of networking protocols}
+%\section{Fundamentals of networking protocols}
 
-\section{TCP \& UDP}
+%\section{TCP \& UDP}

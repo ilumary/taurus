@@ -1,0 +1,35 @@
+\chapter{Summary}
+QUIC, officially released in 2021 as a successor to TCP, aims to address longstanding issues plaguing its predecessor. TCP suffers
+from problems such as Head-of-Line Blocking, lengthy handshakes, reliance on fixed IP addresses, and an intricate coupling between
+congestion control and data reliability.
+QUIC boasts a robust architecture designed to overcome these shortcomings. It allows for multiple concurrent uni-directional and
+bi-directional streams within a single connection. Packets consist of headers and payloads, with payloads further divided into
+frames. Each frame carries specific data based on the frames type type. Headers come in two forms: a longer version for connection
+establishment and a shorter version used during an established connection to minimize processing overhead. Notably, both the header
+and the complete payload are individually protected for enhanced security.
+Flow control within QUIC operates at both the stream and connection level, with adjustments communicated via dedicated frames. The
+congestion control mechanism resembles TCP's approach, utilizing slow start and a cubic algorithm. Additionally, QUIC introduces
+other features such as a 0-RTT (Zero Round Trip Time) handshake which allows for immediate application data transmission upon
+re-establishing a recently turned inactive connection. Additionally, connection migration enables connections to seamlessly
+switch between network paths without disruption. During a typical 1-RTT (One Round Trip Time) QUIC handshake, TLS integration
+enables application data transfer after a single round trip.
+Connections can be terminated due to timeouts, immediate closure, or stateless resets. QUIC employs acknowledgment (ACK) frames for
+loss detection, with a single ACK frame capable of acknowledging multiple QUIC packets. Lost frames within a packet can be retransmitted
+across multiple packets for improved reliability. The security of QUIC has been rigorously tested against various attack vectors,
+including replay attacks, packet manipulation, and fuzzing. Interestingly, fuzzing proved to be the most effective method, causing
+a server crash by manipulating offsets within stream frames.
+
+Due to time constraints, the implemented QUIC library focuses on a core subset of the protocol's features. This is further reflected
+in the decision to leverage Rustls for a complete TLS implementation, instead of implementing it alongside QUIC. The library itself
+is designed to accommodate the full QUIC protocol without requiring major restructuring efforts.
+The core component, the \inlinecode{Endpoint} object, wraps a UDP socket and manages connections. Incoming packets are either matched
+to an existing connection or triggers the creation of a new one. Each \inlinecode{Connection} object encapsulates the TLS session
+provided by Rustls, manages received packets across all packet number spaces, handles keying material, and populates outgoing packets
+with data. Encryption and decryption of packet headers and payloads are handled by functions provided by Rustls.
+A packet is first parsed into a dedicated \inlinecode{Header} object. Depending on the frame size within the payload, additional parsing
+occurs to create specific structs for each contained frame. Following this parsing step, the payload is processed. Each processed
+packet generates at least one event that the user can act upon. Finally, the connection prepares a response packet containing
+relevant information such as acknowledgments and outstanding cryptographic data.
+
+While the library boasts a well-considered design, there is substantial potential for improvement. This includes the adoption of
+an asynchronous design or shifting the responsibility of connection management to the user.

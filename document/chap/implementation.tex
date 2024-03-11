@@ -579,7 +579,7 @@ The packet and its header are then being passed into that new connection to the 
 
 This function starts by processing the packets data (\ref{process_payload}), which contains a CRYPTO frame which in turn
 contains the Client Hello message and generates the returning crypto data, in this case the Server Hello message using
-the tls session.
+the tls session and the function \inlinecode{write\_hs()}.
 
 After returning from the connection, the endpoint returns a \inlinecode{Event} of type \inlinecode{NewConnection} which
 contains the new connection handle.
@@ -588,21 +588,185 @@ contains the new connection handle.
 
 If the incoming packet can be matched to an existing connection it is immediately passed into the corresponding object to
 the \inlinecode{recv()} function. By using the \inlinecode{current\_space} identifier, the correct \inlinecode{PacketNumberSpace}
-is retrieved.
+is retrieved. Within that object is the current keyset with which the header and payload are decrypted. The decrypted payload
+is then passen on to \inlinecode{process\_payload()}.
 
 \subsection{Processing Payload} \label{process_payload}
 
 % process_payload(), read/write crypto data
+To process a QUIC packets payload, every frame has to be decoded and processed in order. Firstly, the function checks for
+every frame if it is ack eliciting (Line 8, \ref{process_payload_code}). Should that be the case, the packet requires an acknowledgement
+to be sent which is noted at then end. 
+
+Depending on the frame, a dedicated struct may be created. Exceptions are frames which contain so few fields, that a dedicated struct
+is not necessary, for example the STOP\_SENDING frame which only contains two fields. The resulting data may then be processed
+accordingly. Crypto data is passed to \inlinecode{process\_crypto\_data()} which calls \inlinecode{read\_hs()} provided by the
+\inlinecode{RustlsConnection} object. This function consumes the crypto data and prepares a possible answer which is extracted
+using \inlinecode{write\_hs()} after the payload has been processed in \inlinecode{accept()}.
+
+\begin{codeblock}{lib.rs}{Rust}
+    \begin{rustcode}
+        fn process_payload(&mut self, header: &Header, payload: &mut OctetsMut<'_>) {
+            let mut ack_eliciting = false;
+
+            while payload.peek_u8().is_ok() {
+                let frame_code = payload.get_u8().unwrap();
+
+                //check if frame is ack eliciting
+                ack_eliciting = !matches!(frame_code, 0x00 | 0x02 | 0x03 | 0x1c | 0x1d);
+
+                match frame_code {
+                    0x00 => continue, //PADDING
+                    0x01 => continue, //PING
+                    0x02 | 0x03 => {
+                        let _ack = AckFrame::from_bytes(&frame_code, payload);
+                        //todo handle ack
+                    } //ACK
+                    0x05 => {
+                        let _stream_id = payload.get_varint().unwrap();
+                        let _application_protocol_error_code = payload.get_varint().unwrap();
+                    } //STOP_SENDING
+                    0x06 => {
+                        let crypto_frame = CryptoFrame::from_bytes(&frame_code, payload);
+                        self.process_crypto_data(&crypto_frame);
+                    } //CRYPTO
+                    0x08..=0x0f => {
+                        let stream_frame = StreamFrame::from_bytes(&frame_code, payload);
+                        let (_, mut stream_data) = payload.split_at(payload.off()).unwrap();
+
+                        //isolate stream data if offset is present, else data extends to end of packet
+                        if stream_frame.offset.is_some() {
+                            (stream_data, _) = payload
+                                .split_at(stream_frame.offset.unwrap() as usize)
+                                .unwrap();
+                        }
+
+                    } //STREAM
+                    [...] //all other frames
+                    _ => eprintln!(
+                        "Error while processing frames: unrecognised frame {:#x} at {:#x}",
+                        frame_code,
+                        payload.off()
+                    ),
+                }
+            }
+
+            if ack_eliciting {
+                self.packet_spaces[self.current_space as usize]
+                    .outgoing_acks
+                    .push(header.packet_num.into());
+            }
+        }
+    \end{rustcode}
+    \label{process_payload_code}
+\end{codeblock}
 
 \subsection{Event Handling}
 
+The endpoint function \inlinecode{recv()} returns an \inlinecode{Event} which can then be acted upon in the applications interest.
+It is then passed into the endpoint again, which takes the connection handle contained within, extracts the connection and calls
+\inlinecode{fill\_datagram()}. One UDP datagram may be filled with multiple, coalesced QUIC packets. If so, packets have to be ordered
+by their packet number space with the lowest being the first. 
 
+\begin{codeblock}{lib.rs}{Rust}
+    \begin{rustcode}
+        fn fill_datagram(&mut self, buffer: &mut [u8]) -> Result<usize, quic_error::Error> {
+
+            for space_id in 0..3_usize {
+                self.build_packet_in_space(buffer, space_id)?;
+            }
+
+            Ok(0)
+        }
+
+        fn build_packet_in_space(
+            &mut self,
+            buffer: &mut [u8],
+            packet_number_space: usize,
+        ) -> Result<usize, quic_error::Error> {
+            //fills packet with outstanding acks, outstanding crypto data, outstanding stream data
+            //and all other answers to received frames or self generated congestion control frames
+            Ok(size)
+        }
+    \end{rustcode}
+    \label{packet_building}
+\end{codeblock}
 
 \section{Error Handling}
 
-quic errors, implementation specific errors
-multiple levels of errors, tls errors, parsing errors, connection errors, protocol errors, application errors, implementation errors
+Errors are handled on three different levels.
+\begingroup
+\renewcommand\labelenumi{(\theenumi)}
+\begin{enumerate}
+\item \textbf{QUIC Errors} as defined in Sec. 20 \cite{rfc9000}, including possible TLS errors by rustls, result in the appropriate
+error code being sent via a CONNECTION\_CLOSE frame for example. All Error types except TLS errors are represented by an enum 
+\ref{quic_errors}. TLS erros range from 0x0100 to 0x01ff and are handled outside of the enum.
+\item \textbf{Application Errors} may be thrown by any application via an event and result in a CONNECTION\_CLOSE frame with type 0x1d
+and an application defined error code.
+\item \textbf{Implementation Errors} are handled within the library, most often through the \inlinecode{Result<(), Error>} return
+type and cover all possible scenarios. A self-defined \inlinecode{Error} contains a code and a reason. Error codes are consistent across
+the whole library and defined in \inlinecode{quic\_error.rs}. For easier implementation a macro is used. \ref{quic_errors_self_defined}
+\end{enumerate}
+\endgroup
 
-\section{Testing and Validation}
+\begin{codeblock}{quic\_error.rs}{Rust}
+    \begin{rustcode}
+        enum QuicTransportErrors {
+            NoError = 0x00,
+            InternalError = 0x01,
+            ConnectionRefused = 0x02,
+            FlowControlError = 0x03,
+            StreamLimitError = 0x04,
+            StreamStateError = 0x05,
+            FinalSizeError = 0x06,
+            FrameEncodingError = 0x07,
+            TransportParameterError = 0x08,
+            ConnectionIdLimitError = 0x09,
+            ProtocolViolation = 0x0a,
+            InvalidToken = 0x0b,
+            ApplicationError = 0x0c,
+            CryptoBufferExceeded = 0x0d,
+            KeyUpdateError = 0x0e,
+            AeadLimitReached = 0x0f,
+            NoViablePath = 0x10,
+        }
+    \end{rustcode}
+    \label{quic_errors}
+\end{codeblock}
 
-tested code, validating
+\begin{codeblock}{quic\_error.rs}{Rust}
+    \begin{rustcode}
+        #[derive(Debug)]
+        pub struct Error {
+            code: u64,
+            msg: String,
+        }
+
+        macro_rules! quic_error {
+            ($name:ident, $code:expr) => {
+                pub fn $name<T>(reason: T) -> Self
+                where
+                    T: Into<String>,
+                {
+                    Self {
+                        code: $code,
+                        msg: reason.into(),
+                    }
+                }
+            };
+        }
+
+        impl Error {
+            quic_error!(fatal, 0x00);
+            quic_error!(unknown_connection, 0x01);
+            quic_error!(socket_error, 0x02);
+            [...] //Other Errors
+        }
+    \end{rustcode}
+    \label{quic_errors_self_defined}
+\end{codeblock}
+
+\section{Executing}
+
+%tested code, testing with example application
+%provide examples with quinn

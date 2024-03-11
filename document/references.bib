@@ -103,6 +103,51 @@
     abstract =  {This document specifies QUIC version 2, which is identical to QUIC version 1 except for some trivial details. Its purpose is to combat various ossification vectors and exercise the version negotiation framework. It also serves as a template for the minimum changes in any future version of QUIC. Note that "version 2" is an informal name for this proposal that indicates it is the second version of QUIC to be published as a Standards Track document. The protocol specified here uses a version number other than 2 in the wire image, in order to minimize ossification risks.},
 }
 
+@misc{rfc8312,
+    series =    {Request for Comments},
+    number =    8312,
+    howpublished =  {RFC 8312},
+    publisher = {RFC Editor},
+    doi =       {10.17487/RFC8312},
+    url =       {https://www.rfc-editor.org/info/rfc8312},
+    author =    {Injong Rhee and Lisong Xu and Sangtae Ha and Alexander Zimmermann and Lars Eggert and Richard Scheffenegger},
+    title =     {{CUBIC for Fast Long-Distance Networks}},
+    pagetotal = 18,
+    year =      2018,
+    month =     feb,
+    abstract =  {CUBIC is an extension to the current TCP standards. It differs from the current TCP standards only in the congestion control algorithm on the sender side. In particular, it uses a cubic function instead of a linear window increase function of the current TCP standards to improve scalability and stability under fast and long-distance networks. CUBIC and its predecessor algorithm have been adopted as defaults by Linux and have been used for many years. This document provides a specification of CUBIC to enable third-party implementations and to solicit community feedback through experimentation on the performance of CUBIC.},
+}
+
+@misc{rfc6582,
+    series =    {Request for Comments},
+    number =    6582,
+    howpublished =  {RFC 6582},
+    publisher = {RFC Editor},
+    doi =       {10.17487/RFC6582},
+    url =       {https://www.rfc-editor.org/info/rfc6582},
+    author =    {Andrei Gurtov and Tom Henderson and Sally Floyd and Yoshifumi Nishida},
+    title =     {{The NewReno Modification to TCP's Fast Recovery Algorithm}},
+    pagetotal = 16,
+    year =      2012,
+    month =     apr,
+    abstract =  {RFC 5681 documents the following four intertwined TCP congestion control algorithms: slow start, congestion avoidance, fast retransmit, and fast recovery. RFC 5681 explicitly allows certain modifications of these algorithms, including modifications that use the TCP Selective Acknowledgment (SACK) option (RFC 2883), and modifications that respond to "partial acknowledgments" (ACKs that cover new data, but not all the data outstanding when loss was detected) in the absence of SACK. This document describes a specific algorithm for responding to partial acknowledgments, referred to as "NewReno". This response to partial acknowledgments was first proposed by Janey Hoe. This document obsoletes RFC 3782. {[}STANDARDS-TRACK{]}},
+}
+
+@misc{rfc9406,
+    series =    {Request for Comments},
+    number =    9406,
+    howpublished =  {RFC 9406},
+    publisher = {RFC Editor},
+    doi =       {10.17487/RFC9406},
+    url =       {https://www.rfc-editor.org/info/rfc9406},
+    author =    {Praveen Balasubramanian and Yi Huang and Matt Olson},
+    title =     {{HyStart++: Modified Slow Start for TCP}},
+    pagetotal = 9,
+    year =      2023,
+    month =     may,
+    abstract =  {This document describes HyStart++, a simple modification to the slow start phase of congestion control algorithms. Slow start can overshoot the ideal send rate in many cases, causing high packet loss and poor performance. HyStart++ uses increase in round-trip delay as a heuristic to find an exit point before possible overshoot. It also adds a mitigation to prevent jitter from causing premature slow start exit.},
+}
+
 @inproceedings{tcp-adoption,
   author={Lee, DongJin and Carpenter, Brian E. and Brownlee, Nevil},
   booktitle={2010 Fifth International Conference on Internet Monitoring and Protection}, 
@@ -184,4 +229,10 @@ series = {ACSAC '20}
   title = {Ring Library},
   howpublished = {\url{https://github.com/briansmith/ring/}},
   note = {Accessed: 2024-02-27}
+}
+
+@misc{ccgraphic,
+  title = {CUBIC and HyStart++ Support in quiche},
+  howpublished = {\url{https://blog.cloudflare.com/cubic-and-hystart-support-in-quiche}},
+  note = {Accessed: 2024-03-11}
 }
