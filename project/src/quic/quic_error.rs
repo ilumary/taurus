@@ -24,11 +24,14 @@ macro_rules! quic_error {
 
 impl Error {
     quic_error!(fatal, 0x00);
+    quic_error!(unknown_connection, 0x01);
+    quic_error!(socket_error, 0x02);
+    quic_error!(header_encoding_error, 0x03);
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:x} {}", self.code, self.msg)
+        write!(f, "{:#x} {}", self.code, self.msg)
     }
 }
 

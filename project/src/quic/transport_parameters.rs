@@ -227,7 +227,7 @@ impl PreferredAddress {
         data.put_u16(self.address_v6.map_or(0, |a| a.port()))?;
 
         data.put_u8(self.conn_id.len() as u8)?;
-        data.put_bytes(self.conn_id.as_arr())?;
+        data.put_bytes(self.conn_id.as_slice())?;
 
         data.put_bytes(self.stateless_reset_token.token.as_ref())?;
 

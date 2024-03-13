@@ -10,6 +10,7 @@ use frame::{
 };
 use octets::{BufferTooShortError, OctetsMut};
 use rand::RngCore;
+use ring::aead::quic;
 use rustls::{
     quic::{
         Connection as RustlsConnection, HeaderProtectionKey, KeyChange, Keys, PacketKeySet, Version,
@@ -20,22 +21,29 @@ use std::{
     collections::HashMap,
     fmt,
     net::{SocketAddr, UdpSocket},
-    sync::Arc,
 };
 
 const LS_TYPE_BIT: u8 = 0x80;
 const TYPE_MASK: u8 = 0x30;
 const PKT_NUM_LENGTH_MASK: u8 = 0x03;
 
-const MAX_PKT_NUM_LEN: usize = 4;
+const MAX_PKT_NUM_LEN: u8 = 4;
 const MAX_CID_SIZE: usize = 20;
 const SAMPLE_LEN: usize = 16;
 
-const SPACE_ID_INITIAL: u8 = 0x01;
-const SPACE_ID_HANDSHAKE: u8 = 0x02;
-const SPACE_ID_DATA: u8 = 0x03;
+const SPACE_ID_INITIAL: usize = 0x00;
+const SPACE_ID_HANDSHAKE: usize = 0x01;
+const SPACE_ID_DATA: usize = 0x02;
 
 type Handle = usize;
+
+pub enum Event {
+    NewConnection(Handle),
+    Handshaking(Handle),
+    ConnectionEstablished(Handle),
+    DataExchange(Handle),
+    ConnectionClosed(Handle),
+}
 
 /*
  * Primary object in library. Can act as client or server. Can accept incoming
@@ -43,7 +51,6 @@ type Handle = usize;
  */
 pub struct Endpoint {
     socket: UdpSocket,
-    socket_addr: SocketAddr,
 
     //server config for rustls. Will have to be updated to allow client side endpoint
     server_config: Option<rustls::ServerConfig>,
@@ -81,7 +88,6 @@ impl Endpoint {
 
         Endpoint {
             socket: UdpSocket::bind(addr).expect("Error: couldn't bind UDP socket to address"),
-            socket_addr: addr.parse().unwrap(),
             server_config: Some(server_cfg),
             hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
             conn_db: HashMap::new(),
@@ -94,7 +100,7 @@ impl Endpoint {
     }
 
     // handles a single incoming UDP datagram
-    pub fn recv(&mut self) {
+    pub fn recv(&mut self) -> Result<Event, quic_error::Error> {
         // TODO: handle coalescing inital, 0-rtt and handshake packets, max udp packet size is 65kb
         let mut buffer = [0u8; 65536];
 
@@ -102,7 +108,7 @@ impl Endpoint {
             Ok((size, src_addr)) => (size, src_addr),
             Err(error) => {
                 println!("Error while receiving datagram: {:?}", error);
-                return;
+                return Err(quic_error::Error::socket_error("receiving packet"));
             }
         };
         println!("Received {:?} bytes from {:?}", size, src_addr);
@@ -113,7 +119,7 @@ impl Endpoint {
 
         //check if most significant bit is 1 or 0, if 0 => short packet => have to get cid len
         //somehow
-        let mut head: Header = match Header::parse_from_bytes(&mut octet_buffer, 8) {
+        let mut head: Header = match Header::from_bytes(&mut octet_buffer, 8) {
             Ok(h) => h,
             Err(error) => panic!("Error: {}", error),
         };
@@ -124,15 +130,15 @@ impl Endpoint {
         {
             //connection exists, pass packet to connection
             println!("Found existing connection for {}", &head.dcid);
-            match self
+            return match self
                 .connections
                 .get_mut(h)
                 .unwrap()
                 .recv(&mut head, &mut octet_buffer)
             {
-                Ok(()) => return,
-                Err(error) => panic!("Error processing packet: {}", error),
-            }
+                Ok(()) => Ok(Event::DataExchange(h)),
+                Err(error) => Err(error),
+            };
         }
 
         //handle new connection
@@ -151,7 +157,7 @@ impl Endpoint {
 
         //cut off trailing 0s from buffer
         let (mut payload_cipher, _) = payload_cipher
-            .split_at(head.packet_length - head.packet_num_length)
+            .split_at(head.packet_length - head.packet_num_length as usize)
             .unwrap();
 
         //payload cipher must be exact size without zeros from the buffer beeing to big!
@@ -206,8 +212,9 @@ impl Endpoint {
         let new_ch = self
             .create_connection(
                 Side::Server,
+                head.version,
                 orig_dcid,
-                head.scid.clone(),
+                head.scid.clone().unwrap(),
                 initial_local_scid,
                 conn,
                 ikp,
@@ -223,7 +230,7 @@ impl Endpoint {
             .unwrap()
             .accept(&head, &mut payload)
         {
-            Ok(()) => (),
+            Ok(()) => Ok(Event::NewConnection(new_ch)), //return new connection event
             Err(error) => panic!("Error processing packet: {}", error),
         }
     }
@@ -246,6 +253,7 @@ impl Endpoint {
     fn create_connection(
         &mut self,
         side: Side,
+        version: u32,
         inital_dcid: ConnectionId,
         inital_scid: ConnectionId,
         inital_loc_scid: ConnectionId,
@@ -268,6 +276,7 @@ impl Endpoint {
 
         self.connections.push(Connection::new(
             side,
+            version,
             tls_session,
             inital_keyset,
             inital_dcid,
@@ -283,12 +292,51 @@ impl Endpoint {
     //terminate all connections
     pub fn _close_endpoint() {}
 
-    pub fn _handle_event() {}
+    pub fn handle_connection(
+        &mut self,
+        connection_handle: Handle,
+    ) -> Result<(), quic_error::Error> {
+        println!("building packet for connection {:?}", connection_handle);
+
+        let connection = match self.connections.get_mut(connection_handle) {
+            Some(c) => c,
+            None => {
+                return Err(quic_error::Error::unknown_connection(
+                    "error while retrieving connection",
+                ));
+            }
+        };
+
+        let mut buffer = [0u8; 65536];
+
+        let packet_length = connection.fill_datagram(&mut buffer)?;
+
+        let size = match self
+            .socket
+            .send_to(&buffer[..packet_length], connection.remote)
+        {
+            Ok(size) => size,
+            Err(error) => {
+                return Err(quic_error::Error::socket_error(format!("{}", error)));
+            }
+        };
+
+        println!("sent {} bytes to {:?}", size, connection.remote);
+
+        Ok(())
+    }
 }
+
+//struct Connection {
+
+//}
 
 struct Connection {
     //side
     side: Side,
+
+    //quic version
+    version: u32,
 
     //tls13 session via rustls and keying material
     tls_session: RustlsConnection,
@@ -301,9 +349,6 @@ struct Connection {
     //connection state
     state: ConnectionState,
 
-    //active connection ids
-    active_cids: Vec<ConnectionId>,
-
     // First received dcid
     initial_dcid: ConnectionId,
     // First received scid
@@ -315,7 +360,7 @@ struct Connection {
 
     // Packet number spaces, inital, handshake, 1-RTT
     packet_spaces: [PacketNumberSpace; 3],
-    current_space: u8,
+    current_space: usize,
 
     // Physical address of connection peer
     remote: SocketAddr,
@@ -332,6 +377,7 @@ struct Connection {
 impl Connection {
     pub fn new(
         side: Side,
+        version: u32,
         tls_session: RustlsConnection,
         initial_keyset: Keys,
         initial_dcid: ConnectionId,
@@ -342,6 +388,7 @@ impl Connection {
     ) -> Self {
         Connection {
             side,
+            version,
             tls_session,
             next_secrets: None,
             next_1rtt_keys: None,
@@ -349,7 +396,6 @@ impl Connection {
             zero_rtt_keyset: None,
             initial_keyset,
             state: ConnectionState::Handshake,
-            active_cids: vec![initial_remote_scid.clone()],
             initial_dcid,
             initial_remote_scid,
             initial_local_scid,
@@ -376,7 +422,7 @@ impl Connection {
     ) -> Result<(), quic_error::Error> {
         //decrypt header and payload
 
-        self.process_payload(payload);
+        self.process_payload(header, payload);
 
         // if space is handshake, call to write crypto after processing payload
 
@@ -389,7 +435,7 @@ impl Connection {
         header: &Header,
         payload: &mut OctetsMut<'_>,
     ) -> Result<(), quic_error::Error> {
-        self.process_payload(payload);
+        self.process_payload(header, payload);
 
         println!(
             "wr {:?} ww {:?} ih {:?} tpp: {:?}",
@@ -406,11 +452,16 @@ impl Connection {
     }
 
     // TODO change to just &Octets, because we dont need to modify the buffer after decrypting
-    fn process_payload(&mut self, payload: &mut OctetsMut<'_>) {
+    fn process_payload(&mut self, header: &Header, payload: &mut OctetsMut<'_>) {
         //TODO check if packet is ack eliciting
+        let mut ack_eliciting = false;
 
         while payload.peek_u8().is_ok() {
             let frame_code = payload.get_u8().unwrap();
+
+            //check if frame is ack eliciting
+            ack_eliciting = !matches!(frame_code, 0x00 | 0x02 | 0x03 | 0x1c | 0x1d);
+
             match frame_code {
                 0x00 => continue, //PADDING
                 0x01 => continue, //PING
@@ -441,7 +492,7 @@ impl Connection {
                     let stream_frame = StreamFrame::from_bytes(&frame_code, payload);
                     let (_, mut stream_data) = payload.split_at(payload.off()).unwrap();
 
-                    //isolate stream data if offset is present
+                    //isolate stream data if offset is present, else data extends to end of packet
                     if stream_frame.offset.is_some() {
                         (stream_data, _) = payload
                             .split_at(stream_frame.offset.unwrap() as usize)
@@ -461,7 +512,7 @@ impl Connection {
                 0x11 => {
                     let _stream_id = payload.get_varint().unwrap();
                     let _max_data = payload.get_varint().unwrap();
-                } //MAX_StREAM_DATA
+                } //MAX_STREAM_DATA
                 0x12 => {
                     let _maximum_streams = payload.get_varint().unwrap();
                 } //MAX_STREAMS (bidirectional)
@@ -506,6 +557,12 @@ impl Connection {
                 ),
             }
         }
+
+        if ack_eliciting {
+            self.packet_spaces[self.current_space as usize]
+                .outgoing_acks
+                .push(header.packet_num.into());
+        }
     }
 
     fn process_crypto_data(&mut self, crypto_frame: &CryptoFrame) {
@@ -536,7 +593,7 @@ impl Connection {
     fn generate_crypto_data(&mut self) {
         //get mutable reference to crypto buffer
         let buf: &mut Vec<u8> = self.packet_spaces[self.current_space as usize]
-            .outstanding_crypto_data
+            .outgoing_crypto_data
             .as_mut()
             .unwrap();
 
@@ -577,6 +634,37 @@ impl Connection {
         //advance space
         self.current_space += 1;
     }
+
+    fn fill_datagram(&mut self, buffer: &mut [u8]) -> Result<usize, quic_error::Error> {
+        // detect if packet needs to be sent if current space is handshake and initial has outstanding_crypto_data
+        let mut size: usize = 0;
+
+        for space_id in 0..(self.current_space + 1) {
+            size += match self.build_packet_in_space(buffer, space_id) {
+                Ok(s) => s,
+                Err(error) => return Err(error),
+            };
+        }
+
+        Ok(size)
+    }
+
+    fn build_packet_in_space(
+        &mut self,
+        buffer: &mut [u8],
+        packet_number_space: usize,
+    ) -> Result<usize, quic_error::Error> {
+        println!("Building packet in space {:#x}", packet_number_space);
+
+        let pns = &mut self.packet_spaces[self.current_space];
+        let buf = octets::OctetsMut::with_slice(buffer);
+
+        //build header
+
+        //build payload
+
+        Ok(buf.off())
+    }
 }
 
 pub enum ConnectionState {
@@ -591,9 +679,10 @@ pub enum ConnectionState {
 pub struct PacketNumberSpace {
     keys: Option<Keys>,
 
-    outstanding_acks: Vec<u64>,
+    outgoing_acks: Vec<u64>,
 
-    outstanding_crypto_data: Option<Vec<u8>>,
+    //TODO make arc around vec to avoid copying
+    outgoing_crypto_data: Option<Vec<u8>>,
 
     max_acked_pkt: Option<u64>,
 
@@ -604,8 +693,8 @@ impl PacketNumberSpace {
     pub fn new(with_crypto_buffer: bool) -> Self {
         Self {
             keys: None,
-            outstanding_acks: Vec::new(),
-            outstanding_crypto_data: match with_crypto_buffer {
+            outgoing_acks: Vec::new(),
+            outgoing_crypto_data: match with_crypto_buffer {
                 true => Some(Vec::new()),
                 false => None,
             },
@@ -619,11 +708,11 @@ pub struct Header {
     hf: u8, //header form and version specific bits
     version: u32,
     dcid: ConnectionId,
-    scid: ConnectionId,
+    scid: Option<ConnectionId>,
 
     //The following fields are under header protection
     packet_num: u32,
-    packet_num_length: usize,
+    packet_num_length: u8,
     token: Option<Vec<u8>>,
 
     //packet length including packet_num
@@ -634,13 +723,141 @@ pub struct Header {
 }
 
 impl Header {
+    pub fn new_long_header(
+        long_header_type: u8,
+        packet_num_length: u8,
+        version: u32,
+        packet_num: u32,
+        dcid: &ConnectionId,
+        scid: Option<&ConnectionId>,
+        token: Option<Vec<u8>>,
+        packet_length: usize,
+    ) -> Result<Self, quic_error::Error> {
+        if !matches!(long_header_type, 0x00..=0x03) {
+            return Err(quic_error::Error::header_encoding_error(format!(
+                "unsupported long header type {:?}",
+                long_header_type
+            )));
+        }
+
+        if !matches!(packet_num_length, 0x01..=MAX_PKT_NUM_LEN) {
+            return Err(quic_error::Error::header_encoding_error(format!(
+                "unsupported packet number length {:?}",
+                packet_num_length
+            )));
+        }
+
+        Ok(Header::new(
+            0x01,
+            long_header_type,
+            packet_num_length,
+            0x00,
+            0x00,
+            version,
+            dcid,
+            scid,
+            packet_num,
+            token,
+            packet_length,
+        ))
+    }
+
+    pub fn new_short_header(
+        packet_num_length: u8,
+        spin_bit: u8,
+        key_phase: u8,
+        version: u32,
+        packet_num: u32,
+        dcid: &ConnectionId,
+        scid: Option<&ConnectionId>,
+        packet_length: usize,
+    ) -> Result<Self, quic_error::Error> {
+        if !matches!(spin_bit, 0x00 | 0x01) {
+            return Err(quic_error::Error::header_encoding_error(format!(
+                "unsupported header spin bit {:?}",
+                spin_bit
+            )));
+        }
+
+        if !matches!(key_phase, 0x00 | 0x01) {
+            return Err(quic_error::Error::header_encoding_error(format!(
+                "unsupported header key phase {:?}",
+                key_phase
+            )));
+        }
+
+        if !matches!(packet_num_length, 0x01..=MAX_PKT_NUM_LEN) {
+            return Err(quic_error::Error::header_encoding_error(format!(
+                "unsupported packet number length {:?}",
+                packet_num_length
+            )));
+        }
+
+        Ok(Header::new(
+            0x00,
+            0x00,
+            packet_num_length,
+            spin_bit,
+            key_phase,
+            version,
+            dcid,
+            scid,
+            packet_num,
+            None,
+            packet_length,
+        ))
+    }
+
+    //not public because values are not error checked
+    fn new(
+        header_form: u8,
+        long_header_type: u8,
+        packet_num_length: u8,
+        spin_bit: u8,
+        key_phase: u8,
+        version: u32,
+        dcid: &ConnectionId,
+        scid: Option<&ConnectionId>,
+        packet_num: u32,
+        token: Option<Vec<u8>>,
+        packet_length: usize,
+    ) -> Self {
+        let mut hf: u8 = 0x00;
+
+        //set header form bit
+        hf |= header_form << 7;
+
+        //set fixed bit for every header type
+        hf |= 1 << 6;
+
+        hf |= spin_bit << 5;
+
+        hf |= long_header_type << 4;
+
+        hf |= key_phase << 2;
+
+        hf |= packet_num_length;
+
+        Self {
+            hf,
+            version,
+            dcid: dcid.clone(),
+            scid: scid.cloned(),
+            packet_num,
+            packet_num_length,
+            token,
+            packet_length,
+            length: 0,
+        }
+    }
+
     pub fn decrypt(
         &mut self,
         b: &mut octets::OctetsMut,
         header_key: &HeaderProtectionKey,
     ) -> Result<(), BufferTooShortError> {
-        let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN + SAMPLE_LEN)?;
-        let (mut pn_cipher, sample) = pn_and_sample.split_at(MAX_PKT_NUM_LEN)?;
+        let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN as usize + SAMPLE_LEN)?;
+        let (mut pn_cipher, sample) = pn_and_sample.split_at(MAX_PKT_NUM_LEN as usize)?;
 
         match header_key.decrypt_in_place(sample.as_ref(), &mut self.hf, pn_cipher.as_mut()) {
             Ok(_) => (),
@@ -651,9 +868,9 @@ impl Header {
         let (mut first_byte, _) = b.split_at(1)?;
         first_byte.as_mut()[0] = self.hf;
 
-        self.packet_num_length = usize::from((self.hf & PKT_NUM_LENGTH_MASK) + 1);
+        self.packet_num_length = (self.hf & PKT_NUM_LENGTH_MASK) + 1;
 
-        self.length += self.packet_num_length;
+        self.length += self.packet_num_length as usize;
 
         self.packet_num = match self.packet_num_length {
             1 => u32::from(b.get_u8()?),
@@ -666,12 +883,51 @@ impl Header {
         Ok(())
     }
 
-    pub fn parse_from_bytes(
+    //TODO retry & version negotiation packets
+    pub fn to_bytes(&self, b: &mut octets::OctetsMut) -> Result<(), BufferTooShortError> {
+        b.put_u8(self.hf)?;
+
+        if let Some(scid) = &self.scid {
+            //long header
+            b.put_u32(self.version)?;
+            b.put_u8(self.dcid.len().try_into().unwrap())?;
+            b.put_bytes(self.dcid.as_slice())?;
+            b.put_u8(scid.len().try_into().unwrap())?;
+            b.put_bytes(scid.as_slice())?;
+
+            //initial
+            if let Some(token) = &self.token {
+                b.put_varint(token.len().try_into().unwrap())?;
+                b.put_bytes(token)?;
+            }
+
+            //packet length
+            b.put_varint(self.packet_length as u64)?;
+        } else {
+            //short header
+            b.put_bytes(self.dcid.as_slice())?;
+        }
+
+        //packet number
+        match self.packet_num_length {
+            1 => b.put_u8(self.packet_num.try_into().unwrap())?,
+            2 => b.put_u16(self.packet_num.try_into().unwrap())?,
+            3 => b.put_u24(self.packet_num)?,
+            4 => b.put_u32(self.packet_num)?,
+            _ => unreachable!(
+                "unsupported packet number length {}",
+                self.packet_num_length
+            ),
+        };
+
+        Ok(())
+    }
+
+    pub fn from_bytes(
         b: &mut octets::OctetsMut,
         dcid_len: usize,
     ) -> Result<Header, BufferTooShortError> {
         let hf = b.get_u8()?;
-        let pkt_length = u64::try_from(b.cap()).unwrap_or(0);
 
         if ((hf & LS_TYPE_BIT) >> 7) == 0 {
             //short packet
@@ -681,11 +937,11 @@ impl Header {
                 hf,
                 version: 0,
                 dcid: dcid.to_vec().into(),
-                scid: ConnectionId::default(),
+                scid: None,
                 packet_num: 0,
                 packet_num_length: 0,
                 token: None,
-                packet_length: pkt_length as usize,
+                packet_length: 0, //TODO
                 length: b.off(),
             });
         }
@@ -717,7 +973,7 @@ impl Header {
             hf,
             version: v,
             dcid: dcid.into(),
-            scid: scid.into(),
+            scid: Some(scid.into()),
             packet_num: 0,
             packet_num_length: 0,
             token: tok,
@@ -739,6 +995,8 @@ impl Header {
                 .collect::<Vec<String>>()
                 .join(""),
             self.scid
+                .clone()
+                .unwrap_or(ConnectionId::from_vec(Vec::new()))
                 .id
                 .iter()
                 .map(|val| format!("{:x}", val))
@@ -768,7 +1026,7 @@ impl ConnectionId {
     }
 
     #[inline]
-    pub fn as_arr(&self) -> &[u8] {
+    pub fn as_slice(&self) -> &[u8] {
         &self.id
     }
 
@@ -810,5 +1068,46 @@ impl From<Vec<u8>> for ConnectionId {
     #[inline]
     fn from(v: Vec<u8>) -> Self {
         Self::from_vec(v)
+    }
+}
+
+// Tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_long_initial_header() {
+        let result = Header::new_long_header(
+            0x00,
+            0x03,
+            1,
+            0,
+            &ConnectionId::from_vec(Vec::new()),
+            Some(&ConnectionId::from_vec(Vec::new())),
+            None,
+            1280,
+        )
+        .unwrap();
+
+        assert_eq!(result.hf, 0b11000011);
+    }
+
+    #[test]
+    fn create_short_initial_header() {
+        let result = Header::new_short_header(
+            0x03,
+            0x01,
+            0x01,
+            1,
+            0,
+            &ConnectionId::from_vec(Vec::new()),
+            Some(&ConnectionId::from_vec(Vec::new())),
+            1280,
+        )
+        .unwrap();
+
+        assert_eq!(result.hf, 0b01100111);
     }
 }

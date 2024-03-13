@@ -3,36 +3,24 @@ use std::{collections::BTreeMap, sync::Arc};
 // stores and manages streams for connection
 struct StreamManager {}
 
-// Represents a Quic Stream as per rfc 9000 section 2
-// Referenced by a unique streamId with u64 type
-struct QuicStream {
-    // byte buffer for receiving
-    recv_buffer: ChunkedByteBuffer,
-    // byte buffer for sending
-    send_buffer: ChunkedByteBuffer,
-    // if stream is unidirectional
-    unidirectional: bool,
-    // if stream is bidirectional
-    bidirectional: bool,
-    // if stream was created on the local endpoint
-    local: bool,
-    // if stream was created on the remote endpoint
-    remote: bool,
-    // stream priority [0..128], lower is better
-    prio: u8,
+struct Stream {
+    id: usize,
+
+    // existence of outbound/inbound data determines if stream is uni/bidirectional
+    outbound: Option<SendStream>,
+    inbound: Option<RecvStream>,
 }
 
-struct ChunkedByteBuffer {
-    data: BTreeMap<u64, Chunk>,
+struct SendStream {
+    //send state
 
-    // total data length
-    len: u64,
+    //vec dequeue
+}
 
-    // current data chunk, identified by offset, while reading or writing
-    off: u64,
+struct RecvStream {
+    //recv state
 
-    // offset of data chunk with last byte
-    fin: Option<u64>,
+    //BTreeMap
 }
 
 //single chunk of data
