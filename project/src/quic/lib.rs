@@ -3,17 +3,17 @@ mod quic_error;
 mod stream;
 mod token;
 mod transport_parameters;
+mod packet;
 
-use crate::frame::Frame;
-use frame::{
-    AckFrame, ConnectionCloseFrame, CryptoFrame, NewConnectionIdFrame, NewTokenFrame, StreamFrame,
-};
-use octets::{BufferTooShortError, OctetsMut};
+// use frame::{
+//     AckFrame, ConnectionCloseFrame, CryptoFrame, NewConnectionIdFrame, NewTokenFrame, StreamFrame, Frame
+// };
+use packet::{Header, AckFrame, ConnectionCloseFrame, CryptoFrame, NewConnectionIdFrame, NewTokenFrame, StreamFrame, Frame};
+use octets::OctetsMut;
 use rand::RngCore;
-use ring::aead::quic;
 use rustls::{
     quic::{
-        Connection as RustlsConnection, HeaderProtectionKey, KeyChange, Keys, PacketKeySet, Version,
+        Connection as RustlsConnection, KeyChange, Keys, PacketKeySet, Version,
     },
     Side,
 };
@@ -23,13 +23,7 @@ use std::{
     net::{SocketAddr, UdpSocket},
 };
 
-const LS_TYPE_BIT: u8 = 0x80;
-const TYPE_MASK: u8 = 0x30;
-const PKT_NUM_LENGTH_MASK: u8 = 0x03;
-
-const MAX_PKT_NUM_LEN: u8 = 4;
 const MAX_CID_SIZE: usize = 20;
-const SAMPLE_LEN: usize = 16;
 
 const SPACE_ID_INITIAL: usize = 0x00;
 const SPACE_ID_HANDSHAKE: usize = 0x01;
@@ -126,7 +120,7 @@ impl Endpoint {
 
         //match connection if one already exists
         if let Some(h) =
-            self.get_connection_handle(&head.dcid, &src_addr, ((head.hf & LS_TYPE_BIT) >> 7) != 0)
+            self.get_connection_handle(&head.dcid, &src_addr, ((head.hf & packet::LS_TYPE_BIT) >> 7) != 0)
         {
             //connection exists, pass packet to connection
             println!("Found existing connection for {}", &head.dcid);
@@ -153,7 +147,7 @@ impl Endpoint {
             Err(error) => panic!("Error: {}", error),
         }
 
-        let (header_raw, mut payload_cipher) = octet_buffer.split_at(head.length).unwrap();
+        let (header_raw, mut payload_cipher) = octet_buffer.split_at(octet_buffer.off()).unwrap();
 
         //cut off trailing 0s from buffer
         let (mut payload_cipher, _) = payload_cipher
@@ -659,9 +653,47 @@ impl Connection {
         let pns = &mut self.packet_spaces[self.current_space];
         let buf = octets::OctetsMut::with_slice(buffer);
 
-        //build header
+        let mut packet_num_length: u8 = 0;
 
-        //build payload
+        match pns.next_pkt_num {
+            0x00..=0xff => packet_num_length = 0,
+            0x0100..=0xffff => packet_num_length = 1,
+            0x010000..=0xffffff => packet_num_length = 2,
+            0x01000000..=0xffffffff => packet_num_length = 3,
+            _ => unreachable!("packet number exceeds maximum encodable value"),
+        }
+
+        //figure out proper way to get current cids
+        let dcid: &ConnectionId = &self.initial_remote_scid;
+        let scid: &ConnectionId = &self.initial_local_scid;
+
+        //collect payload frames and count length
+        let mut packet_length: usize = 0;
+
+        //calculate padding
+        //let padding_count = 1200 - packet_length;
+
+        //add packet num length to packet length
+        packet_length += packet_num_length as usize;
+
+        //create header with length
+        //TODO maybe encode header first and update packet length at fixed offset later
+        //can be done via variable length integer with fixed max len but nontheless encoding small
+        //number
+        let header = Header::new_long_header(
+            0x00,
+            packet_num_length,
+            1,
+            pns.next_pkt_num,
+            dcid,
+            scid,
+            None,
+            packet_length,
+        );
+
+        //encode header
+
+        pns.next_pkt_num += 1;
 
         Ok(buf.off())
     }
@@ -686,7 +718,7 @@ pub struct PacketNumberSpace {
 
     max_acked_pkt: Option<u64>,
 
-    next_pkt_num: u64,
+    next_pkt_num: u32,
 }
 
 impl PacketNumberSpace {
@@ -701,311 +733,6 @@ impl PacketNumberSpace {
             max_acked_pkt: None,
             next_pkt_num: 0,
         }
-    }
-}
-
-pub struct Header {
-    hf: u8, //header form and version specific bits
-    version: u32,
-    dcid: ConnectionId,
-    scid: Option<ConnectionId>,
-
-    //The following fields are under header protection
-    packet_num: u32,
-    packet_num_length: u8,
-    token: Option<Vec<u8>>,
-
-    //packet length including packet_num
-    packet_length: usize,
-
-    //header length including packet_num
-    length: usize,
-}
-
-impl Header {
-    pub fn new_long_header(
-        long_header_type: u8,
-        packet_num_length: u8,
-        version: u32,
-        packet_num: u32,
-        dcid: &ConnectionId,
-        scid: Option<&ConnectionId>,
-        token: Option<Vec<u8>>,
-        packet_length: usize,
-    ) -> Result<Self, quic_error::Error> {
-        if !matches!(long_header_type, 0x00..=0x03) {
-            return Err(quic_error::Error::header_encoding_error(format!(
-                "unsupported long header type {:?}",
-                long_header_type
-            )));
-        }
-
-        if !matches!(packet_num_length, 0x01..=MAX_PKT_NUM_LEN) {
-            return Err(quic_error::Error::header_encoding_error(format!(
-                "unsupported packet number length {:?}",
-                packet_num_length
-            )));
-        }
-
-        Ok(Header::new(
-            0x01,
-            long_header_type,
-            packet_num_length,
-            0x00,
-            0x00,
-            version,
-            dcid,
-            scid,
-            packet_num,
-            token,
-            packet_length,
-        ))
-    }
-
-    pub fn new_short_header(
-        packet_num_length: u8,
-        spin_bit: u8,
-        key_phase: u8,
-        version: u32,
-        packet_num: u32,
-        dcid: &ConnectionId,
-        scid: Option<&ConnectionId>,
-        packet_length: usize,
-    ) -> Result<Self, quic_error::Error> {
-        if !matches!(spin_bit, 0x00 | 0x01) {
-            return Err(quic_error::Error::header_encoding_error(format!(
-                "unsupported header spin bit {:?}",
-                spin_bit
-            )));
-        }
-
-        if !matches!(key_phase, 0x00 | 0x01) {
-            return Err(quic_error::Error::header_encoding_error(format!(
-                "unsupported header key phase {:?}",
-                key_phase
-            )));
-        }
-
-        if !matches!(packet_num_length, 0x01..=MAX_PKT_NUM_LEN) {
-            return Err(quic_error::Error::header_encoding_error(format!(
-                "unsupported packet number length {:?}",
-                packet_num_length
-            )));
-        }
-
-        Ok(Header::new(
-            0x00,
-            0x00,
-            packet_num_length,
-            spin_bit,
-            key_phase,
-            version,
-            dcid,
-            scid,
-            packet_num,
-            None,
-            packet_length,
-        ))
-    }
-
-    //not public because values are not error checked
-    fn new(
-        header_form: u8,
-        long_header_type: u8,
-        packet_num_length: u8,
-        spin_bit: u8,
-        key_phase: u8,
-        version: u32,
-        dcid: &ConnectionId,
-        scid: Option<&ConnectionId>,
-        packet_num: u32,
-        token: Option<Vec<u8>>,
-        packet_length: usize,
-    ) -> Self {
-        let mut hf: u8 = 0x00;
-
-        //set header form bit
-        hf |= header_form << 7;
-
-        //set fixed bit for every header type
-        hf |= 1 << 6;
-
-        hf |= spin_bit << 5;
-
-        hf |= long_header_type << 4;
-
-        hf |= key_phase << 2;
-
-        hf |= packet_num_length;
-
-        Self {
-            hf,
-            version,
-            dcid: dcid.clone(),
-            scid: scid.cloned(),
-            packet_num,
-            packet_num_length,
-            token,
-            packet_length,
-            length: 0,
-        }
-    }
-
-    pub fn decrypt(
-        &mut self,
-        b: &mut octets::OctetsMut,
-        header_key: &HeaderProtectionKey,
-    ) -> Result<(), BufferTooShortError> {
-        let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN as usize + SAMPLE_LEN)?;
-        let (mut pn_cipher, sample) = pn_and_sample.split_at(MAX_PKT_NUM_LEN as usize)?;
-
-        match header_key.decrypt_in_place(sample.as_ref(), &mut self.hf, pn_cipher.as_mut()) {
-            Ok(_) => (),
-            Err(error) => panic!("Error decrypting header: {}", error),
-        }
-
-        //write decrypted first byte back into buffer
-        let (mut first_byte, _) = b.split_at(1)?;
-        first_byte.as_mut()[0] = self.hf;
-
-        self.packet_num_length = (self.hf & PKT_NUM_LENGTH_MASK) + 1;
-
-        self.length += self.packet_num_length as usize;
-
-        self.packet_num = match self.packet_num_length {
-            1 => u32::from(b.get_u8()?),
-            2 => u32::from(b.get_u16()?),
-            3 => b.get_u24()?,
-            4 => b.get_u32()?,
-            _ => return Err(BufferTooShortError),
-        };
-
-        Ok(())
-    }
-
-    //TODO retry & version negotiation packets
-    pub fn to_bytes(&self, b: &mut octets::OctetsMut) -> Result<(), BufferTooShortError> {
-        b.put_u8(self.hf)?;
-
-        if let Some(scid) = &self.scid {
-            //long header
-            b.put_u32(self.version)?;
-            b.put_u8(self.dcid.len().try_into().unwrap())?;
-            b.put_bytes(self.dcid.as_slice())?;
-            b.put_u8(scid.len().try_into().unwrap())?;
-            b.put_bytes(scid.as_slice())?;
-
-            //initial
-            if let Some(token) = &self.token {
-                b.put_varint(token.len().try_into().unwrap())?;
-                b.put_bytes(token)?;
-            }
-
-            //packet length
-            b.put_varint(self.packet_length as u64)?;
-        } else {
-            //short header
-            b.put_bytes(self.dcid.as_slice())?;
-        }
-
-        //packet number
-        match self.packet_num_length {
-            1 => b.put_u8(self.packet_num.try_into().unwrap())?,
-            2 => b.put_u16(self.packet_num.try_into().unwrap())?,
-            3 => b.put_u24(self.packet_num)?,
-            4 => b.put_u32(self.packet_num)?,
-            _ => unreachable!(
-                "unsupported packet number length {}",
-                self.packet_num_length
-            ),
-        };
-
-        Ok(())
-    }
-
-    pub fn from_bytes(
-        b: &mut octets::OctetsMut,
-        dcid_len: usize,
-    ) -> Result<Header, BufferTooShortError> {
-        let hf = b.get_u8()?;
-
-        if ((hf & LS_TYPE_BIT) >> 7) == 0 {
-            //short packet
-            let dcid = b.get_bytes(dcid_len)?;
-
-            return Ok(Header {
-                hf,
-                version: 0,
-                dcid: dcid.to_vec().into(),
-                scid: None,
-                packet_num: 0,
-                packet_num_length: 0,
-                token: None,
-                packet_length: 0, //TODO
-                length: b.off(),
-            });
-        }
-
-        let v = b.get_u32()?;
-
-        let dcid_length = b.get_u8()?; // TODO check for max cid len of 20
-        let dcid = b.get_bytes(dcid_length as usize)?.to_vec();
-
-        let scid_length = b.get_u8()?; // TODO check for max cid len of 20
-        let scid = b.get_bytes(scid_length as usize)?.to_vec();
-
-        let mut tok: Option<Vec<u8>> = None;
-
-        match (hf & TYPE_MASK) >> 4 {
-            0x00 => {
-                // Initial
-                tok = Some(b.get_bytes_with_varint_length()?.to_vec());
-            }
-            0x01 => (), // Zero-RTT
-            0x02 => (), // Handshake
-            0x03 => (), // Retry
-            _ => panic!("Fatal Error with packet type"),
-        }
-
-        let pkt_length = b.get_varint()?;
-
-        Ok(Header {
-            hf,
-            version: v,
-            dcid: dcid.into(),
-            scid: Some(scid.into()),
-            packet_num: 0,
-            packet_num_length: 0,
-            token: tok,
-            packet_length: pkt_length as usize,
-            length: b.off(),
-        })
-    }
-
-    fn debug_print(&self) {
-        println!(
-            "{:#04x?} version: {:#06x?} pn: {:#010x?} dcid: 0x{} scid: 0x{} token:{:x?} length:{:?} header_length:{:?}",
-            ((self.hf & TYPE_MASK) >> 4),
-            self.version,
-            self.packet_num,
-            self.dcid
-                .id
-                .iter()
-                .map(|val| format!("{:x}", val))
-                .collect::<Vec<String>>()
-                .join(""),
-            self.scid
-                .clone()
-                .unwrap_or(ConnectionId::from_vec(Vec::new()))
-                .id
-                .iter()
-                .map(|val| format!("{:x}", val))
-                .collect::<Vec<String>>()
-                .join(""),
-            self.token.as_ref().unwrap(),
-            self.packet_length,
-            self.length,
-        );
     }
 }
 
@@ -1085,7 +812,7 @@ mod tests {
             1,
             0,
             &ConnectionId::from_vec(Vec::new()),
-            Some(&ConnectionId::from_vec(Vec::new())),
+            &ConnectionId::from_vec(Vec::new()),
             None,
             1280,
         )
@@ -1103,11 +830,24 @@ mod tests {
             1,
             0,
             &ConnectionId::from_vec(Vec::new()),
-            Some(&ConnectionId::from_vec(Vec::new())),
             1280,
         )
         .unwrap();
 
         assert_eq!(result.hf, 0b01100111);
+    }
+
+    #[test]
+    fn test_length_matching() {
+        let x = 256;
+        let mut length = 0;
+
+        match x {
+            ..=0xff => length = 0,
+            0x0100..=0xffff => length = 1,
+            _ => unreachable!("unreachable size of next packet num"),
+        }
+
+        assert_eq!(length, 1);
     }
 }
