@@ -6,29 +6,31 @@ and error-checked data transmission between two applications, has been the found
 connectivity that underpins our digital experiences. However, the ever-accelerating evolution of network
 landscapes, coupled with an intensifying demand for heightened flexibility, security, and superior performance,
 has catalyzed in the exploration of alternatives. In response to these demands, the QUIC protocol has emerged
-as a solution to next-generation networking, with its roots tracing back to the laboratories of Google itself.
+as a solution to next-generation networking, with its roots tracing back to the laboratories of Google.
 In a contemporary environment where the static nature of traffic from predominantly home networks has given way
 to a dynamic mix of devices, networks and technologies, QUIC represents the much needed next step in networking.
-Unlike its predecessor, QUIC is designed to meet the challenges of a modernized digital ecosystem, where seamless
-and secure connections are imperative across a diverse array of devices and scenarios. As our lives become
-increasingly interconnected and reliant on a myriad of digital interfaces, QUIC stands as the much-needed next
+Unlike its predecessor, QUIC is designed to meet the challenges of a modern digital ecosystem, where seamless
+and secure connections are imperative across a diverse array of devices and usage scenarios. As our lives become
+increasingly interconnected and reliant on a myriad of digital interfaces, QUIC stands as the widely adopted next
 step, ensuring not only reliability but also security.
 
 \section{Motivation}
 
 The current TCP/IP stack faces limitations in latency and connection establishment times due to its three-way
-handshake mechanism. QUIC, built on top of UDP, offers significant improvements.  Firstly, it utilizes a single
-handshake which directly integrates the tls handshake, leading to faster connection establishment. Secondly,
-QUIC integrates a high performance streaming system combined with a robust error detection system, allowing
+handshake mechanism. QUIC, built on top of UDP, offers significant improvements ocer TCP. Firstly, it utilizes a single
+handshake for establishing a secure connection, leading to faster connection establishment. Secondly,
+QUIC integrates a high performance stream control system combined with a robust error detection system, allowing
 for reliable data transmission even with packet loss, improving application performance.
 
-Additionally Rust has a number of benefits as it is a modern systems programming language currently gaining
-traction due to its focus on memory safety, performance, and concurrency. Its ownership system eliminates
-dangling pointers and memory leaks, crucial for low-level network programming. Additionally, Rust's ability
-to express concurrency efficiently makes it well-suited for handling the asynchronous nature of network
-communication within the QUIC protocol.
+QUIC provides an excellent opportunity to utilise a systems programming language for an implementation in order to
+maximise performance while managing resources at byte level. The programming language Rust has a number of benefits
+as it is currently gaining traction due to its focus on memory safety, performance, and concurrency. Its ownership
+system eliminates dangling pointers and memory leaks, crucial for low-level network programming. Additionally,
+Rust's ability to express concurrency efficiently makes it well-suited for handling the asynchronous nature of
+network communication.
+%and therefore highly beneficial when as utilised by the QUIC protocol.
 
-This thesis aims to develop a minimal QUIC implementation in Rust that demonstrates basic connection
+This thesis aims to develop a basic QUIC implementation in Rust that demonstrates basic connection
 handling, data transfer, and the library design. While not a full-fledged production-ready
 implementation, this prototype will provide valuable insights into QUICs packet and header designs,
 its handshake mechanisms, its security measures and its performace benefits over TCP.
@@ -37,16 +39,16 @@ its handshake mechanisms, its security measures and its performace benefits over
 
 This bachelor's thesis objective is to implement a standalone version of the QUIC transport protocol in Rust,
 utilizing version rustc 1.72.0 and the UDP-Socket from the Rust standard library as its foundation. The
-implementation aims to encompass several features crucial for a functional QUIC server endpoint. These include
+implementation aims to comprise several features crucial for a functional QUIC server endpoint. These include
 the ability to send and receive QUIC packets, parsing, and encryption/decryption of both header and payload data.
 Additionally, the system aims to support a fully executed 1-RTT QUIC handshake between two endpoints, employing
 TLS 1.3 through the Rustls crate.
 
-In developing this implementation, reference is primarily made to RFCs 8999-9001, chosen due to a lack of
-comparable open-source implementations in Rust. The project focuses on handling all frames within the payload,
+In developing this implementation, reference is exclusively made to RFCs 8999-9001, chosen due to a lack of
+comparable open-source implementations in Rust. A focus is set on handling all frames within the payload,
 with special attention given to Cryptoframes and Dataframes.
 
-The implementation incorporates essential tools, such as the Rustls crate with the "quic" feature for a
+The implementation makes use of existing tools, such as the Rustls crate with the "quic" feature for a
 complete TLS 1.3 implementation and the Octets crate, serving as a Rust zero-copy mutable Byte Buffer to
 facilitate parsing.
 
@@ -73,19 +75,19 @@ protocol fundamentals. Furthermore, both TCP and UDP are introduced in more deta
 Chapter three forms the core of the thesis, in which QUIC is examined in detail. It starts by exploring QUIC's
 historical background, clarifying its goals in addressing problems faced by TCP and other protocols, and continues
 with a detailed breakdown of its architecture. Moving into the more practical part of QUIC, the following
-subsections break down its connections and the ways in which QUIC deals with different errors and how it recovers.
-Finally, we examine the security features integrated into QUIC.
+subsections break down its connections and the ways in which QUIC deals with different errors and how it recovers
+from them. Finally, we examine the security features integrated into QUIC.
 
-Moving into the implementation chapter, we learn about the rationale behind choosing Rust as the implementation
-language and the scope of the QUIC implementation, followed by the development environment specifics and all
-external libraries the implementation makes use of. The main part of chapter four deals with the library layout
-and dives deep into specifics of connection establishment, packet handling and stream management. Lastly we will
-examine both protocol and implementation error handling mechanisms before concluding the chapter with an overview
+Moving into the implementation chapter, the rationale behind choosing Rust as the implementation
+language is explained and the scope of the QUIC implementation is set, followed by the development environment specifics
+and all external libraries the implementation makes use of. The main part of chapter four deals with the library layout
+and dives deep into specifics of connection establishment, packet handling and stream management. Lastly both protocol
+and implementation error handling mechanisms will be examined before concluding the chapter with an overview
 of the strategies used to test and validate parts of the implementation.
 
 The "Evaluation" chapter critically assesses the implemented QUIC protocol. It addresses encountered challenges,
 acknowledges inherent limitations, evaluates performance considerations, provides considerations for future
 improvements and modifications, and conducts a comparative analysis with other existing implementations.
 
-In the concluding chapter, key findings are encapsulated and a conclusion is drawn. The end of this thesis provides
+In the concluding chapter, key findings are laid out and a conclusion is drawn. The end of this thesis provides
 an outlook into the future of QUIC.

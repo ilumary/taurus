@@ -278,18 +278,15 @@ modification. Individual values may be extracted through bitshifting. Other fiel
         hf: u8, //header form and version specific bits
         version: u32,
         dcid: ConnectionId,
-        scid: ConnectionId,
-    
+        scid: Option<ConnectionId>,
+        token: Option<Vec<u8>>,
+
         //The following fields are under header protection
         packet_num: u32,
-        packet_num_length: usize,
-        token: Option<Vec<u8>>,
-    
+        packet_num_length: u8,
+
         //packet length including packet_num
         packet_length: usize,
-    
-        //header length including packet_num
-        length: usize,
     }
   \end{rustcode}
 \end{codeblock}
@@ -766,7 +763,7 @@ the whole library and defined in \inlinecode{quic\_error.rs}. For easier impleme
     \label{quic_errors_self_defined}
 \end{codeblock}
 
-\section{Executing}
+%\section{Executing}
 
 %tested code, testing with example application
 %provide examples with quinn
