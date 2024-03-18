@@ -92,7 +92,7 @@ All of these represent the attempt to fix TCPs long standing problems.
  unrelated. This occurs because TCP guarantees in-order delivery of data, so if a packet is lost or delayed, subsequent packets
  must wait until it is retransmitted or delivered. This can lead to inefficiencies and delays, particularly in scenarios where
  real-time communication is crucial.
- \item Long delay incurred during connection setup. TCP requires a three-way handshake process to establish a secure connection, which
+ \item Long delay incurred during connection setup. TCP with TLS requires a three-way handshake process to establish a secure connection, which
  typically involves three round-trip exchanges between the client and server, plus an additional round trip for acknowledgment.
  This can result in significant latency, particularly in situations where rapid connection establishment is essential.
  \item A fixed IP address per connection endpoint. This means that if a device's IP address changes, existing TCP connections must
@@ -516,11 +516,11 @@ whenever an ack-eliciting packet is sent (see Sec. \ref{loss_detection_recovery}
 \subsubsection{Estimating Round Trip Times}
 
 An RTT sample is generated upon receiving an acknowledgement (ACK) frame that meets two criteria:
-First, It acknowledges the largest packet number not previously acknowledged.
-Second, At least one of the newly acknowledged packets triggered an acknowledgement (ack-eliciting frame).
+First, it acknowledges the largest packet number not previously acknowledged.
+Second, at least one of the newly acknowledged packets triggered an acknowledgement (ack-eliciting frame).
 The RTT sample (\inlinecode{latest\_rtt}) is calculated by measuring the time elapsed since the largest acknowledged packet was sent.
 
-Additionally, the minimum rtt (\inlinecode{min\_rtt}) is tracked. The \inlinecode{min\_rtt} represents the sender's observation of the absolute
+Additionally, the minimum round trip time (\inlinecode{min\_rtt}) is tracked. The \inlinecode{min\_rtt} represents the sender's observation of the absolute
 minimum RTT for the connection. It is initialized to the first received RTT sample (\inlinecode{latest\_rtt}). Subsequent samples are compared
 to \inlinecode{min\_rtt}, and the lower value is retained.
 
@@ -546,7 +546,7 @@ Cubic\cite[]{rfc8312} or add improvements like HyStart++\cite[]{rfc9406}.
     \label{cc_comparison}
 \end{figure}
 
-QUIC uses a congestion window to limit the number of bytes in flight (unacknowledged packets) at any given time. A sender cannot
+QUIC uses a congestion window to limit the number of bytes in flight (unacknowledged packets) at any given time. A sender is not allowed
 transmit a packet that would exceed the congestion window which is adjusted dynamically based on network conditions. QUIC defines
 three congestion control states: Slow Start, Recovery, and Congestion Avoidance. Slow Start is used initially, the window grows
 exponentially to quickly probe the network capacity. The recovery is entered upon packet loss or ECN increase. The window is
@@ -563,7 +563,7 @@ the window won't be increased. A pacing mechanism might also delay sending packe
 shouldn't be considered application limited in this case.
 
 Overall, QUIC's congestion control aims to achieve efficient data transfer by dynamically adjusting the sending rate based on network
-conditions while avoiding congestion collapse
+conditions while avoiding congestion collapse.
 
 \subsection{0-RTT Connection} \label{zero_rtt}
 
@@ -612,7 +612,7 @@ with the intended peer. \cite[42]{rfc9000} \label{address_validation}
 \end{enumerate}
 \endgroup
 
-If a QUIC connection is migrated onto a new network path, the new network path may get validated first through the use of probing
+If a QUIC connection is migrated to a new network interface, the new network path may get validated first through the use of probing
 packets. The migration is initiated with the first packet containing non-probing frames. If an endpoint receives a packet with a
 known connection identifier from an address which it does not recognize, it must perform address validation first before sending
 any data over the new path. If the address validation is successful, connection identifiers are renewed and congestion control and

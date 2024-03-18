@@ -1,19 +1,19 @@
 \chapter{Evaluation}
 
-Throughout the process of writing this thesis, the accompanying QUIC library accumulated 1855 lines of code (as of the submit date).
-All major goals that have been set in advacne to this thesis have been achieved, except for one. The QUIC library is able to receive
+Throughout the process of writing this thesis, the QUIC library accumulated 1855 lines of code (as of the submit date).
+All major goals that have been set in advance to this thesis have been achieved, except for one. The QUIC library is able to receive
 QUIC packets, parse, decrypt, process, and encrypt header and payload data through all three packet number spaces, and construct
 answer packets. The only exception is the full TLS 1.3 1-RTT handshake. Due to numerous challenges (\ref{challenges}) and the short
 time frame the full handshake has narrowly not been achieved. Additionally the original objective to test the implementation with
 \inlinecode{aioquic} had to be adjusted to instead use \inlinecode{quinn}. 
 
-Using Rust as only programming language proved a valuable lesson. Its concepts of ownership, borrowing and lifetimes dictate a
-special style of programming that prevents handling of raw pointers and massively complicates the manipulation of data through
-references outside of the scope of the data they are referring to. Keeping references in structs for example is notoriously
+Using Rust as only programming language proved to be a valuable lesson. Rusts concepts of ownership, borrowing and lifetimes dictate a
+special style of programming that prevents handling of raw pointers and hence massively complicates the manipulation of data through
+references outside of the scope of the data the pointers are referring to. Keeping references in structs for example is notoriously
 difficult due to Rusts lifetime annotations. While all these measures have resulted in not a single segmentation fault being
 thrown for the whole development phase, it gravely impacted the library design. One of those being that the \inlinecode{recv()}
 and \inlinecode{accept()} functions from the \inlinecode{Connection} object always return into the endpoint to minimise the
-amount of reference having to be kept. Additionally, Rusts effort to improve the readability of compiler error messages
+amount of references having to be kept. Additionally, Rusts effort to improve the readability of compiler error messages
 greatly accelerated debugging.
 
 While one might think that the limitations of Rust may limit performance, the
@@ -50,7 +50,7 @@ Switch back to the first terminal and start the client connection by executing t
     \end{textcode}
 \end{terminalblock}
 
-The second terminal window now shows the debug print statements of the library.
+The second terminal window now shows the librarys debug statements.
 
 \begin{terminalblock}
     \begin{textcode}
