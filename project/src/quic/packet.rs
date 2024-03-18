@@ -9,12 +9,22 @@ pub const LS_TYPE_BIT: u8 = 0x80;
 const TYPE_MASK: u8 = 0x30;
 const PKT_NUM_LENGTH_MASK: u8 = 0x03;
 
+//static dispatch in favor of dynamic dispatch to increase performance at the cost of (manageable)
+//binary bloat
+pub fn encode_frame<T: Frame>(
+    frame: &T,
+    bytes: &mut octets::OctetsMut<'_>,
+) -> Result<usize, octets::BufferTooShortError> {
+    frame.to_bytes(bytes)
+}
+
 pub trait Frame {
     fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self;
 
-    //fn to_bytes(&self, bytes: &mut octets::OctetsMut<'_>);
-
-    //fn len(&self)
+    fn to_bytes(
+        &self,
+        bytes: &mut octets::OctetsMut<'_>,
+    ) -> Result<usize, octets::BufferTooShortError>;
 }
 
 pub struct AckFrame {
@@ -58,11 +68,27 @@ impl Frame for AckFrame {
             ecn_counts,
         }
     }
+
+    fn to_bytes(
+        &self,
+        bytes: &mut octets::OctetsMut<'_>,
+    ) -> Result<usize, octets::BufferTooShortError> {
+        Ok(0)
+    }
 }
 
 pub struct CryptoFrame {
     offset: u64,
     crypto_data: Vec<u8>,
+}
+
+impl CryptoFrame {
+    pub fn new(offset: u64, crypto_data: Vec<u8>) -> Self {
+        Self {
+            offset,
+            crypto_data,
+        }
+    }
 }
 
 impl Frame for CryptoFrame {
@@ -73,6 +99,17 @@ impl Frame for CryptoFrame {
             offset,
             crypto_data: bytes.get_bytes_with_varint_length().unwrap().to_vec(),
         }
+    }
+
+    fn to_bytes(
+        &self,
+        bytes: &mut octets::OctetsMut<'_>,
+    ) -> Result<usize, octets::BufferTooShortError> {
+        bytes.put_u8(0x06)?;
+        let off_len = bytes.put_varint(self.offset)?.len();
+        let data_len_len = bytes.put_varint(self.len().try_into().unwrap())?.len();
+        bytes.put_bytes(self.crypto_data.as_ref())?;
+        Ok(1 + off_len + data_len_len + self.len())
     }
 }
 
@@ -103,6 +140,13 @@ impl Frame for NewTokenFrame {
             token_length,
             token: bytes.get_bytes(token_length as usize).unwrap().to_vec(),
         }
+    }
+
+    fn to_bytes(
+        &self,
+        bytes: &mut octets::OctetsMut<'_>,
+    ) -> Result<usize, octets::BufferTooShortError> {
+        Ok(0)
     }
 }
 
@@ -140,7 +184,12 @@ impl Frame for StreamFrame {
         }
     }
 
-    //fn to_bytes()
+    fn to_bytes(
+        &self,
+        bytes: &mut octets::OctetsMut<'_>,
+    ) -> Result<usize, octets::BufferTooShortError> {
+        Ok(0)
+    }
 }
 
 impl StreamFrame {
@@ -175,6 +224,13 @@ impl Frame for NewConnectionIdFrame {
             stateless_reset_token,
         }
     }
+
+    fn to_bytes(
+        &self,
+        bytes: &mut octets::OctetsMut<'_>,
+    ) -> Result<usize, octets::BufferTooShortError> {
+        Ok(0)
+    }
 }
 
 pub struct ConnectionCloseFrame {
@@ -205,6 +261,13 @@ impl Frame for ConnectionCloseFrame {
             reason_phrase_length,
             reason_phrase,
         }
+    }
+
+    fn to_bytes(
+        &self,
+        bytes: &mut octets::OctetsMut<'_>,
+    ) -> Result<usize, octets::BufferTooShortError> {
+        Ok(0)
     }
 }
 
@@ -242,7 +305,7 @@ impl Header {
             )));
         }
 
-        if !matches!(packet_num_length, 0x01..=MAX_PKT_NUM_LEN) {
+        if !matches!(packet_num_length, 0x00..=MAX_PKT_NUM_LEN) {
             return Err(quic_error::Error::header_encoding_error(format!(
                 "unsupported packet number length {:?}",
                 packet_num_length
@@ -368,13 +431,13 @@ impl Header {
         let (mut first_byte, _) = b.split_at(1)?;
         first_byte.as_mut()[0] = self.hf;
 
-        self.packet_num_length = (self.hf & PKT_NUM_LENGTH_MASK) + 1;
+        self.packet_num_length = self.hf & PKT_NUM_LENGTH_MASK;
 
         self.packet_num = match self.packet_num_length {
-            1 => u32::from(b.get_u8()?),
-            2 => u32::from(b.get_u16()?),
-            3 => b.get_u24()?,
-            4 => b.get_u32()?,
+            0 => u32::from(b.get_u8()?),
+            1 => u32::from(b.get_u16()?),
+            2 => b.get_u24()?,
+            3 => b.get_u32()?,
             _ => return Err(octets::BufferTooShortError),
         };
 
@@ -408,10 +471,10 @@ impl Header {
 
         //packet number
         match self.packet_num_length {
-            1 => b.put_u8(self.packet_num.try_into().unwrap())?,
-            2 => b.put_u16(self.packet_num.try_into().unwrap())?,
-            3 => b.put_u24(self.packet_num)?,
-            4 => b.put_u32(self.packet_num)?,
+            0 => b.put_u8(self.packet_num.try_into().unwrap())?,
+            1 => b.put_u16(self.packet_num.try_into().unwrap())?,
+            2 => b.put_u24(self.packet_num)?,
+            3 => b.put_u32(self.packet_num)?,
             _ => unreachable!(
                 "unsupported packet number length {}",
                 self.packet_num_length

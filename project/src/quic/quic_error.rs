@@ -27,6 +27,7 @@ impl Error {
     quic_error!(unknown_connection, 0x01);
     quic_error!(socket_error, 0x02);
     quic_error!(header_encoding_error, 0x03);
+    quic_error!(packet_size_error, 0x04);
 }
 
 impl fmt::Display for Error {

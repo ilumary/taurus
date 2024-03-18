@@ -1,25 +1,79 @@
 \chapter{Evaluation}
 
-\todo{Execution, Auswertung usw}
+Throughout the process of writing this thesis, the accompanying QUIC library accumulated 1855 lines of code (as of the submit date).
+All major goals that have been set in advacne to this thesis have been achieved, except for one. The QUIC library is able to receive
+QUIC packets, parse, decrypt, process, and encrypt header and payload data through all three packet number spaces, and construct
+answer packets. The only exception is the full TLS 1.3 1-RTT handshake. Due to numerous challenges (\ref{challenges}) and the short
+time frame the full handshake has narrowly not been achieved. Additionally the original objective to test the implementation with
+\inlinecode{aioquic} had to be adjusted to instead use \inlinecode{quinn}. 
 
-\section{Challenges}
+Using Rust as only programming language proved a valuable lesson. Its concepts of ownership, borrowing and lifetimes dictate a
+special style of programming that prevents handling of raw pointers and massively complicates the manipulation of data through
+references outside of the scope of the data they are referring to. Keeping references in structs for example is notoriously
+difficult due to Rusts lifetime annotations. While all these measures have resulted in not a single segmentation fault being
+thrown for the whole development phase, it gravely impacted the library design. One of those being that the \inlinecode{recv()}
+and \inlinecode{accept()} functions from the \inlinecode{Connection} object always return into the endpoint to minimise the
+amount of reference having to be kept. 
+
+While one might think that the limitations of Rust may limit performance, the
+\inlinecode{quiche}\footnote{\url{https://github.com/cloudflare/quiche}} implementation by cloudflare, also developed in Rust,
+can even outperform \inlinecode{picoquic}\footnote{\url{https://github.com/private-octopus/picoquic}}, an implementation in
+pure C\footnote{\url{https://www.diva-portal.org/smash/get/diva2:1691838/FULLTEXT03}}.
+
+\section{Execution}
+Rust and Cargo should enable fully functionaly cross-platform compilation as long as \inlinecode{rustc} version \inlinecode{1.72.0}
+or higher is used. To test with an external client, clone the external library \inlinecode{quinn} first.
+
+\begin{terminalblock}
+    \begin{textcode}
+        [user@computer thesis]$ git clone https://github.com/quinn-rs/quinn
+        ...
+        [user@computer thesis]$ cd quinn
+    \end{textcode}
+\end{terminalblock}
+
+Open a second terminal and navigate to the \inlinecode{project} folder inside the thesis directory. Start the server by
+executing \inlinecode{cargo run}.
+
+\begin{terminalblock}
+    \begin{textcode}
+        [user@computer thesis] ~/thesis/project $ cargo run
+    \end{textcode}
+\end{terminalblock}
+
+Switch back to the first terminal and start the client connection by executing the following command.
+
+\begin{terminalblock}
+    \begin{textcode}
+        [user@computer thesis] ~/quinn $ cargo run --example client https://127.0.0.1:34254/Cargo.toml
+    \end{textcode}
+\end{terminalblock}
+
+The second terminal window now shows the debug print statements of the library.
+
+\begin{terminalblock}
+    \begin{textcode}
+        [user@computer thesis] ~/thesis/project $ cargo run
+        Received 1200 bytes from 127.0.0.1:63844
+        0x00 version: 0x0001 pn: 0x00000000 dcid: 0xe5d0924ff82d5b9a scid: 0x365428d847571dab token:[] length:1162
+        ...
+    \end{textcode}
+\end{terminalblock}
+
+\section{Challenges} \label{challenges}
 The vast scope of QUIC inherently leads to high complexity. This is evident from the very beginning - 
 the implementation overhead needed to just be able to build an answer to an initial packet is immense.
 Throughout the whole implementation process a carefully designed library is crucial to avoid major refactoring and
 rewrites later on.
 
-Unfortunately, the relatively new nature of QUIC means there's a scarcity of widely available implementations, tutorials,
-and explanations.  This lack of resources makes it more challenging to understand the protocol itself and derive a design
+Unfortunately, the newness of QUIC means there's a scarcity of widely available implementations, tutorials,
+and explanations. This lack of resources makes it more challenging to understand the protocol itself and derive a design
 for the QUIC library.
 
-To make matters even more intricate, comprehending existing open-source QUIC implementations becomes an additional hurdle due
-to the protocol's vast scope and the inherent time limitations of this theis. The \inlinecode{quinn} library alone has over
-32 thousand lines of rust code.
-
 Most of the major setbacks encountered during the implementation process stemmed from the Rustls library. Despite its full support for 
-TLS 1.3 and a specifically for QUIC designed API, a significant portion of its functionality are undocumented. This lack of documentation
+TLS 1.3 and an API specifically designed for QUIC, a significant portion of its functionality is undocumented. This lack of documentation
 extends over most of the API, in that the explanations of function parameters is often incomplete or missing and examples with
-broader contexts are missing in their entirety.
+broader contexts are missing entirely.
 For instance, when initializing the RustlsConnection, it was unclear that the third parameter (\inlinecode{params}) referred to
 RFC section 18. Similarly, when calling \inlinecode{read\_hs()}, which takes a reference to data, it wasn't clear where the
 pointer should start - at the beginning of the CRYPTO frame or the TLS message within it. Further testing revealed that
@@ -51,43 +105,33 @@ This involved directly setting the field within a specific struct of the RustlsC
 \section{Future Improvements}
 
 While the current QUIC library provides a solid foundation, it lacks several key features that need to be implemented first, in
-order to facilitate QUIC connections. The initial library was designed with the whole protocol in mind and should be
-easily expandable without requiring a major restructuring effort. That being said, there are still a number of areas within the
-existing codebase that could benefit from optimization and improvement, even if the pure QUIC implementation is feature complete.
+order to facilitate complete QUIC connections as per specification. The library is designed with the whole protocol in mind and
+should be easily expandable without requiring a major restructuring effort. That being said, there are still a number of areas
+within the existing codebase that could benefit from optimization and improvement, even if the pure QUIC implementation is
+feature complete at some point in the future.
 
 \subsection{Asychronous Design}
 
-The current design of the QUIC library operates within a single thread. However, network programming inherently benefits from a
-concurrent approach. Rust offers two primary models for achieving concurrency: OS threads and asynchronous programming with a runtime.
+The current design of the QUIC library operates within a single thread. However, a production grade implementation requires
+concurrency. Rust offers two primary models for achieving concurrency: OS threads and asynchronous runtime programming.
 
 Asynchronous programming excels in scenarios dominated by I/O bound tasks, which is precisely the case for network applications
 like servers and databases. It significantly reduces CPU and memory overhead compared to traditional thread-based approaches.
-An async runtime manages a limited pool of expensive OS threads efficiently. These threads handle a much larger
+An async runtime manages a limited pool of expensive OS threads more efficiently. These threads are optimised to handle a much larger
 number of lightweight tasks, enabling significantly more concurrent operations compared to using raw OS threads directly.
 
 Unfortunately, transitioning the current library to a concurrent model would necessitate a major rework, particularly for the
 \inlinecode{Connection} and \inlinecode{Endpoint} components. Facilitating concurrent reading and writing of serveral resources 
-would require significant changes. For instance, the connection database design might need to be guarded by a mutex (a synchronization
-primitive) or even removed entirely in favor of a different approach (see Sec. \ref{connection_db_rework}). Additionally, the
-\inlinecode{recv()} function for example would need to return a \inlinecode{Future} object, requiring the use of await
-statements to retrieve data in an asynchronous environment.
+would require significant changes. For instance, the connection "database" design might need to be guarded by a mutex or even
+removed entirely in favor of a different approach (see Sec. \ref{connection_db_rework}).
+Additionally, the \inlinecode{recv()} function for example would need to return a \inlinecode{Future} object, requiring
+the use of await statements to retrieve data in an asynchronous environment, along with multiple other functions.
 
 The transition to an asychronous design would have major performance benefits but would require a major effort as Rusts asynchronous
-features are widely known to be very difficult to work with and are still maturing\footnote{\url{https://bitbashing.io/async-rust.html}}.
+features are widely known to require signifiant effort to work with and are still
+maturing\footnote{\url{https://bitbashing.io/async-rust.html}}.
 
 \subsection{Connection Database Rework in Endpoint} \label{connection_db_rework}
-
-% - current design keeps all the connections in a vector inside the endpoint and uses their indices as handles in a hashmap where the
-% current connection id is the key
-% - requires lookup for every received packet and every event 
-% - possible performance bottleneck if server scales to hundreds of connections with a concurrent programming model
-% - a solution would be to give the user the resposibility over hte individual connections
-% - Connection and Enpoint structs would be wrapped in structs which expose the direct api of both objects
-% - a wrapper for the endpoint could be a Server which has an asynchronous method accept() which yields a Future containing
-% the Connection wrapper directly
-% - Connection wrapper object could expose functions like accept_bi_stream() which again returns the stream object directly
-% - this way the user has the advantage of a very intuitive API design and the library has the advantage of not having to
-% manage these objects
 
 The current design of the library keeps all connections within a vector inside the Endpoint struct. To manage these connections,
 a hashmap is used in which the current connection ID acts as the key and the corresponding index (\inlinecode{Handle}) in the

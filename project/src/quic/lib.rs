@@ -1,20 +1,20 @@
-mod frame;
+mod packet;
 mod quic_error;
 mod stream;
 mod token;
 mod transport_parameters;
-mod packet;
 
 // use frame::{
 //     AckFrame, ConnectionCloseFrame, CryptoFrame, NewConnectionIdFrame, NewTokenFrame, StreamFrame, Frame
 // };
-use packet::{Header, AckFrame, ConnectionCloseFrame, CryptoFrame, NewConnectionIdFrame, NewTokenFrame, StreamFrame, Frame};
 use octets::OctetsMut;
+use packet::{
+    AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, Header, NewConnectionIdFrame,
+    NewTokenFrame, StreamFrame,
+};
 use rand::RngCore;
 use rustls::{
-    quic::{
-        Connection as RustlsConnection, KeyChange, Keys, PacketKeySet, Version,
-    },
+    quic::{Connection as RustlsConnection, KeyChange, Keys, PacketKeySet, Version},
     Side,
 };
 use std::{
@@ -96,7 +96,7 @@ impl Endpoint {
     // handles a single incoming UDP datagram
     pub fn recv(&mut self) -> Result<Event, quic_error::Error> {
         // TODO: handle coalescing inital, 0-rtt and handshake packets, max udp packet size is 65kb
-        let mut buffer = [0u8; 65536];
+        let mut buffer = [0u8; 65535];
 
         let (size, src_addr) = match self.socket.recv_from(&mut buffer) {
             Ok((size, src_addr)) => (size, src_addr),
@@ -119,9 +119,11 @@ impl Endpoint {
         };
 
         //match connection if one already exists
-        if let Some(h) =
-            self.get_connection_handle(&head.dcid, &src_addr, ((head.hf & packet::LS_TYPE_BIT) >> 7) != 0)
-        {
+        if let Some(h) = self.get_connection_handle(
+            &head.dcid,
+            &src_addr,
+            ((head.hf & packet::LS_TYPE_BIT) >> 7) != 0,
+        ) {
             //connection exists, pass packet to connection
             println!("Found existing connection for {}", &head.dcid);
             return match self
@@ -149,9 +151,10 @@ impl Endpoint {
 
         let (header_raw, mut payload_cipher) = octet_buffer.split_at(octet_buffer.off()).unwrap();
 
-        //cut off trailing 0s from buffer
+        //cut off trailing 0s from buffer, substract 1 extra beacuse packet num length of 1 is
+        //encoded as 0...
         let (mut payload_cipher, _) = payload_cipher
-            .split_at(head.packet_length - head.packet_num_length as usize)
+            .split_at(head.packet_length - head.packet_num_length as usize - 1)
             .unwrap();
 
         //payload cipher must be exact size without zeros from the buffer beeing to big!
@@ -301,9 +304,9 @@ impl Endpoint {
             }
         };
 
-        let mut buffer = [0u8; 65536];
+        let mut buffer = [0u8; 65535];
 
-        let packet_length = connection.fill_datagram(&mut buffer)?;
+        let packet_length = connection.fill_datagram(&mut buffer).unwrap();
 
         let size = match self
             .socket
@@ -634,10 +637,7 @@ impl Connection {
         let mut size: usize = 0;
 
         for space_id in 0..(self.current_space + 1) {
-            size += match self.build_packet_in_space(buffer, space_id) {
-                Ok(s) => s,
-                Err(error) => return Err(error),
-            };
+            size += self.build_packet_in_space(&mut buffer[size..], space_id)?;
         }
 
         Ok(size)
@@ -650,12 +650,11 @@ impl Connection {
     ) -> Result<usize, quic_error::Error> {
         println!("Building packet in space {:#x}", packet_number_space);
 
-        let pns = &mut self.packet_spaces[self.current_space];
-        let buf = octets::OctetsMut::with_slice(buffer);
+        let mut buf = octets::OctetsMut::with_slice(buffer);
 
+        //calculate packet number length
         let mut packet_num_length: u8 = 0;
-
-        match pns.next_pkt_num {
+        match self.packet_spaces[packet_number_space].next_pkt_num {
             0x00..=0xff => packet_num_length = 0,
             0x0100..=0xffff => packet_num_length = 1,
             0x010000..=0xffffff => packet_num_length = 2,
@@ -663,39 +662,95 @@ impl Connection {
             _ => unreachable!("packet number exceeds maximum encodable value"),
         }
 
-        //figure out proper way to get current cids
+        //TODO: figure out proper way to get current cids
         let dcid: &ConnectionId = &self.initial_remote_scid;
         let scid: &ConnectionId = &self.initial_local_scid;
 
-        //collect payload frames and count length
-        let mut packet_length: usize = 0;
-
-        //calculate padding
-        //let padding_count = 1200 - packet_length;
-
-        //add packet num length to packet length
-        packet_length += packet_num_length as usize;
-
-        //create header with length
-        //TODO maybe encode header first and update packet length at fixed offset later
-        //can be done via variable length integer with fixed max len but nontheless encoding small
-        //number
-        let header = Header::new_long_header(
+        //pre-encode header
+        match Header::new_long_header(
             0x00,
             packet_num_length,
             1,
-            pns.next_pkt_num,
+            self.packet_spaces[packet_number_space].next_pkt_num,
             dcid,
             scid,
             None,
-            packet_length,
-        );
+            1200, //use minimum packet length to pre-encode packet length
+        )?
+        .to_bytes(&mut buf)
+        {
+            Ok(()) => (),
+            Err(error) => {
+                return Err(quic_error::Error::header_encoding_error(format!(
+                    "buffer has unsufficient size to encode header: {}",
+                    error
+                )))
+            }
+        };
 
-        //encode header
+        let header_length = buf.off();
 
-        pns.next_pkt_num += 1;
+        //calculate packet number offset
+        let packet_length_offset = buf.off() - packet_num_length as usize - 2;
 
-        Ok(buf.off())
+        let max_packet_size: usize = 16383; //max size for packet length encoding with 2 bytes
+
+        //fill payload
+        let mut payload_length = self.populate_packet_payload(&mut buf, packet_number_space)?;
+
+        //calculate padding, buffer is zeroed out anyway, so just increasing the length is
+        //sufficient
+        if payload_length < 1200 {
+            payload_length = 1200;
+        }
+
+        if (payload_length + header_length) > (max_packet_size - packet_num_length as usize) {
+            return Err(quic_error::Error::packet_size_error(format!(
+                "max packet length exceeded with {}",
+                payload_length
+            )));
+        }
+
+        //reencode actual packet length
+        octets::OctetsMut::with_slice(
+            &mut buf.as_mut()[packet_length_offset..packet_length_offset + 2],
+        )
+        .put_varint_with_len(payload_length.try_into().unwrap(), 2)
+        .unwrap();
+
+        //update packet number space
+        self.packet_spaces[packet_number_space].next_pkt_num += 1;
+
+        //encrypt
+
+        //Ok(header_length + payload_length)
+        Ok(0)
+    }
+
+    fn populate_packet_payload(
+        &mut self,
+        buf: &mut octets::OctetsMut<'_>,
+        packet_number_space: usize,
+    ) -> Result<usize, quic_error::Error> {
+        let mut size = 0;
+
+        //CRYPTO
+        if let Some(crypto_buffer) = &self.packet_spaces[packet_number_space].outgoing_crypto_data {
+            if !crypto_buffer.is_empty() {
+                size += match CryptoFrame::new(0, crypto_buffer.to_vec()).to_bytes(buf) {
+                    Ok(s) => s,
+                    Err(_) => {
+                        return Err(quic_error::Error::packet_size_error(format!(
+                            "insufficient sized buffer for CRYPTO frame {}",
+                            crypto_buffer.len()
+                        )))
+                    }
+                };
+                println!("wrote crypto frame with size {:?}", crypto_buffer.len());
+            }
+        }
+
+        Ok(size)
     }
 }
 
