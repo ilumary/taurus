@@ -13,7 +13,8 @@ references outside of the scope of the data they are referring to. Keeping refer
 difficult due to Rusts lifetime annotations. While all these measures have resulted in not a single segmentation fault being
 thrown for the whole development phase, it gravely impacted the library design. One of those being that the \inlinecode{recv()}
 and \inlinecode{accept()} functions from the \inlinecode{Connection} object always return into the endpoint to minimise the
-amount of reference having to be kept. 
+amount of reference having to be kept. Additionally, Rusts effort to improve the readability of compiler error messages
+greatly accelerated debugging.
 
 While one might think that the limitations of Rust may limit performance, the
 \inlinecode{quiche}\footnote{\url{https://github.com/cloudflare/quiche}} implementation by cloudflare, also developed in Rust,

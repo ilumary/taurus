@@ -567,8 +567,8 @@ and (3) is generated using the hmac reset key and the previsouly generated initi
 \end{codeblock}
 
 With the transport configuration parameters being set, the tls session of type \\ 
-\inlinecode{RustlsConnection::Server} can be initialized. In order to so it needs an \inlinecode{Arc} \todo{introduce Arc} to the server config,
-the QUIC version being used and the encoded transport parameters.
+\inlinecode{RustlsConnection::Server} can be initialized. In order to so it needs an \inlinecode{Arc} (a thread-safe reference-counting pointer)
+to the server config, the QUIC version being used and the encoded transport parameters.
 
 \begin{codeblock}{lib.rs}{Rust}
     \begin{rustcode}
@@ -633,7 +633,6 @@ then loops over the buffer with each iteration extracting a single frame until a
             0x00 => continue, //PADDING
             0x02 | 0x03 => {
                 let _ack = AckFrame::from_bytes(&frame_code, payload);
-                //todo handle ack
             } //ACK
             0x05 => {
                 let _stream_id = payload.get_varint().unwrap();

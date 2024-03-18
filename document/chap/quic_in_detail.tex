@@ -527,8 +527,6 @@ to \inlinecode{min\_rtt}, and the lower value is retained.
 The Smoothed RTT (\inlinecode{smoothed\_rtt}) represents an exponentially weighted moving average of RTT samples, providing a more stable
 estimate than individual samples. The RTT Variation \inlinecode{rttvar} reflects the degree of fluctuation in observed RTT samples.
 
-\todo{provide mathematical examples}
-
 While calculating the rtt times, a sample may be adjusted based on acknowledgement delays reported by the peer. Furthermore, during the
 handshake, QUIC might ignore peer-reported delays or limit them to a maximum value to avoid
 biasing the RTT estimate. Lastly, QUIC may account for local processing delays (e.g., decryption) when calculating RTT samples.
