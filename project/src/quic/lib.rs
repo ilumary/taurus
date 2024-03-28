@@ -4,9 +4,6 @@ mod stream;
 mod token;
 mod transport_parameters;
 
-// use frame::{
-//     AckFrame, ConnectionCloseFrame, CryptoFrame, NewConnectionIdFrame, NewTokenFrame, StreamFrame, Frame
-// };
 use octets::OctetsMut;
 use packet::{
     AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, Header, NewConnectionIdFrame,
@@ -324,10 +321,6 @@ impl Endpoint {
     }
 }
 
-//struct Connection {
-
-//}
-
 struct Connection {
     //side
     side: Side,
@@ -435,10 +428,7 @@ impl Connection {
         self.process_payload(header, payload);
 
         println!(
-            "wr {:?} ww {:?} ih {:?} tpp: {:?}",
-            self.tls_session.wants_read(),
-            self.tls_session.wants_write(),
-            self.tls_session.is_handshaking(),
+            "transport parameters from peer: {:x?}",
             self.tls_session.quic_transport_parameters().unwrap(),
         );
 
@@ -556,7 +546,7 @@ impl Connection {
         }
 
         if ack_eliciting {
-            self.packet_spaces[self.current_space as usize]
+            self.packet_spaces[self.current_space]
                 .outgoing_acks
                 .push(header.packet_num.into());
         }
@@ -589,7 +579,7 @@ impl Connection {
 
     fn generate_crypto_data(&mut self) {
         //get mutable reference to crypto buffer
-        let buf: &mut Vec<u8> = self.packet_spaces[self.current_space as usize]
+        let buf: &mut Vec<u8> = self.packet_spaces[self.current_space]
             .outgoing_crypto_data
             .as_mut()
             .unwrap();
@@ -620,10 +610,10 @@ impl Connection {
         }
 
         //"upgrade" to next packet number space with new keying material
-        self.packet_spaces[(self.current_space + 1) as usize].keys = Some(keys);
+        self.packet_spaces[self.current_space + 1].keys = Some(keys);
 
         println!(
-            "Is this the Server Hello with len {:x?}: {:x?}",
+            "generated server hello (len {:x?}): {:x?}",
             buf.len(),
             buf.to_vec()
         );
@@ -737,18 +727,54 @@ impl Connection {
         //CRYPTO
         if let Some(crypto_buffer) = &self.packet_spaces[packet_number_space].outgoing_crypto_data {
             if !crypto_buffer.is_empty() {
-                size += match CryptoFrame::new(0, crypto_buffer.to_vec()).to_bytes(buf) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        return Err(quic_error::Error::packet_size_error(format!(
-                            "insufficient sized buffer for CRYPTO frame {}",
-                            crypto_buffer.len()
-                        )))
-                    }
-                };
-                println!("wrote crypto frame with size {:?}", crypto_buffer.len());
+                let s =
+                    match packet::encode_frame(&CryptoFrame::new(0, crypto_buffer.to_vec()), buf) {
+                        Ok(s) => s,
+                        Err(error) => {
+                            return Err(quic_error::Error::packet_size_error(format!(
+                                "insufficient sized buffer for CRYPTO frame ({})",
+                                error
+                            )))
+                        }
+                    };
+                println!("wrote crypto frame with size {:?}", s);
+                size += s;
             }
         }
+
+        //ACK
+        if !self.packet_spaces[packet_number_space]
+            .outgoing_acks
+            .is_empty()
+        {
+            //sort outgoing acks in reverse to ease range building
+            self.packet_spaces[packet_number_space]
+                .outgoing_acks
+                .sort_by(|a, b| b.cmp(a));
+
+            //directly generate ack frame from packet number vector
+            let ack_frame = AckFrame::from_packet_number_vec(
+                &self.packet_spaces[packet_number_space].outgoing_acks,
+            );
+
+            //clear vector as packet numbers are now ack'ed
+            self.packet_spaces[packet_number_space]
+                .outgoing_acks
+                .clear();
+
+            let s = match packet::encode_frame(&ack_frame, buf) {
+                Ok(s) => s,
+                Err(error) => {
+                    return Err(quic_error::Error::packet_size_error(format!(
+                        "insufficient sized buffer for ack frame ({})",
+                        error
+                    )))
+                }
+            };
+
+            println!("wrote ack frame with size {:?}", s);
+            size += s;
+        };
 
         Ok(size)
     }
@@ -771,8 +797,6 @@ pub struct PacketNumberSpace {
     //TODO make arc around vec to avoid copying
     outgoing_crypto_data: Option<Vec<u8>>,
 
-    max_acked_pkt: Option<u64>,
-
     next_pkt_num: u32,
 }
 
@@ -785,7 +809,6 @@ impl PacketNumberSpace {
                 true => Some(Vec::new()),
                 false => None,
             },
-            max_acked_pkt: None,
             next_pkt_num: 0,
         }
     }

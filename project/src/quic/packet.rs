@@ -38,6 +38,73 @@ pub struct AckFrame {
     ecn_counts: Option<(u64, u64, u64)>,
 }
 
+impl AckFrame {
+    //generates an ack frame from a vector of packet numbers. The vector has to be sorted in
+    //descending order, i.e. the highest packet number has to be at index 0.
+    pub fn from_packet_number_vec(packet_numbers: &[u64]) -> Self {
+        let mut ack = Self::empty(100);
+        let mut last_pn: u64 = 0;
+
+        for (i, range) in Self::range_iterator_descending(packet_numbers).enumerate() {
+            if i == 0 {
+                //first range contains highest ack
+                ack.add_highest_range(range[0], (range.len() - 1) as u64);
+                println!("first ack range: ha {:?} r {:?}", range[0], range.len() - 1);
+                last_pn = range[range.len() - 1];
+            } else {
+                //append to ranges
+                let gap: u64 = last_pn - range[0] - 1;
+                println!("gap {:?} = lpn {:?} - r0 {:?}", gap, last_pn, range[0]);
+                last_pn = range[range.len() - 1];
+                ack.add_range(gap, (range.len() - 1) as u64);
+            }
+        }
+
+        ack
+    }
+
+    //creates an iterator over a descending ordered vector which isolates slices, i.e. a sequence
+    //of numbers where numbers decrease by exactly one
+    fn range_iterator_descending(data: &[u64]) -> impl Iterator<Item = &[u64]> {
+        let mut slice_start = 0;
+        (0..data.len()).flat_map(move |i| {
+            if i == data.len() - 1 || data[i] != data[i + 1] + 1 {
+                let start = slice_start;
+                slice_start = i + 1;
+                Some(&data[start..=i])
+            } else {
+                None
+            }
+        })
+    }
+
+    //creates an empty ack frame with just the ack_delay
+    fn empty(ack_delay: u64) -> Self {
+        Self {
+            largest_acknowledged: 0,
+            ack_delay,
+            ack_range_count: 0,
+            first_ack_range: 0,
+            ack_ranges: Vec::new(),
+            ecn_counts: None,
+        }
+    }
+
+    fn add_highest_range(&mut self, largest_acknowledged: u64, first_ack_range: u64) {
+        self.largest_acknowledged = largest_acknowledged;
+        self.first_ack_range = first_ack_range;
+    }
+
+    fn add_range(&mut self, gap: u64, range: u64) {
+        self.ack_ranges.push((gap, range));
+        self.ack_range_count += 1;
+    }
+
+    fn add_ecn_counts(&mut self, ecn_counts: (u64, u64, u64)) {
+        self.ecn_counts = Some(ecn_counts);
+    }
+}
+
 impl Frame for AckFrame {
     fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self {
         let largest_acknowledged = bytes.get_varint().unwrap();
@@ -73,7 +140,31 @@ impl Frame for AckFrame {
         &self,
         bytes: &mut octets::OctetsMut<'_>,
     ) -> Result<usize, octets::BufferTooShortError> {
-        Ok(0)
+        let start = bytes.off();
+
+        if self.ecn_counts.is_some() {
+            bytes.put_u8(0x03)?;
+        } else {
+            bytes.put_u8(0x02)?;
+        }
+
+        bytes.put_varint(self.largest_acknowledged)?;
+        bytes.put_varint(self.ack_delay)?;
+        bytes.put_varint(self.ack_range_count)?;
+        bytes.put_varint(self.first_ack_range)?;
+
+        for (gap, range_length) in &self.ack_ranges {
+            bytes.put_varint(*gap)?;
+            bytes.put_varint(*range_length)?;
+        }
+
+        if let Some(ecn) = self.ecn_counts {
+            bytes.put_varint(ecn.0)?;
+            bytes.put_varint(ecn.1)?;
+            bytes.put_varint(ecn.2)?;
+        }
+
+        Ok(bytes.off() - start)
     }
 }
 
@@ -271,7 +362,6 @@ impl Frame for ConnectionCloseFrame {
     }
 }
 
-//TODO let Header get trait with from_bytes and to_bytes and len()
 pub struct Header {
     pub hf: u8, //header form and version specific bits
     pub version: u32,
@@ -564,5 +654,35 @@ impl Header {
             self.token.as_ref().unwrap(),
             self.packet_length,
         );
+    }
+}
+
+// Tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ack_frame_creation_1() {
+        let pns: Vec<u64> = vec![10, 9, 8, 6, 5, 4, 2, 1, 0];
+        let ack = AckFrame::from_packet_number_vec(&pns);
+
+        assert_eq!(ack.largest_acknowledged, 10);
+        assert_eq!(ack.first_ack_range, 2);
+        assert_eq!(ack.ack_range_count, 2);
+        assert_eq!(ack.ack_ranges[0], (1, 2));
+        assert_eq!(ack.ack_ranges[0], (1, 2));
+    }
+
+    #[test]
+    fn test_ack_frame_creation_2() {
+        let pns: Vec<u64> = vec![10, 9, 3, 2, 1, 0];
+        let ack = AckFrame::from_packet_number_vec(&pns);
+
+        assert_eq!(ack.largest_acknowledged, 10);
+        assert_eq!(ack.first_ack_range, 1);
+        assert_eq!(ack.ack_range_count, 1);
+        assert_eq!(ack.ack_ranges[0], (5, 3));
     }
 }
