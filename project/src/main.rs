@@ -1,20 +1,14 @@
-use quic::{Endpoint, Event};
+use quic::{quic_error, ServerConfig};
 
-fn main() -> std::io::Result<()> {
-    let mut server = Endpoint::local_server("127.0.0.1:34254");
-    let event = server.recv();
-    match event {
-        Ok(event) => match event {
-            Event::NewConnection(ch) => {
-                //maybe check if server can handle more connections
-                let _ = server.handle_connection(ch);
-            }
-            Event::Handshaking(ch) => {
-                let _ = server.handle_connection(ch);
-            }
-            _ => (),
-        },
-        Err(error) => eprint!("{}", error),
+#[tokio::main]
+async fn main() -> Result<(), quic_error::Error> {
+    let mut server = ServerConfig::local_server("127.0.0.1:34254")
+        .build()
+        .await?;
+
+    while let Some(_connection) = server.accept().await {
+        println!("new connection!");
     }
+
     Ok(())
 }

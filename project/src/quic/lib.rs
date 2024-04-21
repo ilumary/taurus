@@ -1,5 +1,5 @@
 mod packet;
-mod quic_error;
+pub mod quic_error;
 mod stream;
 mod token;
 mod transport_parameters;
@@ -18,7 +18,9 @@ use std::{
     collections::HashMap,
     fmt,
     net::{SocketAddr, UdpSocket},
+    sync::Arc,
 };
+use tokio::{net::UdpSocket as TokioUdpSocket, sync::mpsc, task::JoinHandle};
 
 const MAX_CID_SIZE: usize = 20;
 
@@ -36,33 +38,47 @@ pub enum Event {
     ConnectionClosed(Handle),
 }
 
-/*
- * Primary object in library. Can act as client or server. Can accept incoming
- * connections or connect to a server.
- */
-pub struct Endpoint {
-    socket: UdpSocket,
-
-    //server config for rustls. Will have to be updated to allow client side endpoint
-    server_config: Option<rustls::ServerConfig>,
-    //RFC 2104, used to generate reset tokens from connection ids
-    hmac_reset_key: ring::hmac::Key,
-
-    //stores connection handles
-    conn_db: HashMap<ConnectionId, Handle>,
-    connections: Vec<Connection>,
+pub struct Acceptor {
+    //queue for initial packets
+    rx: mpsc::Receiver<(Vec<u8>, String, Header)>,
 }
 
-impl Endpoint {
+impl Acceptor {
+    pub async fn accept(&mut self) -> Option<Connection> {
+        let (packet, remote, header) = self.rx.recv().await.unwrap();
+        println!("accepting connection from {:?}", &remote);
+        header.debug_print();
+
+        None
+    }
+}
+
+pub struct Server {
+    endpoint: Endpoint,
+    acceptor: Acceptor,
+}
+
+impl Server {
+    pub async fn accept(&mut self) -> Option<Connection> {
+        self.acceptor.accept().await
+    }
+}
+
+pub struct ServerConfig {
+    server_config: Option<rustls::ServerConfig>,
+    address: String,
+}
+
+impl ServerConfig {
     pub fn local_server(addr: &str) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = rustls::PrivateKey(cert.serialize_private_key_der());
         let cert = rustls::Certificate(cert.serialize_der().unwrap());
 
-        Self::server(addr, cert, key)
+        Self::new(addr, cert, key)
     }
 
-    pub fn server(addr: &str, certificate: rustls::Certificate, pkey: rustls::PrivateKey) -> Self {
+    pub fn new(addr: &str, certificate: rustls::Certificate, pkey: rustls::PrivateKey) -> Self {
         let mut server_cfg = rustls::ServerConfig::builder()
             .with_safe_default_cipher_suites()
             .with_safe_default_kx_groups()
@@ -74,20 +90,121 @@ impl Endpoint {
         server_cfg.max_early_data_size = u32::MAX;
         server_cfg.alpn_protocols = vec!["hq-29".into()];
 
+        ServerConfig {
+            server_config: Some(server_cfg),
+            address: addr.to_string(),
+        }
+    }
+
+    pub async fn build(self) -> Result<Server, quic_error::Error> {
+        let mut endpoint = Endpoint::new(
+            self.address.as_ref(),
+            Some(Arc::new(
+                self.server_config
+                    .expect("server config should contain valid config"),
+            )),
+        )
+        .await;
+
+        let acceptor = endpoint.start_acceptor().await;
+
+        Ok(Server { endpoint, acceptor })
+    }
+}
+
+pub struct Endpoint {
+    socket: Arc<TokioUdpSocket>,
+
+    //task handles for recv and send loops
+    recv_loop_handle: Option<JoinHandle<Result<u64, quic_error::Error>>>,
+    send_loop_handle: Option<JoinHandle<Result<u64, quic_error::Error>>>,
+
+    //channel handle for sending packages, tuple of buffer and address
+    tx: Option<mpsc::Sender<(Vec<u8>, String)>>,
+
+    //server config for rustls. Will have to be updated to allow client side endpoint
+    server_config: Option<Arc<rustls::ServerConfig>>,
+    //RFC 2104, used to generate reset tokens from connection ids
+    hmac_reset_key: ring::hmac::Key,
+
+    //stores connection handles
+    conn_db: HashMap<ConnectionId, Handle>,
+    connections: Vec<Connection>,
+}
+
+impl Endpoint {
+    pub async fn new(addr: &str, server_config: Option<Arc<rustls::ServerConfig>>) -> Self {
         let mut hmac_reset_key = [0u8; 64];
         rand::thread_rng().fill_bytes(&mut hmac_reset_key);
 
         Endpoint {
-            socket: UdpSocket::bind(addr).expect("Error: couldn't bind UDP socket to address"),
-            server_config: Some(server_cfg),
+            socket: Arc::new(
+                TokioUdpSocket::bind(addr)
+                    .await
+                    .expect("fatal error: socket bind failed"),
+            ),
+            recv_loop_handle: None,
+            send_loop_handle: None,
+            tx: None,
+            server_config,
             hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
             conn_db: HashMap::new(),
             connections: Vec::new(),
         }
     }
 
-    pub fn client() -> Self {
-        panic!("Client endpoint not yet implemented!")
+    pub async fn start_acceptor(&mut self) -> Acceptor {
+        //TODO add to configuration of (server) endpoint maximum number of buffered inital packets
+        let (tx_initial, mut rx_initial) = mpsc::channel::<(Vec<u8>, String, Header)>(64);
+        let recv_socket = self.socket.clone();
+
+        self.recv_loop_handle = Some(tokio::spawn(async move {
+            loop {
+                let mut buffer = std::iter::repeat(0)
+                    .take(u16::MAX as usize)
+                    .collect::<Vec<_>>();
+
+                let (size, src_addr) = match recv_socket.recv_from(&mut buffer).await {
+                    Ok((size, src_addr)) => (size, src_addr),
+                    Err(error) => {
+                        println!("Error while receiving datagram: {:?}", error);
+                        continue;
+                    }
+                };
+                println!("Received {:?} bytes from {:?}", size, src_addr);
+                let mut octets = OctetsMut::with_slice(&mut buffer[..size]);
+                let partial_decode = Header::from_bytes(&mut octets, 8).unwrap();
+
+                //TODO expand to non initial packets
+                tx_initial
+                    .send((buffer, src_addr.to_string(), partial_decode))
+                    .await
+                    .unwrap();
+
+                //maybe implement sorting where only initial packets are presorted and all others
+                //are forwarded to another task which only sorts them to their respective
+                //connections
+            }
+        }));
+
+        let send_socket = self.socket.clone();
+        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, String)>(64);
+        self.tx = Some(tx);
+
+        self.send_loop_handle = Some(tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let size = match send_socket.send_to(&msg.0, &msg.1).await {
+                    Ok(size) => size,
+                    Err(error) => {
+                        return Err(quic_error::Error::socket_error(format!("{}", error)));
+                    }
+                };
+                println!("sent {} bytes to {}", size, &msg.1);
+            }
+            Ok(0)
+        }));
+
+        Acceptor { rx: rx_initial }
     }
 
     // handles a single incoming UDP datagram
@@ -95,13 +212,14 @@ impl Endpoint {
         // TODO: handle coalescing inital, 0-rtt and handshake packets, max udp packet size is 65kb
         let mut buffer = [0u8; 65535];
 
-        let (size, src_addr) = match self.socket.recv_from(&mut buffer) {
+        let (size, src_addr) = (0, "0.0.0.0:8080".parse::<SocketAddr>().unwrap());
+        /*match self.socket.recv_from(&mut buffer) {
             Ok((size, src_addr)) => (size, src_addr),
             Err(error) => {
                 println!("Error while receiving datagram: {:?}", error);
                 return Err(quic_error::Error::socket_error("receiving packet"));
             }
-        };
+        };*/
         println!("Received {:?} bytes from {:?}", size, src_addr);
 
         let mut octet_buffer = OctetsMut::with_slice(&mut buffer);
@@ -191,7 +309,7 @@ impl Endpoint {
 
         let conn = RustlsConnection::Server(
             rustls::quic::ServerConnection::new(
-                std::sync::Arc::new(self.server_config.as_ref().unwrap().clone()),
+                self.server_config.as_ref().unwrap().clone(),
                 rustls::quic::Version::V1,
                 data.to_vec(),
             )
@@ -203,19 +321,19 @@ impl Endpoint {
             ..PacketNumberSpace::new(true)
         };
 
-        let new_ch = self
-            .create_connection(
-                Side::Server,
-                head.version,
-                orig_dcid,
-                head.scid.clone().unwrap(),
-                initial_local_scid,
-                conn,
-                ikp,
-                initial_space,
-                src_addr,
-            )
-            .unwrap();
+        let new_ch = 1; /*self
+                        .create_connection(
+                            Side::Server,
+                            head.version,
+                            orig_dcid,
+                            head.scid.clone().unwrap(),
+                            initial_local_scid,
+                            conn,
+                            ikp,
+                            initial_space,
+                            src_addr,
+                        )
+                        .unwrap();*/
 
         //accept new connection
         match self
@@ -305,7 +423,7 @@ impl Endpoint {
 
         let packet_length = connection.fill_datagram(&mut buffer).unwrap();
 
-        let size = match self
+        /*let size = match self
             .socket
             .send_to(&buffer[..packet_length], connection.remote)
         {
@@ -316,12 +434,13 @@ impl Endpoint {
         };
 
         println!("sent {} bytes to {:?}", size, connection.remote);
+        */
 
         Ok(())
     }
 }
 
-struct Connection {
+pub struct Connection {
     //side
     side: Side,
 

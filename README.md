@@ -11,6 +11,7 @@
 <h4>A self made implementation of <a href="https://datatracker.ietf.org/doc/html/rfc9000">QUIC</a> in Rust following RFC 9000 and 9001, accompanied by my bachelors thesis.</h4>
 
 <p>
+  <a href="#bachelor-thesis">Bachelor Thesis</a> |
   <a href="#key-features">Key Features</a> |
   <a href="#how-to-use">Build</a> |
   <a href="#credits">Credits</a> |
