@@ -14,12 +14,7 @@ use rustls::{
     quic::{Connection as RustlsConnection, KeyChange, Keys, PacketKeySet, Version},
     Side,
 };
-use std::{
-    collections::HashMap,
-    fmt,
-    net::{SocketAddr, UdpSocket},
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc};
 use tokio::{net::UdpSocket as TokioUdpSocket, sync::mpsc, task::JoinHandle};
 
 const MAX_CID_SIZE: usize = 20;
@@ -30,21 +25,13 @@ const SPACE_ID_DATA: usize = 0x02;
 
 type Handle = usize;
 
-pub enum Event {
-    NewConnection(Handle),
-    Handshaking(Handle),
-    ConnectionEstablished(Handle),
-    DataExchange(Handle),
-    ConnectionClosed(Handle),
-}
-
 pub struct Acceptor {
     //queue for initial packets
     rx: mpsc::Receiver<(Vec<u8>, String, Header)>,
 }
 
 impl Acceptor {
-    pub async fn accept(&mut self) -> Option<Connection> {
+    async fn accept(&mut self) -> Option<Connection> {
         let (packet, remote, header) = self.rx.recv().await.unwrap();
         println!("accepting connection from {:?}", &remote);
         header.debug_print();
@@ -88,12 +75,18 @@ impl ServerConfig {
             .with_single_cert(vec![certificate.clone()], pkey)
             .unwrap();
         server_cfg.max_early_data_size = u32::MAX;
-        server_cfg.alpn_protocols = vec!["hq-29".into()];
 
         ServerConfig {
             server_config: Some(server_cfg),
             address: addr.to_string(),
         }
+    }
+
+    pub fn with_supported_protocols(mut self, protocols: Vec<String>) -> Self {
+        if let Some(ref mut sc) = &mut self.server_config {
+            sc.alpn_protocols = protocols.into_iter().map(|p| p.into_bytes()).collect();
+        }
+        self
     }
 
     pub async fn build(self) -> Result<Server, quic_error::Error> {
@@ -130,6 +123,8 @@ pub struct Endpoint {
     //stores connection handles
     conn_db: HashMap<ConnectionId, Handle>,
     connections: Vec<Connection>,
+
+    handles: HashMap<ConnectionId, mpsc::Sender<(Vec<u8>, String, Header)>>,
 }
 
 impl Endpoint {
@@ -150,6 +145,7 @@ impl Endpoint {
             hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
             conn_db: HashMap::new(),
             connections: Vec::new(),
+            handles: HashMap::new(),
         }
     }
 
@@ -208,7 +204,7 @@ impl Endpoint {
     }
 
     // handles a single incoming UDP datagram
-    pub fn recv(&mut self) -> Result<Event, quic_error::Error> {
+    pub fn recv(&mut self) -> Result<(), quic_error::Error> {
         // TODO: handle coalescing inital, 0-rtt and handshake packets, max udp packet size is 65kb
         let mut buffer = [0u8; 65535];
 
@@ -247,7 +243,7 @@ impl Endpoint {
                 .unwrap()
                 .recv(&mut head, &mut octet_buffer)
             {
-                Ok(()) => Ok(Event::DataExchange(h)),
+                Ok(()) => Ok(()),
                 Err(error) => Err(error),
             };
         }
@@ -342,7 +338,7 @@ impl Endpoint {
             .unwrap()
             .accept(&head, &mut payload)
         {
-            Ok(()) => Ok(Event::NewConnection(new_ch)), //return new connection event
+            Ok(()) => Ok(()), //return new connection event
             Err(error) => panic!("Error processing packet: {}", error),
         }
     }
