@@ -15,7 +15,11 @@ use rustls::{
     Side,
 };
 use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc};
-use tokio::{net::UdpSocket as TokioUdpSocket, sync::mpsc, task::JoinHandle};
+use tokio::{
+    net::UdpSocket as TokioUdpSocket,
+    sync::{mpsc, RwLock},
+    task::JoinHandle,
+};
 
 const MAX_CID_SIZE: usize = 20;
 
@@ -23,18 +27,46 @@ const SPACE_ID_INITIAL: usize = 0x00;
 const SPACE_ID_HANDSHAKE: usize = 0x01;
 const SPACE_ID_DATA: usize = 0x02;
 
-type Handle = usize;
+//Thread Safe Distributor
+type TSDistributor = Arc<RwLock<Distributor>>;
+
+pub struct Distributor {
+    sending_handle: mpsc::Sender<packet::Datagram>,
+    connection_send_handles: HashMap<ConnectionId, mpsc::Sender<packet::EarlyDatagram>>,
+}
+
+impl Default for Distributor {
+    fn default() -> Self {
+        //placeholder for default initialization with 0 capacity
+        let (tx, _) = mpsc::channel::<packet::Datagram>(0);
+        Self {
+            sending_handle: tx,
+            connection_send_handles: HashMap::new(),
+        }
+    }
+}
 
 pub struct Acceptor {
     //queue for initial packets
-    rx: mpsc::Receiver<(Vec<u8>, String, Header)>,
+    rx: mpsc::Receiver<(Vec<u8>, String, Header, TSDistributor)>,
 }
 
 impl Acceptor {
     async fn accept(&mut self) -> Option<Connection> {
-        let (packet, remote, header) = self.rx.recv().await.unwrap();
-        println!("accepting connection from {:?}", &remote);
+        let (packet, remote, header, tsd) = self.rx.recv().await.unwrap();
+
+        //move into static connection function
+        println!("accepting connection from {}", &remote);
         header.debug_print();
+
+        let (tx, rx) = mpsc::channel::<packet::EarlyDatagram>(8);
+
+        {
+            tsd.write()
+                .await
+                .connection_send_handles
+                .insert(header.dcid, tx);
+        }
 
         None
     }
@@ -112,19 +144,13 @@ pub struct Endpoint {
     recv_loop_handle: Option<JoinHandle<Result<u64, quic_error::Error>>>,
     send_loop_handle: Option<JoinHandle<Result<u64, quic_error::Error>>>,
 
-    //channel handle for sending packages, tuple of buffer and address
-    tx: Option<mpsc::Sender<(Vec<u8>, String)>>,
-
     //server config for rustls. Will have to be updated to allow client side endpoint
     server_config: Option<Arc<rustls::ServerConfig>>,
     //RFC 2104, used to generate reset tokens from connection ids
     hmac_reset_key: ring::hmac::Key,
 
-    //stores connection handles
-    conn_db: HashMap<ConnectionId, Handle>,
-    connections: Vec<Connection>,
-
-    handles: HashMap<ConnectionId, mpsc::Sender<(Vec<u8>, String, Header)>>,
+    //stores connection channel sender handles
+    distributor: TSDistributor,
 }
 
 impl Endpoint {
@@ -140,19 +166,17 @@ impl Endpoint {
             ),
             recv_loop_handle: None,
             send_loop_handle: None,
-            tx: None,
             server_config,
             hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
-            conn_db: HashMap::new(),
-            connections: Vec::new(),
-            handles: HashMap::new(),
+            distributor: Arc::new(RwLock::new(Distributor::default())),
         }
     }
 
     pub async fn start_acceptor(&mut self) -> Acceptor {
         //TODO add to configuration of (server) endpoint maximum number of buffered inital packets
-        let (tx_initial, mut rx_initial) = mpsc::channel::<(Vec<u8>, String, Header)>(64);
+        let (tx_initial, rx_initial) = mpsc::channel::<packet::InitialDatagram>(64);
         let recv_socket = self.socket.clone();
+        let dist = self.distributor.clone();
 
         self.recv_loop_handle = Some(tokio::spawn(async move {
             loop {
@@ -171,21 +195,35 @@ impl Endpoint {
                 let mut octets = OctetsMut::with_slice(&mut buffer[..size]);
                 let partial_decode = Header::from_bytes(&mut octets, 8).unwrap();
 
-                //TODO expand to non initial packets
-                tx_initial
-                    .send((buffer, src_addr.to_string(), partial_decode))
-                    .await
-                    .unwrap();
-
-                //maybe implement sorting where only initial packets are presorted and all others
-                //are forwarded to another task which only sorts them to their respective
-                //connections
+                if partial_decode.is_inital() {
+                    tx_initial
+                        .send((buffer, src_addr.to_string(), partial_decode, dist.clone()))
+                        .await
+                        .unwrap();
+                } else {
+                    //TODO make search with source address and retry cid ...
+                    if let Some(handle) = dist
+                        .read()
+                        .await
+                        .connection_send_handles
+                        .get(&partial_decode.dcid)
+                    {
+                        handle
+                            .send((buffer, src_addr.to_string(), partial_decode))
+                            .await
+                            .unwrap();
+                    }
+                }
             }
         }));
 
         let send_socket = self.socket.clone();
-        let (tx, mut rx) = mpsc::channel::<(Vec<u8>, String)>(64);
-        self.tx = Some(tx);
+        let (tx, mut rx) = mpsc::channel::<packet::Datagram>(64);
+
+        {
+            //set sending handle
+            self.distributor.write().await.sending_handle = tx;
+        }
 
         self.send_loop_handle = Some(tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
@@ -230,23 +268,6 @@ impl Endpoint {
         };
 
         //match connection if one already exists
-        if let Some(h) = self.get_connection_handle(
-            &head.dcid,
-            &src_addr,
-            ((head.hf & packet::LS_TYPE_BIT) >> 7) != 0,
-        ) {
-            //connection exists, pass packet to connection
-            println!("Found existing connection for {}", &head.dcid);
-            return match self
-                .connections
-                .get_mut(h)
-                .unwrap()
-                .recv(&mut head, &mut octet_buffer)
-            {
-                Ok(()) => Ok(()),
-                Err(error) => Err(error),
-            };
-        }
 
         //handle new connection
 
@@ -332,106 +353,6 @@ impl Endpoint {
                         .unwrap();*/
 
         //accept new connection
-        match self
-            .connections
-            .get_mut(new_ch)
-            .unwrap()
-            .accept(&head, &mut payload)
-        {
-            Ok(()) => Ok(()), //return new connection event
-            Err(error) => panic!("Error processing packet: {}", error),
-        }
-    }
-
-    fn get_connection_handle(
-        &self,
-        dcid: &ConnectionId,
-        _remote: &SocketAddr,
-        _is_inital_or_0rtt: bool,
-    ) -> Option<Handle> {
-        //TODO check for inital dcids, only remote for cid-less connections
-        if dcid.len() != 0 {
-            if let Some(c) = self.conn_db.get(dcid) {
-                return Some(*c);
-            }
-        }
-        None
-    }
-
-    fn create_connection(
-        &mut self,
-        side: Side,
-        version: u32,
-        inital_dcid: ConnectionId,
-        inital_scid: ConnectionId,
-        inital_loc_scid: ConnectionId,
-        tls_session: RustlsConnection,
-        inital_keyset: Keys,
-        initial_space: PacketNumberSpace,
-        remote: SocketAddr,
-    ) -> Result<Handle, quic_error::Error> {
-        //generate new handle
-        let new_connection_handle = self.connections.len();
-        if let Some(v) = self
-            .conn_db
-            .insert(inital_dcid.clone(), new_connection_handle)
-        {
-            panic!(
-                "Error: extremly unlikely event of identical cid {} from two different hosts",
-                v
-            )
-        }
-
-        self.connections.push(Connection::new(
-            side,
-            version,
-            tls_session,
-            inital_keyset,
-            inital_dcid,
-            inital_scid,
-            inital_loc_scid,
-            remote,
-            initial_space,
-        ));
-
-        Ok(new_connection_handle)
-    }
-
-    //terminate all connections
-    pub fn _close_endpoint() {}
-
-    pub fn handle_connection(
-        &mut self,
-        connection_handle: Handle,
-    ) -> Result<(), quic_error::Error> {
-        println!("building packet for connection {:?}", connection_handle);
-
-        let connection = match self.connections.get_mut(connection_handle) {
-            Some(c) => c,
-            None => {
-                return Err(quic_error::Error::unknown_connection(
-                    "error while retrieving connection",
-                ));
-            }
-        };
-
-        let mut buffer = [0u8; 65535];
-
-        let packet_length = connection.fill_datagram(&mut buffer).unwrap();
-
-        /*let size = match self
-            .socket
-            .send_to(&buffer[..packet_length], connection.remote)
-        {
-            Ok(size) => size,
-            Err(error) => {
-                return Err(quic_error::Error::socket_error(format!("{}", error)));
-            }
-        };
-
-        println!("sent {} bytes to {:?}", size, connection.remote);
-        */
-
         Ok(())
     }
 }

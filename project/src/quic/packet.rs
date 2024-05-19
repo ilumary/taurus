@@ -1,4 +1,4 @@
-use crate::{quic_error, token::StatelessResetToken, ConnectionId};
+use crate::{quic_error, token::StatelessResetToken, ConnectionId, TSDistributor};
 
 use rustls::quic::HeaderProtectionKey;
 
@@ -8,6 +8,15 @@ const SAMPLE_LEN: usize = 16;
 pub const LS_TYPE_BIT: u8 = 0x80;
 const TYPE_MASK: u8 = 0x30;
 const PKT_NUM_LENGTH_MASK: u8 = 0x03;
+
+//packet and address, either source or destination
+pub type Datagram = (Vec<u8>, String);
+
+//early packet with partial header decode
+pub type EarlyDatagram = (Vec<u8>, String, Header);
+
+//inital packet with early datagram and distributor
+pub type InitialDatagram = (Vec<u8>, String, Header, TSDistributor);
 
 //static dispatch in favor of dynamic dispatch to increase performance at the cost of (manageable)
 //binary bloat
@@ -629,6 +638,10 @@ impl Header {
             token: tok,
             packet_length: pkt_length as usize,
         })
+    }
+
+    pub fn is_inital(&self) -> bool {
+        ((self.hf & LS_TYPE_BIT) >> 7) == 1
     }
 
     pub fn debug_print(&self) {
