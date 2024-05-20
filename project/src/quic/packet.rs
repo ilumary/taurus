@@ -384,6 +384,9 @@ pub struct Header {
 
     //packet length including packet_num
     pub packet_length: usize,
+
+    //header length excluding packet num
+    pub raw_length: usize,
 }
 
 impl Header {
@@ -510,14 +513,18 @@ impl Header {
             packet_num_length,
             token,
             packet_length,
+            raw_length: 0, //TODO
         }
     }
 
     pub fn decrypt(
         &mut self,
-        b: &mut octets::OctetsMut,
+        buffer: &mut [u8],
         header_key: &HeaderProtectionKey,
-    ) -> Result<(), octets::BufferTooShortError> {
+    ) -> Result<usize, octets::BufferTooShortError> {
+        let mut b = octets::OctetsMut::with_slice(buffer);
+        b.skip(self.raw_length)?;
+
         let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN as usize + SAMPLE_LEN)?;
         let (mut pn_cipher, sample) = pn_and_sample.split_at(MAX_PKT_NUM_LEN as usize)?;
 
@@ -540,7 +547,7 @@ impl Header {
             _ => return Err(octets::BufferTooShortError),
         };
 
-        Ok(())
+        Ok(self.raw_length + self.packet_num_length as usize + 1)
     }
 
     //TODO retry & version negotiation packets
@@ -602,6 +609,7 @@ impl Header {
                 packet_num_length: 0,
                 token: None,
                 packet_length: 0, //TODO
+                raw_length: b.off(),
             });
         }
 
@@ -637,6 +645,7 @@ impl Header {
             packet_num_length: 0,
             token: tok,
             packet_length: pkt_length as usize,
+            raw_length: b.off(),
         })
     }
 
@@ -646,7 +655,7 @@ impl Header {
 
     pub fn debug_print(&self) {
         println!(
-            "{:#04x?} version: {:#06x?} pn: {:#010x?} dcid: 0x{} scid: 0x{} token:{:x?} length:{:?}",
+            "{:#04x?} version: {:#06x?} pn: {:#010x?} dcid: 0x{} scid: 0x{} token:{:x?} length:{:?} raw_length:{:?}",
             ((self.hf & TYPE_MASK) >> 4),
             self.version,
             self.packet_num,
@@ -666,6 +675,7 @@ impl Header {
                 .join(""),
             self.token.as_ref().unwrap(),
             self.packet_length,
+            self.raw_length,
         );
     }
 }
@@ -675,6 +685,39 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    //TODO expand to other packet types through all pns
+    #[test]
+    fn test_header_decoding() {
+        let mut head_raw: [u8; 64] = [
+            0xc3, 0x00, 0x00, 0x00, 0x01, 0x14, 0x8b, 0x36, 0x1e, 0xd4, 0x6c, 0xbf, 0xde, 0x7f,
+            0xa3, 0x7e, 0xb4, 0xd6, 0xb9, 0xa6, 0x68, 0xf4, 0x49, 0x3e, 0x75, 0xf6, 0x08, 0x21,
+            0x8a, 0xd5, 0x88, 0xe8, 0x40, 0x4a, 0xfb, 0x00, 0x44, 0x8a, 0x7f, 0x81, 0x22, 0x1f,
+            0xf1, 0xf4, 0x4a, 0x64, 0x00, 0x6a, 0x32, 0xf4, 0xb3, 0x67, 0x99, 0xdc, 0x9e, 0x18,
+            0xe1, 0x5c, 0x9f, 0xee, 0x48, 0x37, 0x7b, 0xc4,
+        ];
+        let mut b = octets::OctetsMut::with_slice(&mut head_raw);
+
+        let mut partial_decode = Header::from_bytes(&mut b, 8).unwrap();
+
+        let ikp = rustls::quic::Keys::initial(
+            rustls::quic::Version::V1,
+            &partial_decode.dcid.id,
+            rustls::Side::Server,
+        );
+
+        let header_length = match partial_decode.decrypt(&mut head_raw, &ikp.remote.header) {
+            Ok(s) => s,
+            Err(error) => panic!("Error: {}", error),
+        };
+
+        assert_eq!(header_length, 39);
+        assert_eq!(partial_decode.version, 1);
+        assert_eq!(partial_decode.packet_num, 0);
+        assert_eq!(partial_decode.packet_num_length, 0);
+        assert_eq!(partial_decode.packet_length, 1162);
+        assert_eq!(partial_decode.raw_length, 38);
+    }
 
     #[test]
     fn test_ack_frame_creation_1() {
