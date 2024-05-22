@@ -10,6 +10,8 @@ async fn main() -> Result<(), quic_error::Error> {
     while let Some(_connection) = server.accept().await {
         println!("new connection!");
     }
+    
+    server.stop().await;
 
     Ok(())
 }

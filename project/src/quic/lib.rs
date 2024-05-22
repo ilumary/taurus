@@ -42,6 +42,9 @@ pub struct Distributor {
 
     //channels for each connection
     connection_send_handles: HashMap<ConnectionId, mpsc::Sender<packet::EarlyDatagram>>,
+    
+    //cancellation token. if activated all connections are shut down
+    cancellation_token: tokio_util::sync::CancellationToken,
 }
 
 impl Distributor {
@@ -53,6 +56,7 @@ impl Distributor {
             hmac_reset_key: key,
             sending_handle: tx,
             connection_send_handles: HashMap::new(),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 }
@@ -69,6 +73,7 @@ impl Acceptor {
         //move into static connection function
         println!("accepting connection from {}", &remote);
 
+        //TODO move cancellation token in connection, listen in connection for cancel without channel
         let new_conn = Connection::early_connection((packet, remote, header), tsd)
             .await
             .unwrap();
@@ -90,6 +95,10 @@ pub struct Server {
 impl Server {
     pub async fn accept(&mut self) -> Option<Connection> {
         self.acceptor.accept().await
+    }
+    
+    pub async fn stop(&mut self) {
+        self.endpoint.distributor.read().await.cancellation_token.cancel();   
     }
 }
 
@@ -162,7 +171,12 @@ impl Endpoint {
     pub async fn new(addr: &str, server_config: Option<Arc<rustls::ServerConfig>>) -> Self {
         let mut hmac_reset_key = [0u8; 64];
         rand::thread_rng().fill_bytes(&mut hmac_reset_key);
-
+        
+        let distributor = Arc::new(RwLock::new(Distributor::new(
+                ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
+                server_config,
+            )));
+            
         Endpoint {
             socket: Arc::new(
                 TokioUdpSocket::bind(addr)
@@ -171,10 +185,7 @@ impl Endpoint {
             ),
             recv_loop_handle: None,
             send_loop_handle: None,
-            distributor: Arc::new(RwLock::new(Distributor::new(
-                ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
-                server_config,
-            ))),
+            distributor,
         }
     }
 
@@ -183,6 +194,7 @@ impl Endpoint {
         let (tx_initial, rx_initial) = mpsc::channel::<packet::InitialDatagram>(64);
         let recv_socket = self.socket.clone();
         let dist = self.distributor.clone();
+        let cancellation_token = {dist.read().await.cancellation_token.clone()};
 
         self.recv_loop_handle = Some(tokio::spawn(async move {
             loop {
@@ -207,7 +219,8 @@ impl Endpoint {
                     Err(error) => panic!("Error: {}", error),
                 };
 
-                if partial_decode.is_inital() {
+                //stop accepting new connections when entering graceful shutdown
+                if partial_decode.is_inital() && !cancellation_token.is_cancelled() {
                     tx_initial
                         .send((buffer, src_addr.to_string(), partial_decode, dist.clone()))
                         .await
@@ -226,11 +239,22 @@ impl Endpoint {
                             .unwrap();
                     }
                 }
+                
+                if cancellation_token.is_cancelled() {
+                    {
+                        //return if all connections have been succesfully shut down
+                        if dist.read().await.connection_send_handles.is_empty() {
+                            return Ok(0);
+                        }
+                    }
+                }
             }
         }));
 
         let send_socket = self.socket.clone();
         let (tx, mut rx) = mpsc::channel::<packet::Datagram>(64);
+        let dist = self.distributor.clone();
+        let cancellation_token = {dist.read().await.cancellation_token.clone()};
 
         {
             //set sending handle
@@ -245,7 +269,17 @@ impl Endpoint {
                         return Err(quic_error::Error::socket_error(format!("{}", error)));
                     }
                 };
+                
                 println!("sent {} bytes to {}", size, &msg.1);
+                
+                if cancellation_token.is_cancelled() {
+                    {
+                        //return if all connections have been succesfully shut down
+                        if dist.read().await.connection_send_handles.is_empty() {
+                            return Ok(0);
+                        }
+                    }
+                }
             }
             Ok(0)
         }));
