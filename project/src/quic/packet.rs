@@ -520,7 +520,7 @@ impl Header {
     pub fn decrypt(
         &mut self,
         buffer: &mut [u8],
-        header_key: &HeaderProtectionKey,
+        header_key: &dyn HeaderProtectionKey,
     ) -> Result<usize, octets::BufferTooShortError> {
         let mut b = octets::OctetsMut::with_slice(buffer);
         b.skip(self.raw_length)?;
@@ -700,13 +700,26 @@ mod tests {
 
         let mut partial_decode = Header::from_bytes(&mut b, 8).unwrap();
 
+        rustls::crypto::ring::default_provider()
+            .install_default()
+            .unwrap();
+
         let ikp = rustls::quic::Keys::initial(
             rustls::quic::Version::V1,
+            rustls::crypto::ring::default_provider().cipher_suites[1]
+                .tls13()
+                .unwrap(),
+            rustls::crypto::ring::default_provider().cipher_suites[1]
+                .tls13()
+                .unwrap()
+                .quic
+                .unwrap(),
             &partial_decode.dcid.id,
             rustls::Side::Server,
         );
 
-        let header_length = match partial_decode.decrypt(&mut head_raw, &ikp.remote.header) {
+        let header_length = match partial_decode.decrypt(&mut head_raw, ikp.remote.header.as_ref())
+        {
             Ok(s) => s,
             Err(error) => panic!("Error: {}", error),
         };

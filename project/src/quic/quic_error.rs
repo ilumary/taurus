@@ -28,6 +28,7 @@ impl Error {
     quic_error!(socket_error, 0x02);
     quic_error!(header_encoding_error, 0x03);
     quic_error!(packet_size_error, 0x04);
+    quic_error!(no_cipher_suite, 0x05);
 }
 
 impl fmt::Display for Error {

@@ -1,6 +1,5 @@
 mod packet;
 pub mod quic_error;
-mod stream;
 mod token;
 mod transport_parameters;
 
@@ -42,7 +41,7 @@ pub struct Distributor {
 
     //channels for each connection
     connection_send_handles: HashMap<ConnectionId, mpsc::Sender<packet::EarlyDatagram>>,
-    
+
     //cancellation token. if activated all connections are shut down
     cancellation_token: tokio_util::sync::CancellationToken,
 }
@@ -96,9 +95,14 @@ impl Server {
     pub async fn accept(&mut self) -> Option<Connection> {
         self.acceptor.accept().await
     }
-    
+
     pub async fn stop(&mut self) {
-        self.endpoint.distributor.read().await.cancellation_token.cancel();   
+        self.endpoint
+            .distributor
+            .read()
+            .await
+            .cancellation_token
+            .cancel();
     }
 }
 
@@ -110,22 +114,25 @@ pub struct ServerConfig {
 impl ServerConfig {
     pub fn local_server(addr: &str) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let key = rustls::PrivateKey(cert.serialize_private_key_der());
-        let cert = rustls::Certificate(cert.serialize_der().unwrap());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
+        let cert = rustls::pki_types::CertificateDer::from(cert.cert);
 
         Self::new(addr, cert, key)
     }
 
-    pub fn new(addr: &str, certificate: rustls::Certificate, pkey: rustls::PrivateKey) -> Self {
-        let mut server_cfg = rustls::ServerConfig::builder()
-            .with_safe_default_cipher_suites()
-            .with_safe_default_kx_groups()
+    pub fn new(
+        addr: &str,
+        certificate: rustls::pki_types::CertificateDer<'_>,
+        pkey: rustls::pki_types::PrivateKeyDer<'_>,
+    ) -> Self {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
             .with_no_client_auth()
-            .with_single_cert(vec![certificate.clone()], pkey)
+            .with_single_cert(vec![certificate.into_owned().clone()], pkey.clone_key())
             .unwrap();
-        server_cfg.max_early_data_size = u32::MAX;
 
         ServerConfig {
             server_config: Some(server_cfg),
@@ -171,12 +178,12 @@ impl Endpoint {
     pub async fn new(addr: &str, server_config: Option<Arc<rustls::ServerConfig>>) -> Self {
         let mut hmac_reset_key = [0u8; 64];
         rand::thread_rng().fill_bytes(&mut hmac_reset_key);
-        
+
         let distributor = Arc::new(RwLock::new(Distributor::new(
-                ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
-                server_config,
-            )));
-            
+            ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
+            server_config,
+        )));
+
         Endpoint {
             socket: Arc::new(
                 TokioUdpSocket::bind(addr)
@@ -194,7 +201,7 @@ impl Endpoint {
         let (tx_initial, rx_initial) = mpsc::channel::<packet::InitialDatagram>(64);
         let recv_socket = self.socket.clone();
         let dist = self.distributor.clone();
-        let cancellation_token = {dist.read().await.cancellation_token.clone()};
+        let cancellation_token = { dist.read().await.cancellation_token.clone() };
 
         self.recv_loop_handle = Some(tokio::spawn(async move {
             loop {
@@ -239,7 +246,7 @@ impl Endpoint {
                             .unwrap();
                     }
                 }
-                
+
                 if cancellation_token.is_cancelled() {
                     {
                         //return if all connections have been succesfully shut down
@@ -254,7 +261,7 @@ impl Endpoint {
         let send_socket = self.socket.clone();
         let (tx, mut rx) = mpsc::channel::<packet::Datagram>(64);
         let dist = self.distributor.clone();
-        let cancellation_token = {dist.read().await.cancellation_token.clone()};
+        let cancellation_token = { dist.read().await.cancellation_token.clone() };
 
         {
             //set sending handle
@@ -269,9 +276,9 @@ impl Endpoint {
                         return Err(quic_error::Error::socket_error(format!("{}", error)));
                     }
                 };
-                
+
                 println!("sent {} bytes to {}", size, &msg.1);
-                
+
                 if cancellation_token.is_cancelled() {
                     {
                         //return if all connections have been succesfully shut down
@@ -306,10 +313,18 @@ impl Connection {
             (t.hmac_reset_key.clone(), t.server_config.clone())
         };
 
-        //get initial keys
-        let ikp = Keys::initial(Version::V1, &head.dcid.id, Side::Server);
+        let server_config = server_config.unwrap();
 
-        let header_length = match head.decrypt(&mut buffer, &ikp.remote.header) {
+        //get initial keys, use default crypto provider by ring with all suites for now
+        let ikp = Connection::derive_initial_keyset(
+            server_config.clone(),
+            Version::V1,
+            Side::Server,
+            &head.dcid,
+        )
+        .await?;
+
+        let header_length = match head.decrypt(&mut buffer, ikp.remote.header.as_ref()) {
             Ok(s) => s,
             Err(error) => panic!("Error: {}", error),
         };
@@ -339,7 +354,6 @@ impl Connection {
         };
 
         //truncate payload to length returned by decrypting packet payload
-        //let payload = OctetsMut::with_slice(payload_cipher.as_mut()[..dec_len].as_mut());
         buffer.truncate(dec_len);
 
         let initial_local_scid = ConnectionId::generate_with_length(head.dcid.len());
@@ -363,7 +377,7 @@ impl Connection {
 
         let conn = RustlsConnection::Server(
             rustls::quic::ServerConnection::new(
-                server_config.unwrap(),
+                server_config,
                 rustls::quic::Version::V1,
                 data.to_vec(),
             )
@@ -371,7 +385,7 @@ impl Connection {
         );
 
         let initial_space: PacketNumberSpace = PacketNumberSpace {
-            keys: Some(Keys::initial(Version::V1, &head.dcid.id, Side::Server)),
+            keys: Some(ikp),
             ..PacketNumberSpace::new(true)
         };
 
@@ -388,7 +402,6 @@ impl Connection {
             Side::Server,
             head.version,
             conn,
-            ikp,
             orig_dcid,
             head.scid.clone().unwrap(),
             initial_local_scid,
@@ -404,6 +417,42 @@ impl Connection {
         Ok(conn.start(recv_q).await.unwrap())
     }
 
+    async fn derive_initial_keyset(
+        server_cfg: Arc<rustls::ServerConfig>,
+        version: Version,
+        side: Side,
+        dcid: &ConnectionId,
+    ) -> Result<Keys, quic_error::Error> {
+        println!(
+            "{:?} available cipher suites: {:?}",
+            &server_cfg.crypto_provider().cipher_suites.len(),
+            &server_cfg.crypto_provider().cipher_suites,
+        );
+
+        let cipher_suites = &server_cfg.crypto_provider().cipher_suites;
+
+        if cipher_suites.is_empty() {
+            return Err(quic_error::Error::no_cipher_suite(
+                "no supported cipher suites",
+            ));
+        }
+
+        //use first availible tls 1.3 crypto suite for now
+        if let Some(tls13_cipher_suite) = cipher_suites[0].tls13() {
+            return Ok(Keys::initial(
+                version,
+                tls13_cipher_suite,
+                tls13_cipher_suite.quic.unwrap(),
+                &dcid.id,
+                side,
+            ));
+        }
+
+        Err(quic_error::Error::no_cipher_suite(
+            "no available tls 1.3 cipher suite",
+        ))
+    }
+
     //starts recv_q, feeds into all other queues
     async fn start(
         mut self,
@@ -414,8 +463,6 @@ impl Connection {
                 println!("received datagram inside connection {:?}", msg.1);
 
                 //process
-
-                //poll for answer packet
             }
             Ok(0)
         }));
@@ -445,7 +492,6 @@ struct Inner {
     next_secrets: Option<rustls::quic::Secrets>,
     prev_1rtt_keys: Option<PacketKeySet>,
     next_1rtt_keys: Option<PacketKeySet>,
-    initial_keyset: Keys,
     zero_rtt_keyset: Option<Keys>,
 
     //connection state
@@ -481,7 +527,6 @@ impl Inner {
         side: Side,
         version: u32,
         tls_session: RustlsConnection,
-        initial_keyset: Keys,
         initial_dcid: ConnectionId,
         initial_remote_scid: ConnectionId,
         initial_local_scid: ConnectionId,
@@ -497,7 +542,6 @@ impl Inner {
             next_1rtt_keys: None,
             prev_1rtt_keys: None,
             zero_rtt_keyset: None,
-            initial_keyset,
             state: ConnectionState::Handshake,
             initial_dcid,
             initial_remote_scid,
@@ -521,11 +565,12 @@ impl Inner {
     fn recv(
         &mut self,
         header: &mut Header,
-        payload: &mut OctetsMut<'_>,
+        payload_raw: &mut [u8],
     ) -> Result<(), quic_error::Error> {
+        let mut payload = octets::OctetsMut::with_slice(payload_raw);
         //decrypt header and payload
 
-        self.process_payload(header, payload);
+        self.process_payload(header, &mut payload);
 
         // if space is handshake, call to write crypto after processing payload
 
