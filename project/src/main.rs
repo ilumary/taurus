@@ -1,7 +1,7 @@
-use quic::{quic_error, ServerConfig};
+use quic::{terror, ServerConfig};
 
 #[tokio::main]
-async fn main() -> Result<(), quic_error::Error> {
+async fn main() -> Result<(), terror::Error> {
     let mut server = ServerConfig::local_server("127.0.0.1:34254")
         .with_supported_protocols(vec!["hq-29".to_owned()])
         .build()
@@ -10,7 +10,7 @@ async fn main() -> Result<(), quic_error::Error> {
     while let Some(_connection) = server.accept().await {
         println!("new connection!");
     }
-    
+
     server.stop().await;
 
     Ok(())

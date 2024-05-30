@@ -1,4 +1,4 @@
-use crate::{quic_error, token::StatelessResetToken, ConnectionId, TSDistributor};
+use crate::{terror, token::StatelessResetToken, ConnectionId, TSDistributor};
 
 use rustls::quic::HeaderProtectionKey;
 
@@ -399,16 +399,16 @@ impl Header {
         scid: &ConnectionId,
         token: Option<Vec<u8>>,
         packet_length: usize,
-    ) -> Result<Self, quic_error::Error> {
+    ) -> Result<Self, terror::Error> {
         if !matches!(long_header_type, 0x00..=0x03) {
-            return Err(quic_error::Error::header_encoding_error(format!(
+            return Err(terror::Error::header_encoding_error(format!(
                 "unsupported long header type {:?}",
                 long_header_type
             )));
         }
 
         if !matches!(packet_num_length, 0x00..=MAX_PKT_NUM_LEN) {
-            return Err(quic_error::Error::header_encoding_error(format!(
+            return Err(terror::Error::header_encoding_error(format!(
                 "unsupported packet number length {:?}",
                 packet_num_length
             )));
@@ -437,23 +437,23 @@ impl Header {
         packet_num: u32,
         dcid: &ConnectionId,
         packet_length: usize,
-    ) -> Result<Self, quic_error::Error> {
+    ) -> Result<Self, terror::Error> {
         if !matches!(spin_bit, 0x00 | 0x01) {
-            return Err(quic_error::Error::header_encoding_error(format!(
+            return Err(terror::Error::header_encoding_error(format!(
                 "unsupported header spin bit {:?}",
                 spin_bit
             )));
         }
 
         if !matches!(key_phase, 0x00 | 0x01) {
-            return Err(quic_error::Error::header_encoding_error(format!(
+            return Err(terror::Error::header_encoding_error(format!(
                 "unsupported header key phase {:?}",
                 key_phase
             )));
         }
 
         if !matches!(packet_num_length, 0x00..=MAX_PKT_NUM_LEN) {
-            return Err(quic_error::Error::header_encoding_error(format!(
+            return Err(terror::Error::header_encoding_error(format!(
                 "unsupported packet number length {:?}",
                 packet_num_length
             )));

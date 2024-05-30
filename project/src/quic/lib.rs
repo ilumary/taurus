@@ -1,5 +1,5 @@
 mod packet;
-pub mod quic_error;
+pub mod terror;
 mod token;
 mod transport_parameters;
 
@@ -147,7 +147,7 @@ impl ServerConfig {
         self
     }
 
-    pub async fn build(self) -> Result<Server, quic_error::Error> {
+    pub async fn build(self) -> Result<Server, terror::Error> {
         let mut endpoint = Endpoint::new(
             self.address.as_ref(),
             Some(Arc::new(
@@ -167,8 +167,8 @@ pub struct Endpoint {
     socket: Arc<TokioUdpSocket>,
 
     //task handles for recv and send loops
-    recv_loop_handle: Option<JoinHandle<Result<u64, quic_error::Error>>>,
-    send_loop_handle: Option<JoinHandle<Result<u64, quic_error::Error>>>,
+    recv_loop_handle: Option<JoinHandle<Result<u64, terror::Error>>>,
+    send_loop_handle: Option<JoinHandle<Result<u64, terror::Error>>>,
 
     //stores connection channel sender handles
     distributor: TSDistributor,
@@ -273,7 +273,7 @@ impl Endpoint {
                 let size = match send_socket.send_to(&msg.0, &msg.1).await {
                     Ok(size) => size,
                     Err(error) => {
-                        return Err(quic_error::Error::socket_error(format!("{}", error)));
+                        return Err(terror::Error::socket_error(format!("{}", error)));
                     }
                 };
 
@@ -306,7 +306,7 @@ impl Connection {
     async fn early_connection(
         inital_datagram: packet::EarlyDatagram,
         tsd: TSDistributor,
-    ) -> Result<Self, quic_error::Error> {
+    ) -> Result<Self, terror::Error> {
         let (mut buffer, src_addr, mut head) = inital_datagram;
         let (hmac_reset_key, server_config) = {
             let t = tsd.read().await;
@@ -422,7 +422,7 @@ impl Connection {
         version: Version,
         side: Side,
         dcid: &ConnectionId,
-    ) -> Result<Keys, quic_error::Error> {
+    ) -> Result<Keys, terror::Error> {
         println!(
             "{:?} available cipher suites: {:?}",
             &server_cfg.crypto_provider().cipher_suites.len(),
@@ -432,9 +432,7 @@ impl Connection {
         let cipher_suites = &server_cfg.crypto_provider().cipher_suites;
 
         if cipher_suites.is_empty() {
-            return Err(quic_error::Error::no_cipher_suite(
-                "no supported cipher suites",
-            ));
+            return Err(terror::Error::no_cipher_suite("no supported cipher suites"));
         }
 
         //use first availible tls 1.3 crypto suite for now
@@ -448,7 +446,7 @@ impl Connection {
             ));
         }
 
-        Err(quic_error::Error::no_cipher_suite(
+        Err(terror::Error::no_cipher_suite(
             "no available tls 1.3 cipher suite",
         ))
     }
@@ -457,7 +455,7 @@ impl Connection {
     async fn start(
         mut self,
         mut recv_q: mpsc::Receiver<packet::EarlyDatagram>,
-    ) -> Result<Self, quic_error::Error> {
+    ) -> Result<Self, terror::Error> {
         self.inner.loop_handle = Some(tokio::spawn(async move {
             while let Some(msg) = recv_q.recv().await {
                 println!("received datagram inside connection {:?}", msg.1);
@@ -479,7 +477,7 @@ impl Connection {
 }
 
 struct Inner {
-    loop_handle: Option<JoinHandle<Result<u64, quic_error::Error>>>,
+    loop_handle: Option<JoinHandle<Result<u64, terror::Error>>>,
 
     //side
     side: Side,
@@ -562,11 +560,7 @@ impl Inner {
     }
 
     //fully decrypts packet header and payload, does tls stuff and passes packet to process_payload
-    fn recv(
-        &mut self,
-        header: &mut Header,
-        payload_raw: &mut [u8],
-    ) -> Result<(), quic_error::Error> {
+    fn recv(&mut self, header: &mut Header, payload_raw: &mut [u8]) -> Result<(), terror::Error> {
         let mut payload = octets::OctetsMut::with_slice(payload_raw);
         //decrypt header and payload
 
@@ -578,7 +572,7 @@ impl Inner {
     }
 
     //accepts new connection, passes payload to process_payload
-    fn accept(&mut self, header: &Header, payload_raw: &mut [u8]) -> Result<(), quic_error::Error> {
+    fn accept(&mut self, header: &Header, payload_raw: &mut [u8]) -> Result<(), terror::Error> {
         let mut payload = octets::OctetsMut::with_slice(payload_raw);
 
         self.process_payload(header, &mut payload);
@@ -778,7 +772,7 @@ impl Inner {
         self.current_space += 1;
     }
 
-    fn fill_datagram(&mut self, buffer: &mut [u8]) -> Result<usize, quic_error::Error> {
+    fn fill_datagram(&mut self, buffer: &mut [u8]) -> Result<usize, terror::Error> {
         // detect if packet needs to be sent if current space is handshake and initial has outstanding_crypto_data
         let mut size: usize = 0;
 
@@ -793,7 +787,7 @@ impl Inner {
         &mut self,
         buffer: &mut [u8],
         packet_number_space: usize,
-    ) -> Result<usize, quic_error::Error> {
+    ) -> Result<usize, terror::Error> {
         println!("Building packet in space {:#x}", packet_number_space);
 
         let mut buf = octets::OctetsMut::with_slice(buffer);
@@ -827,7 +821,7 @@ impl Inner {
         {
             Ok(()) => (),
             Err(error) => {
-                return Err(quic_error::Error::header_encoding_error(format!(
+                return Err(terror::Error::header_encoding_error(format!(
                     "buffer has unsufficient size to encode header: {}",
                     error
                 )))
@@ -851,7 +845,7 @@ impl Inner {
         }
 
         if (payload_length + header_length) > (max_packet_size - packet_num_length as usize) {
-            return Err(quic_error::Error::packet_size_error(format!(
+            return Err(terror::Error::packet_size_error(format!(
                 "max packet length exceeded with {}",
                 payload_length
             )));
@@ -877,7 +871,7 @@ impl Inner {
         &mut self,
         buf: &mut octets::OctetsMut<'_>,
         packet_number_space: usize,
-    ) -> Result<usize, quic_error::Error> {
+    ) -> Result<usize, terror::Error> {
         let mut size = 0;
 
         //CRYPTO
@@ -887,7 +881,7 @@ impl Inner {
                     match packet::encode_frame(&CryptoFrame::new(0, crypto_buffer.to_vec()), buf) {
                         Ok(s) => s,
                         Err(error) => {
-                            return Err(quic_error::Error::packet_size_error(format!(
+                            return Err(terror::Error::packet_size_error(format!(
                                 "insufficient sized buffer for CRYPTO frame ({})",
                                 error
                             )))
@@ -921,7 +915,7 @@ impl Inner {
             let s = match packet::encode_frame(&ack_frame, buf) {
                 Ok(s) => s,
                 Err(error) => {
-                    return Err(quic_error::Error::packet_size_error(format!(
+                    return Err(terror::Error::packet_size_error(format!(
                         "insufficient sized buffer for ack frame ({})",
                         error
                     )))

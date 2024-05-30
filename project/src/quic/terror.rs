@@ -1,5 +1,4 @@
 #![allow(non_snake_case)]
-use std::error::Error as SError;
 use std::fmt;
 
 #[derive(Debug)]
@@ -8,7 +7,7 @@ pub struct Error {
     msg: String,
 }
 
-macro_rules! quic_error {
+macro_rules! taurus_error {
     ($name:ident, $code:expr) => {
         pub fn $name<T>(reason: T) -> Self
         where
@@ -23,12 +22,12 @@ macro_rules! quic_error {
 }
 
 impl Error {
-    quic_error!(fatal, 0x00);
-    quic_error!(unknown_connection, 0x01);
-    quic_error!(socket_error, 0x02);
-    quic_error!(header_encoding_error, 0x03);
-    quic_error!(packet_size_error, 0x04);
-    quic_error!(no_cipher_suite, 0x05);
+    taurus_error!(fatal, 0x00);
+    taurus_error!(unknown_connection, 0x01);
+    taurus_error!(socket_error, 0x02);
+    taurus_error!(header_encoding_error, 0x03);
+    taurus_error!(packet_size_error, 0x04);
+    taurus_error!(no_cipher_suite, 0x05);
 }
 
 impl fmt::Display for Error {
@@ -37,7 +36,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl SError for Error {
+impl std::error::Error for Error {
     fn description(&self) -> &str {
         &self.msg
     }
