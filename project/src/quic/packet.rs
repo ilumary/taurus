@@ -16,7 +16,13 @@ pub type Datagram = (Vec<u8>, String);
 pub type EarlyDatagram = (Vec<u8>, String, Header);
 
 //inital packet with early datagram and distributor
-pub type InitialDatagram = (Vec<u8>, String, Header, TSDistributor);
+pub type InitialDatagram = (
+    Vec<u8>,
+    String,
+    Header,
+    TSDistributor,
+    std::sync::Arc<tokio::net::UdpSocket>,
+);
 
 //static dispatch in favor of dynamic dispatch to increase performance at the cost of (manageable)
 //binary bloat

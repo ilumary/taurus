@@ -42,7 +42,9 @@ impl std::error::Error for Error {
     }
 }
 
-enum QuicTransportErrors {
+#[repr(u64)]
+#[derive(Copy, Clone)]
+pub enum QuicTransportError {
     NoError = 0x00,
     InternalError = 0x01,
     ConnectionRefused = 0x02,
@@ -60,9 +62,46 @@ enum QuicTransportErrors {
     KeyUpdateError = 0x0e,
     AeadLimitReached = 0x0f,
     NoViablePath = 0x10,
+    CryptoError(CryptoError),
+}
+
+impl fmt::Display for QuicTransportError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            QuicTransportError::NoError => write!(f, "0x00 no error"),
+            QuicTransportError::InternalError => write!(f, "0x01 internal error"),
+            QuicTransportError::ConnectionRefused => write!(f, "0x02 connection refused"),
+            QuicTransportError::FlowControlError => write!(f, "0x03 flow control error"),
+            QuicTransportError::StreamLimitError => write!(f, "0x04 stream limit error"),
+            QuicTransportError::StreamStateError => write!(f, "0x05 stream state error"),
+            QuicTransportError::FinalSizeError => write!(f, "0x06 final size error"),
+            QuicTransportError::FrameEncodingError => write!(f, "0x07 frame encoding error"),
+            QuicTransportError::TransportParameterError => {
+                write!(f, "0x08 transport parameter error")
+            }
+            QuicTransportError::ConnectionIdLimitError => {
+                write!(f, "0x09 connection id limit error")
+            }
+            QuicTransportError::ProtocolViolation => write!(f, "0x0a protocol violation"),
+            QuicTransportError::InvalidToken => write!(f, "0x0b invalid token"),
+            QuicTransportError::ApplicationError => write!(f, "0x0c application error"),
+            QuicTransportError::CryptoBufferExceeded => write!(f, "0x0d crypto buffer exceeded"),
+            QuicTransportError::KeyUpdateError => write!(f, "0x0e key update error"),
+            QuicTransportError::AeadLimitReached => write!(f, "0x0f aead limit reached"),
+            QuicTransportError::NoViablePath => write!(f, "0x10 no viable path"),
+            QuicTransportError::CryptoError(c) => write!(f, "{} crypto error", c),
+        }
+    }
 }
 
 // 0x0100 - 0x01ff
-struct CryptoError {
+#[derive(Copy, Clone)]
+pub struct CryptoError {
     code: u64,
+}
+
+impl fmt::Display for CryptoError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:#x}", self.code)
+    }
 }
