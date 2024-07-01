@@ -63,6 +63,7 @@ impl Acceptor {
     async fn accept(&mut self) -> Option<Connection> {
         let (packet, remote, header, tsd, socket) = self.rx.recv().await.unwrap();
 
+        //TODO refactor unwrap panic with proper error handling
         let (connection, ready) =
             Connection::early_connection((packet, remote, header), tsd, socket)
                 .await
@@ -267,10 +268,11 @@ impl Endpoint {
 }
 
 pub struct Connection {
-    inner: Inner,
-
     //send socket
     socket: Arc<TokioUdpSocket>,
+
+    //packet recv loop for connection
+    loop_handle: Option<JoinHandle<Result<u64, terror::Error>>>,
     //stream acceptor handles
     //bidi_stream_r: mpsc::Receiver<stream::data>,
     //uni_stream_r: mpsc::Receiver<stream::data>,
@@ -375,7 +377,7 @@ impl Connection {
 
         let (conn_read_tx, conn_ready_rx) = oneshot::channel::<terror::QuicTransportError>();
 
-        let inner = Inner::new(
+        let mut inner = Inner::new(
             Side::Server,
             head.version,
             conn,
@@ -387,16 +389,20 @@ impl Connection {
             conn_read_tx,
         );
 
-        let mut conn = Self { inner, socket };
+        let conn = Self {
+            socket,
+            loop_handle: None,
+        };
 
         //process inital packet inside connection, all subsequent packets are sent through channel
-        conn.inner.accept(&head, &mut buffer)?;
+        inner.accept(&head, &mut buffer)?;
 
-        //send answer to initial packet
-        //conn.send((buffer, conn.remote))
+        //TODO send answer to initial packet
+        let initial_answer: packet::Datagram = (vec![], inner.remote.to_string());
+        conn.send(&initial_answer).await?;
 
         //start recv loop to process more incoming packets
-        Ok((conn.start(recv_q).await.unwrap(), conn_ready_rx))
+        Ok((conn.start(recv_q, inner).await.unwrap(), conn_ready_rx))
     }
 
     fn derive_initial_keyset(
@@ -405,7 +411,7 @@ impl Connection {
         side: Side,
         dcid: &ConnectionId,
     ) -> Keys {
-        /* for now only the rustls ring provider is supported, so we may omit numerous checks */
+        /* for now only the rustls ring provider is used, so we may omit numerous checks */
         server_cfg
             .crypto_provider()
             .cipher_suites
@@ -425,19 +431,39 @@ impl Connection {
     async fn start(
         mut self,
         mut recv_q: mpsc::Receiver<packet::EarlyDatagram>,
+        mut conn: Inner,
     ) -> Result<Self, terror::Error> {
-        self.inner.loop_handle = Some(tokio::spawn(async move {
-            while let Some(msg) = recv_q.recv().await {
+        let socket = self.socket.clone();
+
+        self.loop_handle = Some(tokio::spawn(async move {
+            while let Some(mut msg) = recv_q.recv().await {
                 println!("received datagram inside connection {:?}", msg.1);
 
                 //process
+                if let Err(error) = conn.recv(&mut msg) {
+                    eprint!("error processing datagram: {}", error);
+                };
+
+                //send back ack at least, check for data in outgoing streams
+                //placeholder
+                let dgram: packet::Datagram = (vec![], conn.remote.to_string());
+
+                //send data back
+                let size = match socket.send_to(&dgram.0, &dgram.1).await {
+                    Ok(size) => size,
+                    Err(error) => {
+                        return Err(terror::Error::socket_error(format!("{}", error)));
+                    }
+                };
+
+                println!("sent {} bytes to {}", size, &dgram.1);
             }
             Ok(0)
         }));
         Ok(self)
     }
 
-    async fn send(&self, dgram: packet::Datagram) -> Result<(), terror::Error> {
+    async fn send(&self, dgram: &packet::Datagram) -> Result<(), terror::Error> {
         let size = match self.socket.send_to(&dgram.0, &dgram.1).await {
             Ok(size) => size,
             Err(error) => {
@@ -451,7 +477,7 @@ impl Connection {
     }
 
     fn abort(self) {
-        self.inner.loop_handle.unwrap().abort();
+        self.loop_handle.unwrap().abort();
     }
 
     //pub async fn accept_bidi_stream() {}
@@ -464,9 +490,6 @@ impl Connection {
 }
 
 struct Inner {
-    //packet recv loop for connection
-    loop_handle: Option<JoinHandle<Result<u64, terror::Error>>>,
-
     //oneshot channel
     conn_ready: oneshot::Sender<terror::QuicTransportError>,
 
@@ -524,7 +547,6 @@ impl Inner {
         conn_ready: oneshot::Sender<terror::QuicTransportError>,
     ) -> Self {
         Self {
-            loop_handle: None,
             conn_ready,
             side,
             version,
@@ -553,11 +575,10 @@ impl Inner {
     }
 
     //fully decrypts packet header and payload, does tls stuff and passes packet to process_payload
-    fn recv(&mut self, header: &mut Header, payload_raw: &mut [u8]) -> Result<(), terror::Error> {
-        let mut payload = octets::OctetsMut::with_slice(payload_raw);
+    fn recv(&mut self, datagram: &mut packet::EarlyDatagram) -> Result<(), terror::Error> {
         //decrypt header and payload
-
-        self.process_payload(header, &mut payload);
+        //TODO handle coalesced packets
+        self.process_payload(&datagram.2, &mut datagram.0)?;
 
         // if space is handshake, call to write crypto after processing payload
 
@@ -566,7 +587,21 @@ impl Inner {
 
     //accepts new connection, passes payload to process_payload
     fn accept(&mut self, header: &Header, packet_raw: &mut [u8]) -> Result<(), terror::Error> {
-        let mut payload = octets::OctetsMut::with_slice(packet_raw);
+        //initial packet cant be coalesced, TODO investigate for 0-rtt
+        self.process_payload(header, packet_raw)?;
+
+        self.generate_crypto_data();
+
+        // generate crypto data again for ee, cert, cv, fin
+        Ok(())
+    }
+
+    fn process_payload(
+        &mut self,
+        header: &Header,
+        payload: &mut [u8],
+    ) -> Result<(), terror::Error> {
+        let mut payload = octets::OctetsMut::with_slice(payload);
 
         //skip forth to packet payload
         if let Err(error) = payload.skip(header.raw_length + header.packet_num_length as usize + 1)
@@ -577,22 +612,6 @@ impl Inner {
             )));
         };
 
-        self.process_payload(header, &mut payload);
-
-        println!(
-            "transport parameters from peer: {:x?}",
-            self.tls_session.quic_transport_parameters().unwrap(),
-        );
-
-        self.generate_crypto_data();
-
-        // generate crypto data again for ee, cert, cv, fin
-        Ok(())
-    }
-
-    // TODO change to just &Octets, because we dont need to modify the buffer after decrypting
-    fn process_payload(&mut self, header: &Header, payload: &mut OctetsMut<'_>) {
-        //TODO check if packet is ack eliciting
         let mut ack_eliciting = false;
 
         while payload.peek_u8().is_ok() {
@@ -602,10 +621,12 @@ impl Inner {
             ack_eliciting = !matches!(frame_code, 0x00 | 0x02 | 0x03 | 0x1c | 0x1d);
 
             match frame_code {
-                0x00 => continue, //PADDING
+                0x00 => {
+                    let _ = payload.get_u8();
+                } //PADDING
                 0x01 => continue, //PING
                 0x02 | 0x03 => {
-                    let _ack = AckFrame::from_bytes(&frame_code, payload);
+                    let _ack = AckFrame::from_bytes(&frame_code, &mut payload);
                 } //ACK
                 0x04 => {
                     let _stream_id = payload.get_varint().unwrap();
@@ -617,18 +638,18 @@ impl Inner {
                     let _application_protocol_error_code = payload.get_varint().unwrap();
                 } //STOP_SENDING
                 0x06 => {
-                    let crypto_frame = CryptoFrame::from_bytes(&frame_code, payload);
+                    let crypto_frame = CryptoFrame::from_bytes(&frame_code, &mut payload);
                     self.process_crypto_data(&crypto_frame);
                 } //CRYPTO
                 0x07 => {
                     if self.side != Side::Server {
-                        let _new_token = NewTokenFrame::from_bytes(&frame_code, payload);
+                        let _new_token = NewTokenFrame::from_bytes(&frame_code, &mut payload);
                     } else {
                         //Quic Error: ProtocolViolation
                     }
                 } //NEW_TOKEN
                 0x08..=0x0f => {
-                    let stream_frame = StreamFrame::from_bytes(&frame_code, payload);
+                    let stream_frame = StreamFrame::from_bytes(&frame_code, &mut payload);
                     let (_, mut stream_data) = payload.split_at(payload.off()).unwrap();
 
                     //isolate stream data if offset is present, else data extends to end of packet
@@ -671,7 +692,8 @@ impl Inner {
                     let _maximum_streams = payload.get_varint().unwrap();
                 } //STREAMS_BLOCKED (unidirectional)
                 0x18 => {
-                    let _new_connection_id = NewConnectionIdFrame::from_bytes(&frame_code, payload);
+                    let _new_connection_id =
+                        NewConnectionIdFrame::from_bytes(&frame_code, &mut payload);
                 } //NEW_CONNECTION_ID
                 0x19 => {
                     let _sequence_number = payload.get_varint().unwrap();
@@ -683,10 +705,17 @@ impl Inner {
                     let _path_response_data = payload.get_u64().unwrap();
                 } //PATH_RESPONSE
                 0x1c | 0x1d => {
-                    let _connection_close = ConnectionCloseFrame::from_bytes(&frame_code, payload);
+                    let _connection_close =
+                        ConnectionCloseFrame::from_bytes(&frame_code, &mut payload);
                 } //CONNECTION_CLOSE_FRAME
                 0x1e => {
-                    //self.handshake_done = true;
+                    if self.side == Side::Server {
+                        eprintln!("Received HANDSHAKE_DONE frame as server");
+                        self.transmit_ready(terror::QuicTransportError::ProtocolViolation);
+                        continue;
+                    }
+
+                    self.transmit_ready(terror::QuicTransportError::NoError);
                 } // HANDSHAKE_DONE
                 _ => eprintln!(
                     "Error while processing frames: unrecognised frame {:#x} at {:#x}",
@@ -700,6 +729,17 @@ impl Inner {
             self.packet_spaces[self.current_space]
                 .outgoing_acks
                 .push(header.packet_num.into());
+        }
+
+        Ok(())
+    }
+
+    fn transmit_ready(&mut self, error_code: terror::QuicTransportError) {
+        let (tx, _) = oneshot::channel::<terror::QuicTransportError>();
+        let ready = std::mem::replace(&mut self.conn_ready, tx);
+
+        if let Err(err) = ready.send(error_code) {
+            eprintln!("receiver of oneshot channel \"ready\" dropped {}", err);
         }
     }
 
@@ -723,7 +763,7 @@ impl Inner {
             || has_server_name
             || !self.tls_session.is_handshaking()
         {
-            println!("Handshake data has been read and proccessed successfully");
+            println!("Handshake data has been proccessed successfully");
             let _ = true;
         }
     }
@@ -763,12 +803,6 @@ impl Inner {
 
         //"upgrade" to next packet number space with new keying material
         self.packet_spaces[self.current_space + 1].keys = Some(keys);
-
-        println!(
-            "generated server hello (len {:x?}): {:x?}",
-            buf.len(),
-            buf.to_vec()
-        );
 
         //advance space
         self.current_space += 1;

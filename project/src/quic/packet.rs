@@ -24,8 +24,6 @@ pub type InitialDatagram = (
     std::sync::Arc<tokio::net::UdpSocket>,
 );
 
-//static dispatch in favor of dynamic dispatch to increase performance at the cost of (manageable)
-//binary bloat
 pub fn encode_frame<T: Frame>(
     frame: &T,
     bytes: &mut octets::OctetsMut<'_>,
