@@ -363,7 +363,7 @@ impl Connection {
 
         let initial_space: PacketNumberSpace = PacketNumberSpace {
             keys: Some(ikp),
-            ..PacketNumberSpace::new(true)
+            ..PacketNumberSpace::new()
         };
 
         let (transmit_q, recv_q) = mpsc::channel::<packet::EarlyDatagram>(8);
@@ -562,8 +562,8 @@ impl Inner {
             rscid: None,
             packet_spaces: [
                 initial_space,
-                PacketNumberSpace::new(true),
-                PacketNumberSpace::new(false),
+                PacketNumberSpace::new(),
+                PacketNumberSpace::new(),
             ],
             current_space: SPACE_ID_INITIAL,
             remote: remote_address,
@@ -590,9 +590,9 @@ impl Inner {
         //initial packet cant be coalesced, TODO investigate for 0-rtt
         self.process_payload(header, packet_raw)?;
 
-        self.generate_crypto_data();
+        self.generate_crypto_data(SPACE_ID_INITIAL);
+        self.generate_crypto_data(SPACE_ID_HANDSHAKE);
 
-        // generate crypto data again for ee, cert, cv, fin
         Ok(())
     }
 
@@ -768,44 +768,50 @@ impl Inner {
         }
     }
 
-    fn generate_crypto_data(&mut self) {
-        //get mutable reference to crypto buffer
-        let buf: &mut Vec<u8> = self.packet_spaces[self.current_space]
-            .outgoing_crypto_data
-            .as_mut()
-            .unwrap();
+    fn generate_crypto_data(&mut self, space_id: usize) {
+        let mut buf: Vec<u8> = Vec::new();
 
-        //writing handshake data prompts a keychange because the packet number spce is promoted
-        let kc = match self.tls_session.write_hs(buf) {
-            Some(kc) => kc,
-            None => panic!("Error writing handshake data"),
-        };
+        //writing handshake data prompts a keychange because the packet number space is promoted
+        if let Some(kc) = self.tls_session.write_hs(&mut buf) {
+            //get keys from keychange
+            let keys = match kc {
+                KeyChange::Handshake { keys } => keys,
+                KeyChange::OneRtt { keys, next } => {
+                    self.next_secrets = Some(next);
+                    keys
+                }
+            };
 
-        //get keys from keychange
-        let keys = match kc {
-            KeyChange::Handshake { keys } => keys,
-            KeyChange::OneRtt { keys, next } => {
-                self.next_secrets = Some(next);
-                //connection may be established here, investigate
-                keys
+            // if space id is DATA, only the packet payload keys update, not the header keys
+            if (space_id + 1) == SPACE_ID_DATA {
+                self.next_1rtt_keys = Some(
+                    self.next_secrets
+                        .as_mut()
+                        .expect("handshake should be completed and next secrets availible")
+                        .next_packet_keys(),
+                )
             }
+
+            //"upgrade" to next packet number space with new keying material
+            self.packet_spaces[space_id + 1].keys = Some(keys);
+
+            //advance space
+            self.current_space = space_id + 1;
         };
 
-        // if space id is DATA, only the packet payload keys update, not the header keys
-        if (self.current_space + 1) == SPACE_ID_DATA {
-            self.next_1rtt_keys = Some(
-                self.next_secrets
-                    .as_mut()
-                    .expect("handshake should be completed and next secrets availible")
-                    .next_packet_keys(),
-            )
+        if buf.is_empty() && space_id == self.current_space {
+            return;
         }
 
-        //"upgrade" to next packet number space with new keying material
-        self.packet_spaces[self.current_space + 1].keys = Some(keys);
+        println!("generated crypto data {:x?}", buf);
 
-        //advance space
-        self.current_space += 1;
+        //create outgoing crypto frame
+        let offset = self.packet_spaces[space_id].outgoing_crypto_offset;
+        let length = buf.len() as u64;
+        self.packet_spaces[space_id]
+            .outgoing_crypto
+            .push(packet::CryptoFrame::new(offset, buf));
+        self.packet_spaces[space_id].outgoing_crypto_offset += length;
     }
 
     fn fill_datagram(&mut self, buffer: &mut [u8]) -> Result<usize, terror::Error> {
@@ -831,7 +837,7 @@ impl Inner {
         //calculate packet number length
         let mut packet_num_length: u8 = 0;
         match self.packet_spaces[packet_number_space].next_pkt_num {
-            0x00..=0xff => packet_num_length = 0,
+            0x00..=0xff => (),
             0x0100..=0xffff => packet_num_length = 1,
             0x010000..=0xffffff => packet_num_length = 2,
             0x01000000..=0xffffffff => packet_num_length = 3,
@@ -914,7 +920,7 @@ impl Inner {
         let mut size = 0;
 
         //CRYPTO
-        if let Some(crypto_buffer) = &self.packet_spaces[packet_number_space].outgoing_crypto_data {
+        /*if let Some(crypto_buffer) = &self.packet_spaces[packet_number_space].outgoing_crypto_data {
             if !crypto_buffer.is_empty() {
                 let s =
                     match packet::encode_frame(&CryptoFrame::new(0, crypto_buffer.to_vec()), buf) {
@@ -929,7 +935,7 @@ impl Inner {
                 println!("wrote crypto frame with size {:?}", s);
                 size += s;
             }
-        }
+        }*/
 
         //ACK
         if !self.packet_spaces[packet_number_space]
@@ -983,21 +989,19 @@ struct PacketNumberSpace {
 
     outgoing_acks: Vec<u64>,
 
-    //TODO make arc around vec to avoid copying
-    outgoing_crypto_data: Option<Vec<u8>>,
+    outgoing_crypto: Vec<packet::CryptoFrame>,
+    outgoing_crypto_offset: u64,
 
     next_pkt_num: u32,
 }
 
 impl PacketNumberSpace {
-    fn new(with_crypto_buffer: bool) -> Self {
+    fn new() -> Self {
         Self {
             keys: None,
             outgoing_acks: Vec::new(),
-            outgoing_crypto_data: match with_crypto_buffer {
-                true => Some(Vec::new()),
-                false => None,
-            },
+            outgoing_crypto: Vec::new(),
+            outgoing_crypto_offset: 0,
             next_pkt_num: 0,
         }
     }
