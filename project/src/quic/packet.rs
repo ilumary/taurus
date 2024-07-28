@@ -6,7 +6,7 @@ const MAX_PKT_NUM_LEN: u8 = 4;
 const SAMPLE_LEN: usize = 16;
 
 pub const LS_TYPE_BIT: u8 = 0x80;
-const TYPE_MASK: u8 = 0x30;
+const LONG_PACKET_TYPE: u8 = 0x30;
 const PKT_NUM_LENGTH_MASK: u8 = 0x03;
 
 //packet and address, either source or destination
@@ -23,6 +23,153 @@ pub type InitialDatagram = (
     TSDistributor,
     std::sync::Arc<tokio::net::UdpSocket>,
 );
+
+pub struct PacketBuilder {
+    datagram: Vec<u8>,
+    body: Vec<u8>,
+
+    packet_count: u32,
+
+    // referring to current packet beeing built
+    quic_version: u32,
+    header: Header,
+    offset: usize,
+}
+
+impl PacketBuilder {
+    pub fn new(quic_version: u32) -> Self {
+        Self {
+            datagram: Vec::new(),
+            body: Vec::new(),
+            packet_count: 0,
+            quic_version,
+            header: Header::default(),
+            offset: 0,
+        }
+    }
+
+    pub fn packet(mut self) -> PacketBodyBuilder {
+        self.packet_count += 1;
+        PacketBodyBuilder { pkb: self }
+    }
+
+    pub fn to_datagram(self, address: String) -> Datagram {
+        assert!(
+            self.packet_count > 0,
+            "cant build datagram with zero packets"
+        );
+        (self.datagram, address)
+    }
+}
+
+pub struct PacketBodyBuilder {
+    pkb: PacketBuilder,
+}
+
+impl PacketBodyBuilder {
+    pub fn with_body(mut self, body: Vec<u8>) -> PacketHeaderBuilder {
+        self.pkb.body = body;
+        PacketHeaderBuilder { pkb: self.pkb }
+    }
+}
+
+pub struct PacketHeaderBuilder {
+    pkb: PacketBuilder,
+}
+
+impl PacketHeaderBuilder {
+    pub fn with_long_header(
+        mut self,
+        long_header_type: u8,
+        packet_number: u32,
+        dcid: &ConnectionId,
+        scid: &ConnectionId,
+        token: Option<Vec<u8>>,
+    ) -> Result<PacketFinalizer, terror::Error> {
+        let packet_number_length = Header::calculate_pn_length(packet_number);
+        let packet_length = self.pkb.body.len() + (packet_number_length + 1) as usize;
+
+        let header = Header::new_long_header(
+            long_header_type,
+            self.pkb.quic_version,
+            packet_number,
+            dcid,
+            scid,
+            token,
+            packet_length,
+        )?;
+
+        self.pkb.header = header;
+        Ok(PacketFinalizer { pkb: self.pkb })
+    }
+
+    pub fn with_short_header(
+        mut self,
+        packet_number: u32,
+        dcid: &ConnectionId,
+        spin_bit: u8,
+        key_phase: u8,
+    ) -> Result<PacketFinalizer, terror::Error> {
+        let header = Header::new_short_header(
+            spin_bit,
+            key_phase,
+            self.pkb.quic_version,
+            packet_number,
+            dcid,
+        )?;
+
+        self.pkb.header = header;
+        Ok(PacketFinalizer { pkb: self.pkb })
+    }
+}
+
+pub struct PacketFinalizer {
+    pkb: PacketBuilder,
+}
+
+impl PacketFinalizer {
+    fn encode(&mut self) -> Result<(), octets::BufferTooShortError> {
+        //calculate required buffer length
+        let mut required_space = self.pkb.header.raw_length
+            + self.pkb.header.packet_num_length as usize
+            + 1
+            + self.pkb.body.len();
+
+        //check for minimum size
+        if required_space < 1200 {
+            required_space = 1200;
+            self.pkb.header.length = 1200 - self.pkb.header.raw_length;
+        }
+
+        self.pkb
+            .datagram
+            .resize(self.pkb.datagram.len() + required_space, 0x00);
+
+        let mut b = octets::OctetsMut::with_slice(&mut self.pkb.datagram);
+        b.skip(self.pkb.offset)?;
+
+        //encode header
+        self.pkb.header.to_bytes(&mut b)?;
+
+        //encode body
+        b.put_bytes(&self.pkb.body).unwrap();
+
+        //update offset to allow for packet coalescing
+        self.pkb.offset = b.off();
+
+        Ok(())
+    }
+
+    pub fn finalize(
+        mut self,
+        keys: &rustls::quic::Keys,
+    ) -> Result<PacketBuilder, octets::BufferTooShortError> {
+        self.encode()?;
+        //TODO encrypt
+
+        Ok(self.pkb)
+    }
+}
 
 pub fn encode_frame<T: Frame>(
     frame: &T,
@@ -375,8 +522,11 @@ impl Frame for ConnectionCloseFrame {
     }
 }
 
+//TODO add retry token and long header type
+#[derive(Default)]
 pub struct Header {
-    pub hf: u8, //header form and version specific bits
+    //header form and version specific bits
+    pub hf: u8,
     pub version: u32,
     pub dcid: ConnectionId,
     pub scid: Option<ConnectionId>,
@@ -387,7 +537,7 @@ pub struct Header {
     pub packet_num_length: u8,
 
     //packet length including packet_num
-    pub packet_length: usize,
+    pub length: usize,
 
     //header length excluding packet num
     pub raw_length: usize,
@@ -396,7 +546,6 @@ pub struct Header {
 impl Header {
     pub fn new_long_header(
         long_header_type: u8,
-        packet_num_length: u8,
         version: u32,
         packet_num: u32,
         dcid: &ConnectionId,
@@ -411,17 +560,32 @@ impl Header {
             )));
         }
 
-        if !matches!(packet_num_length, 0x00..=MAX_PKT_NUM_LEN) {
-            return Err(terror::Error::header_encoding_error(format!(
-                "unsupported packet number length {:?}",
-                packet_num_length
-            )));
+        if long_header_type == 0x00 && token.is_none() {
+            return Err(terror::Error::header_encoding_error(
+                "token required for initial header",
+            ));
         }
+
+        let mut raw_length = 1 + 4 + 1 + dcid.len() + 1 + scid.len();
+
+        if long_header_type == 0x00 {
+            // token length is encoded as variable length integer
+            let token_length_length = match token.as_ref().unwrap().len() {
+                0..=63 => 1,
+                64..=16383 => 2,
+                16384..=1073741823 => 3,
+                _ => unreachable!("token size exceeded abnormally large size"),
+            };
+
+            raw_length += token_length_length + token.as_ref().unwrap().len();
+        }
+
+        //variable length packet length always encoded as length 4
+        raw_length += 4;
 
         Ok(Header::new(
             0x01,
             long_header_type,
-            packet_num_length,
             0x00,
             0x00,
             version,
@@ -430,17 +594,16 @@ impl Header {
             packet_num,
             token,
             packet_length,
+            raw_length,
         ))
     }
 
     pub fn new_short_header(
-        packet_num_length: u8,
         spin_bit: u8,
         key_phase: u8,
         version: u32,
         packet_num: u32,
         dcid: &ConnectionId,
-        packet_length: usize,
     ) -> Result<Self, terror::Error> {
         if !matches!(spin_bit, 0x00 | 0x01) {
             return Err(terror::Error::header_encoding_error(format!(
@@ -456,25 +619,10 @@ impl Header {
             )));
         }
 
-        if !matches!(packet_num_length, 0x00..=MAX_PKT_NUM_LEN) {
-            return Err(terror::Error::header_encoding_error(format!(
-                "unsupported packet number length {:?}",
-                packet_num_length
-            )));
-        }
+        let raw_length = 1 + dcid.len();
 
         Ok(Header::new(
-            0x00,
-            0x00,
-            packet_num_length,
-            spin_bit,
-            key_phase,
-            version,
-            dcid,
-            None,
-            packet_num,
-            None,
-            packet_length,
+            0x00, 0x00, spin_bit, key_phase, version, dcid, None, packet_num, None, 0, raw_length,
         ))
     }
 
@@ -482,7 +630,6 @@ impl Header {
     fn new(
         header_form: u8,
         long_header_type: u8,
-        packet_num_length: u8,
         spin_bit: u8,
         key_phase: u8,
         version: u32,
@@ -490,8 +637,10 @@ impl Header {
         scid: Option<&ConnectionId>,
         packet_num: u32,
         token: Option<Vec<u8>>,
-        packet_length: usize,
+        length: usize,
+        raw_length: usize,
     ) -> Self {
+        let packet_num_length = Header::calculate_pn_length(packet_num);
         let mut hf: u8 = 0x00;
 
         //set header form bit
@@ -516,8 +665,8 @@ impl Header {
             packet_num,
             packet_num_length,
             token,
-            packet_length,
-            raw_length: 0, //TODO
+            length,
+            raw_length,
         }
     }
 
@@ -567,13 +716,16 @@ impl Header {
             b.put_bytes(scid.as_slice())?;
 
             //initial
-            if let Some(token) = &self.token {
-                b.put_varint(token.len().try_into().unwrap())?;
+            if ((self.hf & LONG_PACKET_TYPE) >> 4) == 0x00 {
+                let token = self.token.as_ref().unwrap();
+                let token_length = token.len();
+
+                b.put_varint(token_length.try_into().unwrap())?;
                 b.put_bytes(token)?;
             }
 
-            //packet length
-            b.put_varint(self.packet_length as u64)?;
+            //packet length, always write as 4 byte varint to allow for later
+            b.put_varint_with_len(self.length as u64, 4)?;
         } else {
             //short header
             b.put_bytes(self.dcid.as_slice())?;
@@ -612,7 +764,7 @@ impl Header {
                 packet_num: 0,
                 packet_num_length: 0,
                 token: None,
-                packet_length: 0, //TODO
+                length: 0, //TODO
                 raw_length: b.off(),
             });
         }
@@ -627,7 +779,7 @@ impl Header {
 
         let mut tok: Option<Vec<u8>> = None;
 
-        match (hf & TYPE_MASK) >> 4 {
+        match (hf & LONG_PACKET_TYPE) >> 4 {
             0x00 => {
                 // Initial
                 tok = Some(b.get_bytes_with_varint_length()?.to_vec());
@@ -638,7 +790,7 @@ impl Header {
             _ => panic!("Fatal Error with packet type"),
         }
 
-        let pkt_length = b.get_varint()?;
+        let length = b.get_varint()? as usize;
 
         Ok(Header {
             hf,
@@ -648,7 +800,7 @@ impl Header {
             packet_num: 0,
             packet_num_length: 0,
             token: tok,
-            packet_length: pkt_length as usize,
+            length,
             raw_length: b.off(),
         })
     }
@@ -657,10 +809,19 @@ impl Header {
         ((self.hf & LS_TYPE_BIT) >> 7) == 1
     }
 
+    pub fn calculate_pn_length(packet_number: u32) -> u8 {
+        match packet_number {
+            0x00..=0xff => 0,
+            0x0100..=0xffff => 1,
+            0x010000..=0xffffff => 2,
+            0x01000000..=0xffffffff => 3,
+        }
+    }
+
     pub fn debug_print(&self) {
         println!(
             "{:#04x?} version: {:#06x?} pn: {:#010x?} dcid: 0x{} scid: 0x{} token:{:x?} length:{:?} raw_length:{:?}",
-            ((self.hf & TYPE_MASK) >> 4),
+            ((self.hf & LONG_PACKET_TYPE) >> 4),
             self.version,
             self.packet_num,
             self.dcid
@@ -678,7 +839,7 @@ impl Header {
                 .collect::<Vec<String>>()
                 .join(""),
             self.token.as_ref().unwrap(),
-            self.packet_length,
+            self.length,
             self.raw_length,
         );
     }
@@ -692,7 +853,7 @@ mod tests {
 
     //TODO expand to other packet types through all pns
     #[test]
-    fn test_header_decoding() {
+    fn test_intial_header_decoding_server_side() {
         let mut head_raw: [u8; 64] = [
             0xc3, 0x00, 0x00, 0x00, 0x01, 0x14, 0x8b, 0x36, 0x1e, 0xd4, 0x6c, 0xbf, 0xde, 0x7f,
             0xa3, 0x7e, 0xb4, 0xd6, 0xb9, 0xa6, 0x68, 0xf4, 0x49, 0x3e, 0x75, 0xf6, 0x08, 0x21,
@@ -732,7 +893,7 @@ mod tests {
         assert_eq!(partial_decode.version, 1);
         assert_eq!(partial_decode.packet_num, 0);
         assert_eq!(partial_decode.packet_num_length, 0);
-        assert_eq!(partial_decode.packet_length, 1162);
+        assert_eq!(partial_decode.length, 1162);
         assert_eq!(partial_decode.raw_length, 38);
     }
 
@@ -757,5 +918,126 @@ mod tests {
         assert_eq!(ack.first_ack_range, 1);
         assert_eq!(ack.ack_range_count, 1);
         assert_eq!(ack.ack_ranges[0], (5, 3));
+    }
+
+    #[test]
+    fn test_long_initial_header_creation() {
+        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
+        let header = Header::new_long_header(0x00, 1, 0, &dcid, &scid, Some(vec![]), 1201).unwrap();
+
+        let mut vec = vec![0u8; 29];
+
+        let mut b = octets::OctetsMut::with_slice(&mut vec);
+
+        header.to_bytes(&mut b).unwrap();
+
+        let expected = vec![
+            0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
+            0x08, 0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b, 0x00, 0x80, 0x00, 0x04, 0xb1,
+            0x00,
+        ];
+
+        assert_eq!(vec, expected);
+        assert_eq!(header.raw_length, 28);
+    }
+
+    //#[test]
+    //fn test_long_retry_header_creation() {}
+
+    #[test]
+    fn test_long_handshake_header_creation() {
+        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
+        let header = Header::new_long_header(0x02, 1, 1, &dcid, &scid, None, 3200).unwrap();
+
+        let mut vec = vec![0u8; 28];
+
+        let mut b = octets::OctetsMut::with_slice(&mut vec);
+
+        header.to_bytes(&mut b).unwrap();
+
+        let expected = vec![
+            0xe0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
+            0x08, 0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b, 0x80, 0x00, 0x0c, 0x80, 0x01,
+        ];
+
+        assert_eq!(vec, expected);
+        assert_eq!(header.raw_length, 27);
+    }
+
+    #[test]
+    fn test_long_zero_rtt_header_creation() {
+        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
+        let header = Header::new_long_header(0x01, 1, 0, &dcid, &scid, None, 3200).unwrap();
+
+        let mut vec = vec![0u8; 28];
+
+        let mut b = octets::OctetsMut::with_slice(&mut vec);
+
+        header.to_bytes(&mut b).unwrap();
+
+        let expected = vec![
+            0xd0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
+            0x08, 0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b, 0x80, 0x00, 0x0c, 0x80, 0x00,
+        ];
+
+        assert_eq!(vec, expected);
+        assert_eq!(header.raw_length, 27);
+    }
+
+    #[test]
+    fn test_short_header_creation() {
+        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let header = Header::new_short_header(0x00, 0x01, 1, 380, &dcid).unwrap();
+
+        let mut vec = vec![0u8; 11];
+
+        let mut b = octets::OctetsMut::with_slice(&mut vec);
+
+        header.to_bytes(&mut b).unwrap();
+
+        let expected = vec![
+            0x45, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef, 0x01, 0x7c,
+        ];
+
+        assert_eq!(vec, expected);
+        assert_eq!(header.raw_length, 9);
+    }
+
+    #[test]
+    fn test_packet_builder_builds_initial_packet_with_minimum_size() {
+        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
+
+        let body = vec![
+            0x06, 0x01, 0x00, 0x01, 0x03, 0x03, 0x03, 0x92, 0x2f, 0x01, 0x2b, 0xd7, 0x8b, 0x30,
+            0xaa, 0xbd, 0xa6, 0x7c, 0x7a, 0x62, 0x75, 0xce, 0x4a, 0xbc, 0x3e, 0xd4, 0xa4, 0x23,
+            0xe1, 0x03, 0xcc, 0xef, 0x4c, 0x9f, 0xcb, 0x28, 0xa4, 0x08, 0x97, 0x00, 0x00, 0x08,
+            0x13, 0x02, 0x13, 0x01, 0x13, 0x03, 0x00, 0xff, 0x01, 0x00, 0x00, 0xd2, 0x00, 0x39,
+        ];
+
+        let pkb = PacketBuilder::new(1);
+
+        let mut fin = pkb
+            .packet()
+            .with_body(body)
+            .with_long_header(0x00, 0, &dcid, &scid, Some(vec![]))
+            .unwrap();
+        fin.encode().unwrap();
+
+        let mut expected: Vec<u8> = vec![
+            0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
+            0x08, 0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b, 0x00, 0x80, 0x00, 0x04, 0x94,
+            0x00, 0x06, 0x01, 0x00, 0x01, 0x03, 0x03, 0x03, 0x92, 0x2f, 0x01, 0x2b, 0xd7, 0x8b,
+            0x30, 0xaa, 0xbd, 0xa6, 0x7c, 0x7a, 0x62, 0x75, 0xce, 0x4a, 0xbc, 0x3e, 0xd4, 0xa4,
+            0x23, 0xe1, 0x03, 0xcc, 0xef, 0x4c, 0x9f, 0xcb, 0x28, 0xa4, 0x08, 0x97, 0x00, 0x00,
+            0x08, 0x13, 0x02, 0x13, 0x01, 0x13, 0x03, 0x00, 0xff, 0x01, 0x00, 0x00, 0xd2, 0x00,
+            0x39,
+        ];
+        expected.resize(1200, 0x00);
+
+        assert_eq!(fin.pkb.datagram, expected);
     }
 }
