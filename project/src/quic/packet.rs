@@ -2,12 +2,17 @@ use crate::{terror, token::StatelessResetToken, ConnectionId, TSDistributor};
 
 use rustls::quic::HeaderProtectionKey;
 
+use std::marker::PhantomData;
+
 const MAX_PKT_NUM_LEN: u8 = 4;
 const SAMPLE_LEN: usize = 16;
 
 pub const LS_TYPE_BIT: u8 = 0x80;
 const LONG_PACKET_TYPE: u8 = 0x30;
 const PKT_NUM_LENGTH_MASK: u8 = 0x03;
+
+pub const LONG_HEADER_TYPE_INITIAL: u8 = 0x00;
+pub const LONG_HEADER_TYPE_HANDSHAKE: u8 = 0x02;
 
 //packet and address, either source or destination
 pub type Datagram = (Vec<u8>, String);
@@ -24,74 +29,81 @@ pub type InitialDatagram = (
     std::sync::Arc<tokio::net::UdpSocket>,
 );
 
-pub struct PacketBuilder {
-    datagram: Vec<u8>,
-    body: Vec<u8>,
+//Required for full packet
+pub struct PacketBody;
+pub struct PacketHeader;
+pub struct PacketEncoder;
+pub type Completed = (PacketBody, PacketHeader, PacketEncoder);
 
-    packet_count: u32,
+//Packet Builder
+pub struct PacketBuilder<'a, S = ((), (), ())> {
+    dgram: &'a mut [u8],
 
-    // referring to current packet beeing built
-    quic_version: u32,
+    //packet
     header: Header,
-    offset: usize,
+    body: Vec<u8>,
+    packet_length: usize,
+    quic_version: u32,
+
+    // header_end incl. packet number
+    header_end_off: usize,
+
+    // required because we never use the zero-sized types
+    phantom: PhantomData<S>,
 }
 
-impl PacketBuilder {
-    pub fn new(quic_version: u32) -> Self {
-        Self {
-            datagram: Vec::new(),
-            body: Vec::new(),
-            packet_count: 0,
-            quic_version,
-            header: Header::default(),
-            offset: 0,
-        }
-    }
-
-    pub fn packet(mut self) -> PacketBodyBuilder {
-        self.packet_count += 1;
-        PacketBodyBuilder { pkb: self }
-    }
-
-    pub fn to_datagram(self, address: String) -> Datagram {
-        assert!(
-            self.packet_count > 0,
-            "cant build datagram with zero packets"
-        );
-        (self.datagram, address)
-    }
-}
-
-pub struct PacketBodyBuilder {
-    pkb: PacketBuilder,
-}
-
-impl PacketBodyBuilder {
-    pub fn with_body(mut self, body: Vec<u8>) -> PacketHeaderBuilder {
-        self.pkb.body = body;
-        PacketHeaderBuilder { pkb: self.pkb }
+// private to control how Thing can be constructed
+fn new_packet_builder<S>(
+    dgram: &mut [u8],
+    header: Header,
+    body: Vec<u8>,
+    packet_length: usize,
+    quic_version: u32,
+    header_end_off: usize,
+) -> PacketBuilder<S> {
+    PacketBuilder {
+        dgram,
+        header,
+        body,
+        packet_length,
+        quic_version,
+        header_end_off,
+        phantom: PhantomData,
     }
 }
 
-pub struct PacketHeaderBuilder {
-    pkb: PacketBuilder,
+impl<'a> PacketBuilder<'a> {
+    pub fn new(quic_version: u32, dgram: &'a mut [u8]) -> Self {
+        new_packet_builder(dgram, Header::default(), Vec::new(), 1200, quic_version, 0)
+    }
 }
 
-impl PacketHeaderBuilder {
+impl<'a, B, H, C> PacketBuilder<'a, (B, H, C)> {
+    pub fn with_body(self, body: Vec<u8>) -> PacketBuilder<'a, (PacketBody, H, C)> {
+        new_packet_builder(
+            self.dgram,
+            self.header,
+            body,
+            self.packet_length,
+            self.quic_version,
+            self.header_end_off,
+        )
+    }
+
     pub fn with_long_header(
-        mut self,
+        self,
         long_header_type: u8,
         packet_number: u32,
         dcid: &ConnectionId,
         scid: &ConnectionId,
         token: Option<Vec<u8>>,
-    ) -> Result<PacketFinalizer, terror::Error> {
+    ) -> Result<PacketBuilder<'a, (B, PacketHeader, C)>, terror::Error> {
         let packet_number_length = Header::calculate_pn_length(packet_number);
-        let packet_length = self.pkb.body.len() + (packet_number_length + 1) as usize;
+        let packet_length = self.body.len() + (packet_number_length + 1) as usize;
 
         let header = Header::new_long_header(
             long_header_type,
-            self.pkb.quic_version,
+            self.quic_version,
             packet_number,
             dcid,
             scid,
@@ -99,75 +111,133 @@ impl PacketHeaderBuilder {
             packet_length,
         )?;
 
-        self.pkb.header = header;
-        Ok(PacketFinalizer { pkb: self.pkb })
+        Ok(new_packet_builder(
+            self.dgram,
+            header,
+            self.body,
+            self.packet_length,
+            self.quic_version,
+            self.header_end_off,
+        ))
     }
 
     pub fn with_short_header(
-        mut self,
+        self,
         packet_number: u32,
-        dcid: &ConnectionId,
+        dcid: &'a ConnectionId,
         spin_bit: u8,
         key_phase: u8,
-    ) -> Result<PacketFinalizer, terror::Error> {
-        let header = Header::new_short_header(
-            spin_bit,
-            key_phase,
-            self.pkb.quic_version,
-            packet_number,
-            dcid,
-        )?;
+    ) -> Result<PacketBuilder<(B, PacketHeader, C)>, terror::Error> {
+        let header =
+            Header::new_short_header(spin_bit, key_phase, self.quic_version, packet_number, dcid)?;
 
-        self.pkb.header = header;
-        Ok(PacketFinalizer { pkb: self.pkb })
+        Ok(new_packet_builder(
+            self.dgram,
+            header,
+            self.body,
+            self.packet_length,
+            self.quic_version,
+            self.header_end_off,
+        ))
     }
 }
 
-pub struct PacketFinalizer {
-    pkb: PacketBuilder,
-}
-
-impl PacketFinalizer {
-    fn encode(&mut self) -> Result<(), octets::BufferTooShortError> {
+impl<'a, E> PacketBuilder<'a, (PacketBody, PacketHeader, E)> {
+    // encodes the packet and its header into the datagram, can only be called after body and
+    // header have been specified
+    pub fn encode(mut self) -> Result<(usize, PacketBuilder<'a, Completed>), terror::Error> {
         //calculate required buffer length
-        let mut required_space = self.pkb.header.raw_length
-            + self.pkb.header.packet_num_length as usize
-            + 1
-            + self.pkb.body.len();
+        let mut required_space =
+            self.header.raw_length + self.header.packet_num_length as usize + 1 + self.body.len();
 
         //check for minimum size
         if required_space < 1200 {
             required_space = 1200;
-            self.pkb.header.length = 1200 - self.pkb.header.raw_length;
+            self.header.length = 1200 - self.header.raw_length;
         }
 
-        self.pkb
-            .datagram
-            .resize(self.pkb.datagram.len() + required_space, 0x00);
+        if self.dgram.len() < required_space {
+            return Err(terror::Error::buffer_size_error(
+                "Datagram buffer has insufficient remaining size for packet",
+            ));
+        }
 
-        let mut b = octets::OctetsMut::with_slice(&mut self.pkb.datagram);
-        b.skip(self.pkb.offset)?;
+        let mut b = octets::OctetsMut::with_slice(self.dgram);
 
         //encode header
-        self.pkb.header.to_bytes(&mut b)?;
+        if let Err(err) = self.header.to_bytes(&mut b) {
+            return Err(terror::Error::buffer_size_error(format!(
+                "Fatal error while encoding header: {}",
+                err
+            )));
+        }
+
+        self.header_end_off = b.off();
 
         //encode body
-        b.put_bytes(&self.pkb.body).unwrap();
+        if let Err(err) = b.put_bytes(&self.body) {
+            return Err(terror::Error::buffer_size_error(format!(
+                "Fatal error while encoding packet body: {}",
+                err
+            )));
+        }
 
-        //update offset to allow for packet coalescing
-        self.pkb.offset = b.off();
+        assert!(b.off() <= required_space, "Fatal error");
+
+        if b.off() < required_space {
+            b.skip(required_space - b.off()).unwrap();
+        }
+
+        Ok((
+            b.off(),
+            new_packet_builder(
+                self.dgram,
+                self.header,
+                self.body,
+                self.packet_length,
+                self.quic_version,
+                self.header_end_off,
+            ),
+        ))
+    }
+}
+
+impl<'a> PacketBuilder<'a, Completed> {
+    //encrypts the packet, and returns new PacketBuilder in original state
+    pub fn encrypt(self, keys: &'a rustls::quic::Keys) -> Result<(), terror::Error> {
+        //isolate actual package
+        let (dgram, _) = self.dgram.split_at_mut(self.packet_length);
+
+        println!("NON ENCRYPT: {:x?}", &dgram);
+
+        //encrypts the packet payload and copies the tag into the buffer
+        let (header, payload_tag) = dgram.split_at_mut(self.header_end_off);
+        let (payload, tag_storage) =
+            payload_tag.split_at_mut(payload_tag.len() - keys.local.packet.tag_len());
+        let tag = keys
+            .local
+            .packet
+            .encrypt_in_place(self.header.packet_num as u64, &*header, payload)
+            .unwrap();
+        tag_storage.copy_from_slice(tag.as_ref());
+
+        //encrypts the header
+        let pn_offset = self.header_end_off - (self.header.packet_num_length as usize + 1);
+        let (header, sample) = dgram.split_at_mut(pn_offset + 4);
+        let (first, rest) = header.split_at_mut(1);
+        let pn_end = Ord::min(pn_offset + 3, rest.len());
+        keys.local
+            .header
+            .encrypt_in_place(
+                &sample[..keys.local.header.sample_len()],
+                &mut first[0],
+                &mut rest[pn_offset - 1..pn_end],
+            )
+            .unwrap();
+
+        println!("ENCRYPT: {:x?}", &dgram);
 
         Ok(())
-    }
-
-    pub fn finalize(
-        mut self,
-        keys: &rustls::quic::Keys,
-    ) -> Result<PacketBuilder, octets::BufferTooShortError> {
-        self.encode()?;
-        //TODO encrypt
-
-        Ok(self.pkb)
     }
 }
 
@@ -1018,14 +1088,16 @@ mod tests {
             0x13, 0x02, 0x13, 0x01, 0x13, 0x03, 0x00, 0xff, 0x01, 0x00, 0x00, 0xd2, 0x00, 0x39,
         ];
 
-        let pkb = PacketBuilder::new(1);
+        let mut result = vec![0u8; 2048];
 
-        let mut fin = pkb
-            .packet()
+        let pkb = PacketBuilder::new(1, &mut result);
+
+        let (len, _) = pkb
             .with_body(body)
             .with_long_header(0x00, 0, &dcid, &scid, Some(vec![]))
+            .unwrap()
+            .encode()
             .unwrap();
-        fin.encode().unwrap();
 
         let mut expected: Vec<u8> = vec![
             0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
@@ -1038,6 +1110,56 @@ mod tests {
         ];
         expected.resize(1200, 0x00);
 
-        assert_eq!(fin.pkb.datagram, expected);
+        assert_eq!(result[..len], expected);
+    }
+
+    #[test]
+    fn test_coalesced_packet_building() {
+        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
+        let body = vec![
+            0x06, 0x01, 0x00, 0x01, 0x03, 0x03, 0x03, 0x92, 0x2f, 0x01, 0x2b, 0xd7, 0x8b, 0x30,
+            0xaa, 0xbd, 0xa6, 0x7c, 0x7a, 0x62, 0x75, 0xce, 0x4a, 0xbc, 0x3e, 0xd4, 0xa4, 0x23,
+            0xe1, 0x03, 0xcc, 0xef, 0x4c, 0x9f, 0xcb, 0x28, 0xa4, 0x08, 0x97, 0x00, 0x00, 0x08,
+            0x13, 0x02, 0x13, 0x01, 0x13, 0x03, 0x00, 0xff, 0x01, 0x00, 0x00, 0xd2, 0x00, 0x39,
+        ];
+
+        let mut result = vec![0u8; 4096];
+        let mut offset = 0;
+
+        let pkb1 = PacketBuilder::new(1, &mut result[offset..]);
+        if let Ok((len1, _)) = pkb1
+            .with_body(body.clone())
+            .with_long_header(0x00, 0, &dcid, &scid, Some(vec![]))
+            .unwrap()
+            .encode()
+        {
+            offset += len1;
+        }
+
+        let pkb2 = PacketBuilder::new(1, &mut result[offset..]);
+        if let Ok((len2, _)) = pkb2
+            .with_body(body.clone())
+            .with_long_header(0x00, 0, &dcid, &scid, Some(vec![]))
+            .unwrap()
+            .encode()
+        {
+            offset += len2;
+        }
+
+        let mut expected: Vec<u8> = vec![
+            0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
+            0x08, 0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b, 0x00, 0x80, 0x00, 0x04, 0x94,
+            0x00, 0x06, 0x01, 0x00, 0x01, 0x03, 0x03, 0x03, 0x92, 0x2f, 0x01, 0x2b, 0xd7, 0x8b,
+            0x30, 0xaa, 0xbd, 0xa6, 0x7c, 0x7a, 0x62, 0x75, 0xce, 0x4a, 0xbc, 0x3e, 0xd4, 0xa4,
+            0x23, 0xe1, 0x03, 0xcc, 0xef, 0x4c, 0x9f, 0xcb, 0x28, 0xa4, 0x08, 0x97, 0x00, 0x00,
+            0x08, 0x13, 0x02, 0x13, 0x01, 0x13, 0x03, 0x00, 0xff, 0x01, 0x00, 0x00, 0xd2, 0x00,
+            0x39,
+        ];
+        expected.resize(1200, 0x00);
+        let mut second = expected.clone();
+        expected.append(&mut second);
+
+        assert_eq!(result[..offset], expected);
     }
 }

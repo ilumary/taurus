@@ -26,8 +26,11 @@ impl Error {
     taurus_error!(unknown_connection, 0x01);
     taurus_error!(socket_error, 0x02);
     taurus_error!(header_encoding_error, 0x03);
-    taurus_error!(packet_size_error, 0x04);
-    taurus_error!(no_cipher_suite, 0x05);
+    taurus_error!(packet_encoding_error, 0x04);
+    taurus_error!(buffer_size_error, 0x05);
+    taurus_error!(no_cipher_suite, 0x06);
+    taurus_error!(crypto_error, 0x07);
+    taurus_error!(taurus_misc_error, 0xff);
 }
 
 impl fmt::Display for Error {

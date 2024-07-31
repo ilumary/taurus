@@ -13,7 +13,12 @@ use rustls::{
     quic::{Connection as RustlsConnection, KeyChange, Keys, PacketKeySet, Version},
     Side,
 };
-use std::{collections::HashMap, fmt, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    net::SocketAddr,
+    sync::Arc,
+};
 use tokio::{
     net::UdpSocket as TokioUdpSocket,
     sync::{mpsc, oneshot, RwLock},
@@ -326,7 +331,12 @@ impl Connection {
                 payload_cipher.as_mut(),
             ) {
                 Ok(p) => p,
-                Err(error) => panic!("Error decrypting packet body {}", error),
+                Err(error) => {
+                    return Err(terror::Error::crypto_error(format!(
+                        "Error decrypting packet body {}",
+                        error
+                    )))
+                }
             };
             decrypted_payload_raw.len()
         };
@@ -334,7 +344,7 @@ impl Connection {
         //truncate payload to length returned by decrypting packet payload
         buffer.truncate(dec_len);
 
-        let initial_local_scid = ConnectionId::generate_with_length(head.dcid.len());
+        let initial_local_scid = ConnectionId::generate_with_length(8);
         let orig_dcid = head.dcid.clone();
 
         let mut transport_config = transport_parameters::TransportConfig::default();
@@ -398,9 +408,11 @@ impl Connection {
         //process inital packet inside connection, all subsequent packets are sent through channel
         inner.accept(&head, &mut buffer)?;
 
-        //TODO send answer to initial packet
-        let initial_answer: packet::Datagram = (vec![], inner.remote.to_string());
+        let initial_answer: packet::Datagram = inner.fetch_dgram()?;
         conn.send(&initial_answer).await?;
+
+        //promote connection state
+        inner.state = ConnectionState::Handshake;
 
         //start recv loop to process more incoming packets
         Ok((conn.start(recv_q, inner).await.unwrap(), conn_ready_rx))
@@ -556,7 +568,7 @@ impl Inner {
             next_1rtt_keys: None,
             prev_1rtt_keys: None,
             zero_rtt_keyset: None,
-            state: ConnectionState::Handshake,
+            state: ConnectionState::Initial,
             initial_dcid,
             initial_remote_scid,
             initial_local_scid,
@@ -606,7 +618,7 @@ impl Inner {
         //skip forth to packet payload
         if let Err(error) = payload.skip(header.raw_length + header.packet_num_length as usize + 1)
         {
-            return Err(terror::Error::packet_size_error(format!(
+            return Err(terror::Error::buffer_size_error(format!(
                 "header is longer than packet {}",
                 error
             )));
@@ -810,176 +822,123 @@ impl Inner {
         let length = buf.len() as u64;
         self.packet_spaces[space_id]
             .outgoing_crypto
-            .push(packet::CryptoFrame::new(offset, buf));
+            .push_back(packet::CryptoFrame::new(offset, buf));
         self.packet_spaces[space_id].outgoing_crypto_offset += length;
     }
 
-    fn fill_datagram(&mut self, buffer: &mut [u8]) -> Result<usize, terror::Error> {
-        // detect if packet needs to be sent if current space is handshake and initial has outstanding_crypto_data
-        let mut size: usize = 0;
+    fn fetch_dgram(&mut self) -> Result<packet::Datagram, terror::Error> {
+        let mut dgram = vec![0u8; 65536];
+        let mut offset: usize = 0;
+        let pkb = packet::PacketBuilder::new(self.version, &mut dgram[offset..]);
 
-        for space_id in 0..(self.current_space + 1) {
-            size += self.build_packet_in_space(&mut buffer[size..], space_id)?;
-        }
+        // initial space
+        if self.state == ConnectionState::Initial {
+            if let Ok(body) = self.fetch_early_data(SPACE_ID_INITIAL) {
+                let (len, pkb) = pkb
+                    .with_body(body)
+                    .with_long_header(
+                        packet::LONG_HEADER_TYPE_INITIAL,
+                        self.packet_spaces[SPACE_ID_INITIAL].next_pkt_num,
+                        &self.initial_remote_scid,
+                        &self.initial_local_scid,
+                        Some(vec![]),
+                    )?
+                    .encode()?;
+                offset += len;
 
-        Ok(size)
-    }
-
-    fn build_packet_in_space(
-        &mut self,
-        buffer: &mut [u8],
-        packet_number_space: usize,
-    ) -> Result<usize, terror::Error> {
-        println!("Building packet in space {:#x}", packet_number_space);
-
-        let mut buf = octets::OctetsMut::with_slice(buffer);
-
-        //calculate packet number length
-        let mut packet_num_length: u8 = 0;
-        match self.packet_spaces[packet_number_space].next_pkt_num {
-            0x00..=0xff => (),
-            0x0100..=0xffff => packet_num_length = 1,
-            0x010000..=0xffffff => packet_num_length = 2,
-            0x01000000..=0xffffffff => packet_num_length = 3,
-            _ => unreachable!("packet number exceeds maximum encodable value"),
-        }
-
-        //TODO: figure out proper way to get current cids
-        let dcid: &ConnectionId = &self.initial_remote_scid;
-        let scid: &ConnectionId = &self.initial_local_scid;
-
-        //pre-encode header
-        match Header::new_long_header(
-            0x00,
-            1,
-            self.packet_spaces[packet_number_space].next_pkt_num,
-            dcid,
-            scid,
-            None,
-            1200, //use minimum packet length to pre-encode packet length
-        )?
-        .to_bytes(&mut buf)
-        {
-            Ok(()) => (),
-            Err(error) => {
-                return Err(terror::Error::header_encoding_error(format!(
-                    "buffer has unsufficient size to encode header: {}",
-                    error
-                )))
+                pkb.encrypt(self.packet_spaces[SPACE_ID_INITIAL].keys.as_ref().unwrap())?;
             }
-        };
-
-        //THIS IS THE WAY
-        //buf.put_varint_with_len(packet_length_min, 3);
-
-        let header_length = buf.off();
-
-        //calculate packet number offset
-        let packet_length_offset = buf.off() - packet_num_length as usize - 2;
-
-        let max_packet_size: usize = 16383; //max size for packet length encoding with 2 bytes
-
-        //fill payload
-        let mut payload_length = self.populate_packet_payload(&mut buf, packet_number_space)?;
-
-        //calculate padding, buffer is zeroed out anyway, so just increasing the length is
-        //sufficient
-        if payload_length < 1200 {
-            payload_length = 1200;
         }
 
-        if (payload_length + header_length) > (max_packet_size - packet_num_length as usize) {
-            return Err(terror::Error::packet_size_error(format!(
-                "max packet length exceeded with {}",
-                payload_length
-            )));
+        // handshake space
+        if self.state == ConnectionState::Handshake || self.state == ConnectionState::Initial {
+            let space = &self.packet_spaces[SPACE_ID_HANDSHAKE];
         }
 
-        //reencode actual packet length
-        octets::OctetsMut::with_slice(
-            &mut buf.as_mut()[packet_length_offset..packet_length_offset + 2],
-        )
-        .put_varint_with_len(payload_length.try_into().unwrap(), 2)
-        .unwrap();
+        // data space
 
-        //update packet number space
-        self.packet_spaces[packet_number_space].next_pkt_num += 1;
-
-        //encrypt
-
-        //Ok(header_length + payload_length)
-        Ok(0)
+        //resize dgram
+        dgram.resize(offset, 0x00);
+        Ok((dgram, self.remote.to_string()))
+        //Ok((Vec::new(), String::from("")))
     }
 
-    fn populate_packet_payload(
-        &mut self,
-        buf: &mut octets::OctetsMut<'_>,
-        packet_number_space: usize,
-    ) -> Result<usize, terror::Error> {
+    // fetches only early data to send, i.e. crypto & ack
+    fn fetch_early_data(&mut self, packet_number_space: usize) -> Result<Vec<u8>, terror::Error> {
+        //maybe its cheapest to create huge vec at beginning and just trim it at the end
+        //TODO replace with max mtu
+        let mut data = vec![0u8; 65535];
         let mut size = 0;
 
-        //CRYPTO
-        /*if let Some(crypto_buffer) = &self.packet_spaces[packet_number_space].outgoing_crypto_data {
-            if !crypto_buffer.is_empty() {
-                let s =
-                    match packet::encode_frame(&CryptoFrame::new(0, crypto_buffer.to_vec()), buf) {
-                        Ok(s) => s,
-                        Err(error) => {
-                            return Err(terror::Error::packet_size_error(format!(
-                                "insufficient sized buffer for CRYPTO frame ({})",
-                                error
-                            )))
-                        }
-                    };
-                println!("wrote crypto frame with size {:?}", s);
-                size += s;
-            }
-        }*/
-
-        //ACK
-        if !self.packet_spaces[packet_number_space]
-            .outgoing_acks
-            .is_empty()
         {
-            //sort outgoing acks in reverse to ease range building
-            self.packet_spaces[packet_number_space]
+            let mut buf = octets::OctetsMut::with_slice(&mut data);
+
+            //CRYPTO
+            while let Some(frame) = self.packet_spaces[packet_number_space]
+                .outgoing_crypto
+                .pop_front()
+            {
+                let s = match packet::encode_frame(&frame, &mut buf) {
+                    Ok(s) => s,
+                    Err(error) => {
+                        return Err(terror::Error::buffer_size_error(format!(
+                            "insufficient sized buffer for CRYPTO frame ({})",
+                            error
+                        )))
+                    }
+                };
+            }
+
+            //ACK
+            if !self.packet_spaces[packet_number_space]
                 .outgoing_acks
-                .sort_by(|a, b| b.cmp(a));
+                .is_empty()
+            {
+                //sort outgoing acks in reverse to ease range building
+                self.packet_spaces[packet_number_space]
+                    .outgoing_acks
+                    .sort_by(|a, b| b.cmp(a));
 
-            //directly generate ack frame from packet number vector
-            let ack_frame = AckFrame::from_packet_number_vec(
-                &self.packet_spaces[packet_number_space].outgoing_acks,
-            );
+                //directly generate ack frame from packet number vector
+                let ack_frame = AckFrame::from_packet_number_vec(
+                    &self.packet_spaces[packet_number_space].outgoing_acks,
+                );
 
-            //clear vector as packet numbers are now ack'ed
-            self.packet_spaces[packet_number_space]
-                .outgoing_acks
-                .clear();
+                //clear vector as packet numbers are now ack'ed
+                self.packet_spaces[packet_number_space]
+                    .outgoing_acks
+                    .clear();
 
-            let s = match packet::encode_frame(&ack_frame, buf) {
-                Ok(s) => s,
-                Err(error) => {
-                    return Err(terror::Error::packet_size_error(format!(
-                        "insufficient sized buffer for ack frame ({})",
-                        error
-                    )))
-                }
+                let s = match packet::encode_frame(&ack_frame, &mut buf) {
+                    Ok(s) => s,
+                    Err(error) => {
+                        return Err(terror::Error::buffer_size_error(format!(
+                            "insufficient sized buffer for ack frame ({})",
+                            error
+                        )))
+                    }
+                };
+
+                println!("wrote ack frame with size {:?}", s);
             };
 
-            println!("wrote ack frame with size {:?}", s);
-            size += s;
-        };
+            size = buf.off();
+        }
 
-        Ok(size)
+        //dont forget to trim empty part of buffer
+        data.resize(size, 0x00);
+
+        Ok(data)
     }
 }
 
+#[derive(PartialEq)]
 enum ConnectionState {
+    Initial,
     Handshake,
     Connected,
-    Terminated,
     Emtpying,
-    Empty,
+    Terminated,
 }
 
 //RFC 9000 section 12.3. we have 3 packet number spaces: initial, handshake & 1-RTT
@@ -988,7 +947,7 @@ struct PacketNumberSpace {
 
     outgoing_acks: Vec<u64>,
 
-    outgoing_crypto: Vec<packet::CryptoFrame>,
+    outgoing_crypto: VecDeque<packet::CryptoFrame>,
     outgoing_crypto_offset: u64,
 
     next_pkt_num: u32,
@@ -999,7 +958,7 @@ impl PacketNumberSpace {
         Self {
             keys: None,
             outgoing_acks: Vec::new(),
-            outgoing_crypto: Vec::new(),
+            outgoing_crypto: VecDeque::new(),
             outgoing_crypto_offset: 0,
             next_pkt_num: 0,
         }
