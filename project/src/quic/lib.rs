@@ -24,6 +24,7 @@ use tokio::{
     sync::{mpsc, oneshot, RwLock},
     task::JoinHandle,
 };
+use transport_parameters::TransportConfig;
 
 const MAX_CID_SIZE: usize = 20;
 
@@ -119,7 +120,6 @@ impl ServerConfig {
     pub fn local_server(addr: &str) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-        println!("{:x?}", cert.cert.der());
         let cert = rustls::pki_types::CertificateDer::from(cert.cert);
 
         Self::new(addr, cert, key)
@@ -224,9 +224,8 @@ impl Endpoint {
                 println!("Received {:?} bytes from {:?}", size, src_addr);
                 //truncate vector to correct size
                 buffer.truncate(size);
-                let mut octets = OctetsMut::with_slice(&mut buffer);
 
-                let partial_decode: Header = match Header::from_bytes(&mut octets, 8) {
+                let partial_decode: Header = match Header::from_bytes(&buffer, 8) {
                     Ok(h) => h,
                     Err(error) => panic!("Error: {}", error),
                 };
@@ -244,6 +243,8 @@ impl Endpoint {
                         .await
                         .unwrap();
                 } else {
+                    print!("Got packet of known connection: ");
+                    partial_decode.debug_print();
                     //TODO make search with source address and retry cid ...
                     if let Some(handle) = dist
                         .read()
@@ -373,7 +374,7 @@ impl Connection {
         );
 
         let initial_space: PacketNumberSpace = PacketNumberSpace {
-            keys: Some(ikp),
+            keys: Some(Arc::new(ikp)),
             ..PacketNumberSpace::new()
         };
 
@@ -538,10 +539,8 @@ struct Inner {
     // Physical address of connection peer
     remote: SocketAddr,
 
-    // Packet stats
-    recved: u64,
-    sent: u64,
-    lost: u64,
+    // TransportConfig of remote
+    remote_tpc: TransportConfig,
 
     //0-Rtt enabled
     zero_rtt_enabled: bool,
@@ -580,9 +579,7 @@ impl Inner {
             ],
             current_space: SPACE_ID_INITIAL,
             remote: remote_address,
-            recved: 0,
-            sent: 0,
-            lost: 0,
+            remote_tpc: TransportConfig::default(),
             zero_rtt_enabled: false,
         }
     }
@@ -590,6 +587,7 @@ impl Inner {
     //fully decrypts packet header and payload, does tls stuff and passes packet to process_payload
     fn recv(&mut self, datagram: &mut packet::EarlyDatagram) -> Result<(), terror::Error> {
         //decrypt header and payload
+        datagram.2.debug_print();
         //TODO handle coalesced packets
         self.process_payload(&datagram.2, &mut datagram.0)?;
 
@@ -601,6 +599,16 @@ impl Inner {
     //accepts new connection, passes payload to process_payload
     fn accept(&mut self, header: &Header, packet_raw: &mut [u8]) -> Result<(), terror::Error> {
         self.process_payload(header, packet_raw)?;
+
+        if let Some(tpc) = self.tls_session.quic_transport_parameters() {
+            self.remote_tpc.update(tpc);
+        }
+
+        if self.remote_tpc.get_original_scid() != self.initial_remote_scid {
+            return Err(terror::Error::quic_protocol_violation(
+                "scids from packet header and transport parameters differ",
+            ));
+        }
 
         self.generate_crypto_data(SPACE_ID_INITIAL);
         self.generate_crypto_data(SPACE_ID_HANDSHAKE);
@@ -756,8 +764,6 @@ impl Inner {
     }
 
     fn process_crypto_data(&mut self, crypto_frame: &CryptoFrame) {
-        println!("Crypto Frame Data: {:x?}", crypto_frame.vec());
-
         match self.tls_session.read_hs(crypto_frame.data()) {
             Ok(()) => println!("Successfully read handshake data"),
             Err(err) => {
@@ -805,7 +811,7 @@ impl Inner {
             }
 
             //"upgrade" to next packet number space with new keying material
-            self.packet_spaces[space_id + 1].keys = Some(keys);
+            self.packet_spaces[space_id + 1].keys = Some(Arc::new(keys));
 
             //advance space
             self.current_space = space_id + 1;
@@ -815,7 +821,7 @@ impl Inner {
             return;
         }
 
-        println!("generated crypto data {:x?}", buf);
+        // println!("generated crypto data {:x?}", buf);
 
         //create outgoing crypto frame
         let offset = self.packet_spaces[space_id].outgoing_crypto_offset;
@@ -827,40 +833,59 @@ impl Inner {
     }
 
     fn fetch_dgram(&mut self) -> Result<packet::Datagram, terror::Error> {
-        let mut dgram = vec![0u8; 65536];
-        let mut offset: usize = 0;
-        let pkb = packet::PacketBuilder::new(self.version, &mut dgram[offset..]);
+        let mut dgram_builder = packet::DatagramBuilder::new(self.version);
 
         // initial space
         if self.state == ConnectionState::Initial {
             if let Ok(body) = self.fetch_early_data(SPACE_ID_INITIAL) {
-                let (len, pkb) = pkb
+                let next_pkt_num = self.packet_spaces[SPACE_ID_INITIAL].get_next_pkt_num();
+                let initial = packet::PacketBuilder::new(self.version)
                     .with_body(body)
                     .with_long_header(
                         packet::LONG_HEADER_TYPE_INITIAL,
-                        self.packet_spaces[SPACE_ID_INITIAL].next_pkt_num,
+                        next_pkt_num,
                         &self.initial_remote_scid,
                         &self.initial_local_scid,
                         Some(vec![]),
                     )?
-                    .encode()?;
-                offset += len;
-
-                pkb.encrypt(self.packet_spaces[SPACE_ID_INITIAL].keys.as_ref().unwrap())?;
+                    .with_crypto(
+                        self.packet_spaces[SPACE_ID_INITIAL]
+                            .keys
+                            .as_ref()
+                            .unwrap()
+                            .clone(),
+                    );
+                dgram_builder.add_packet(initial);
             }
         }
 
         // handshake space
         if self.state == ConnectionState::Handshake || self.state == ConnectionState::Initial {
-            let space = &self.packet_spaces[SPACE_ID_HANDSHAKE];
+            if let Ok(body) = self.fetch_early_data(SPACE_ID_HANDSHAKE) {
+                let next_pkt_num = self.packet_spaces[SPACE_ID_HANDSHAKE].get_next_pkt_num();
+                let hs = packet::PacketBuilder::new(self.version)
+                    .with_body(body)
+                    .with_long_header(
+                        packet::LONG_HEADER_TYPE_HANDSHAKE,
+                        next_pkt_num,
+                        &self.initial_remote_scid,
+                        &self.initial_local_scid,
+                        None,
+                    )?
+                    .with_crypto(
+                        self.packet_spaces[SPACE_ID_HANDSHAKE]
+                            .keys
+                            .as_ref()
+                            .unwrap()
+                            .clone(),
+                    );
+                dgram_builder.add_packet(hs);
+            }
         }
 
         // data space
 
-        //resize dgram
-        dgram.resize(offset, 0x00);
-        Ok((dgram, self.remote.to_string()))
-        //Ok((Vec::new(), String::from("")))
+        dgram_builder.build(self.remote.to_string())
     }
 
     // fetches only early data to send, i.e. crypto & ack
@@ -878,14 +903,11 @@ impl Inner {
                 .outgoing_crypto
                 .pop_front()
             {
-                let s = match packet::encode_frame(&frame, &mut buf) {
-                    Ok(s) => s,
-                    Err(error) => {
-                        return Err(terror::Error::buffer_size_error(format!(
-                            "insufficient sized buffer for CRYPTO frame ({})",
-                            error
-                        )))
-                    }
+                if let Err(err) = packet::encode_frame(&frame, &mut buf) {
+                    //no more space, put frame back
+                    self.packet_spaces[packet_number_space]
+                        .outgoing_crypto
+                        .push_front(frame);
                 };
             }
 
@@ -899,9 +921,13 @@ impl Inner {
                     .outgoing_acks
                     .sort_by(|a, b| b.cmp(a));
 
+                //TODO figure out delay
+                let ack_delay = 64 * (2 ^ self.remote_tpc.ack_delay_exponent.as_varint());
+
                 //directly generate ack frame from packet number vector
                 let ack_frame = AckFrame::from_packet_number_vec(
                     &self.packet_spaces[packet_number_space].outgoing_acks,
+                    ack_delay,
                 );
 
                 //clear vector as packet numbers are now ack'ed
@@ -909,17 +935,12 @@ impl Inner {
                     .outgoing_acks
                     .clear();
 
-                let s = match packet::encode_frame(&ack_frame, &mut buf) {
-                    Ok(s) => s,
-                    Err(error) => {
-                        return Err(terror::Error::buffer_size_error(format!(
-                            "insufficient sized buffer for ack frame ({})",
-                            error
-                        )))
-                    }
+                if let Err(err) = packet::encode_frame(&ack_frame, &mut buf) {
+                    return Err(terror::Error::buffer_size_error(format!(
+                        "insufficient sized buffer for ack frame ({})",
+                        err
+                    )));
                 };
-
-                println!("wrote ack frame with size {:?}", s);
             };
 
             size = buf.off();
@@ -943,7 +964,7 @@ enum ConnectionState {
 
 //RFC 9000 section 12.3. we have 3 packet number spaces: initial, handshake & 1-RTT
 struct PacketNumberSpace {
-    keys: Option<Keys>,
+    keys: Option<Arc<Keys>>,
 
     outgoing_acks: Vec<u64>,
 
@@ -962,6 +983,11 @@ impl PacketNumberSpace {
             outgoing_crypto_offset: 0,
             next_pkt_num: 0,
         }
+    }
+
+    fn get_next_pkt_num(&mut self) -> u32 {
+        self.next_pkt_num += 1;
+        self.next_pkt_num - 1
     }
 }
 

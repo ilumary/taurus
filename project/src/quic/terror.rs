@@ -30,6 +30,7 @@ impl Error {
     taurus_error!(buffer_size_error, 0x05);
     taurus_error!(no_cipher_suite, 0x06);
     taurus_error!(crypto_error, 0x07);
+    taurus_error!(quic_protocol_violation, 0x0a);
     taurus_error!(taurus_misc_error, 0xff);
 }
 

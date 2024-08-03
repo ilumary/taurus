@@ -1,4 +1,4 @@
-use octets::{BufferTooShortError, OctetsMut};
+use octets::{BufferTooShortError, Octets, OctetsMut};
 use std::{
     fmt,
     net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
@@ -8,24 +8,25 @@ use crate::token;
 use crate::ConnectionId;
 
 //RFC 9000 Section 18.2
+//TODO expand to RFC 9287 & draft-ietf-quic-ack-frequency
 pub struct TransportConfig {
-    original_destination_connection_id: Option<TransportParameter>,
-    max_idle_timeout: TransportParameter,
-    stateless_reset_token: Option<TransportParameter>,
-    max_udp_payload_size: TransportParameter,
-    initial_max_data: TransportParameter,
-    initial_max_stream_data_bidi_local: TransportParameter,
-    initial_max_stream_data_bidi_remote: TransportParameter,
-    initial_max_stream_data_uni: TransportParameter,
-    initial_max_streams_bidi: TransportParameter,
-    initial_max_streams_uni: TransportParameter,
-    ack_delay_exponent: TransportParameter,
-    max_ack_delay: TransportParameter,
-    disable_active_migration: Option<TransportParameter>,
-    preferred_address: Option<PreferredAddress>,
-    active_connection_id_limit: TransportParameter,
-    initial_source_connection_id: Option<TransportParameter>,
-    retry_source_connection_id: Option<TransportParameter>,
+    pub original_destination_connection_id: Option<TransportParameter>,
+    pub max_idle_timeout: TransportParameter,
+    pub stateless_reset_token: Option<TransportParameter>,
+    pub max_udp_payload_size: TransportParameter,
+    pub initial_max_data: TransportParameter,
+    pub initial_max_stream_data_bidi_local: TransportParameter,
+    pub initial_max_stream_data_bidi_remote: TransportParameter,
+    pub initial_max_stream_data_uni: TransportParameter,
+    pub initial_max_streams_bidi: TransportParameter,
+    pub initial_max_streams_uni: TransportParameter,
+    pub ack_delay_exponent: TransportParameter,
+    pub max_ack_delay: TransportParameter,
+    pub disable_active_migration: Option<TransportParameter>,
+    pub preferred_address: Option<PreferredAddress>,
+    pub active_connection_id_limit: TransportParameter,
+    pub initial_source_connection_id: Option<TransportParameter>,
+    pub retry_source_connection_id: Option<TransportParameter>,
 }
 
 impl TransportConfig {
@@ -49,6 +50,36 @@ impl TransportConfig {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
         }
+    }
+
+    pub fn update(&mut self, buffer: &[u8]) {
+        let mut buf = octets::Octets::with_slice(buffer);
+        while let Ok(tp) = TransportParameter::decode(&mut buf) {
+            match tp.id {
+                0x0001 => self.max_idle_timeout = tp,
+                0x0002 => self.stateless_reset_token = Some(tp),
+                0x0003 => self.max_udp_payload_size = tp,
+                0x0004 => self.initial_max_data = tp,
+                0x0005 => self.initial_max_stream_data_bidi_local = tp,
+                0x0006 => self.initial_max_stream_data_bidi_remote = tp,
+                0x0007 => self.initial_max_stream_data_uni = tp,
+                0x0008 => self.initial_max_streams_bidi = tp,
+                0x0009 => self.initial_max_streams_uni = tp,
+                0x000a => self.ack_delay_exponent = tp,
+                0x000b => self.max_ack_delay = tp,
+                0x000c => self.disable_active_migration = Some(tp),
+                0x000e => self.active_connection_id_limit = tp,
+                0x000f => self.initial_source_connection_id = Some(tp),
+                _ => println!(
+                    "unknown transport parameter with id {:x?} and value: {:x?}",
+                    tp.id, tp.value
+                ),
+            }
+        }
+    }
+
+    pub fn get_original_scid(&self) -> ConnectionId {
+        self.initial_source_connection_id.as_ref().unwrap().as_cid()
     }
 
     pub fn original_destination_connection_id(&mut self, orig_dcid: &Vec<u8>) -> &mut Self {
@@ -134,8 +165,6 @@ impl TransportConfig {
 
         Ok(())
     }
-
-    pub fn _read(_buf: &mut OctetsMut) {}
 }
 
 //RFC 9000 Section 18: Transport Parameter Encoding
@@ -152,7 +181,16 @@ impl TransportParameter {
         Self { id, length, value }
     }
 
-    pub fn decode(data: &mut OctetsMut<'_>) -> Result<Self, BufferTooShortError> {
+    pub fn as_varint(&self) -> u64 {
+        let mut b = Octets::with_slice(&self.value);
+        b.get_varint().unwrap()
+    }
+
+    pub fn as_cid(&self) -> ConnectionId {
+        ConnectionId::from_vec(self.value.clone())
+    }
+
+    pub fn decode(data: &mut Octets<'_>) -> Result<Self, BufferTooShortError> {
         let id = data.get_varint()?;
         let length = data.get_varint()?;
         let value = data.get_bytes(length as usize).unwrap();
