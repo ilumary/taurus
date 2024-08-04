@@ -5,7 +5,7 @@ use rustls::quic::HeaderProtectionKey;
 
 use std::{collections::VecDeque, marker::PhantomData, sync::Arc};
 
-const MAX_PKT_NUM_LEN: u8 = 4;
+const MAX_PKT_NUM_LEN: usize = 4;
 const SAMPLE_LEN: usize = 16;
 
 pub const LS_TYPE_BIT: u8 = 0x80;
@@ -64,30 +64,33 @@ impl DatagramBuilder {
         let mut i: usize = 0;
 
         while let Some(mut packet) = self.packets.pop_front() {
+            let tag_len = packet.keys.as_ref().unwrap().local.packet.tag_len();
+            //add tag length to payload length
+            packet.header.length += tag_len;
+
             //calculate required buffer length
             let mut required_space = packet.header.raw_length
                 + packet.header.packet_num_length as usize
                 + 1
                 + packet.body.len()
-                + packet.keys.as_ref().unwrap().local.packet.tag_len();
+                + tag_len;
 
             //check for minimum size if datagram contains initial packet
             if (i + 1) == size && self.contains_initial && (offset + required_space) < 1200 {
-                println!("POLSTERING PACKET");
                 let additional_space = 1200 - (offset + required_space);
                 required_space += additional_space;
                 packet.header.length += additional_space;
             }
 
-            packet.encode_and_encrypt(&mut dgram[offset..required_space])?;
+            packet.encode_and_encrypt(&mut dgram[offset..offset + required_space])?;
 
             offset += required_space;
             i += 1;
         }
 
-        self.dgram.resize(offset, 0x00);
+        dgram.resize(offset, 0x00);
 
-        Ok((self.dgram, address))
+        Ok((dgram, address))
     }
 }
 
@@ -233,8 +236,6 @@ impl PacketBuilder<Completed> {
 
         let tag_len = keys.local.packet.tag_len();
 
-        println!("NON ENCRYPT (len: {:?}): {:x?}", packet.len(), &packet);
-
         let header_end_off: usize =
             self.header.raw_length + self.header.packet_num_length as usize + 1;
 
@@ -247,8 +248,6 @@ impl PacketBuilder<Completed> {
             .packet
             .encrypt_in_place(self.header.packet_num as u64, &*header, payload)
             .unwrap();
-
-        println!("TAG: {:x?}", tag.as_ref());
 
         tag_storage.copy_from_slice(tag.as_ref());
 
@@ -266,8 +265,6 @@ impl PacketBuilder<Completed> {
                 &mut rest[pn_offset - 1..pn_end],
             )
             .unwrap();
-
-        println!("ENCRYPT (len: {:?}): {:x?}", packet.len(), &packet);
 
         Ok(())
     }
@@ -852,8 +849,8 @@ impl Header {
         let mut b = octets::OctetsMut::with_slice(buffer);
         b.skip(self.raw_length)?;
 
-        let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN as usize + SAMPLE_LEN)?;
-        let (mut pn_cipher, sample) = pn_and_sample.split_at(MAX_PKT_NUM_LEN as usize)?;
+        let mut pn_and_sample = b.peek_bytes_mut(MAX_PKT_NUM_LEN + SAMPLE_LEN)?;
+        let (mut pn_cipher, sample) = pn_and_sample.split_at(MAX_PKT_NUM_LEN)?;
 
         match header_key.decrypt_in_place(sample.as_ref(), &mut self.hf, pn_cipher.as_mut()) {
             Ok(_) => (),

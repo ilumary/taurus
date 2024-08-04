@@ -230,6 +230,9 @@ impl Endpoint {
                     Err(error) => panic!("Error: {}", error),
                 };
 
+                print!("I: ");
+                partial_decode.debug_print();
+
                 //stop accepting new connections when entering graceful shutdown
                 if partial_decode.is_inital() && !cancellation_token.is_cancelled() {
                     tx_initial
@@ -312,8 +315,6 @@ impl Connection {
             Ok(s) => s,
             Err(error) => panic!("Error: {}", error),
         };
-
-        println!("{:?}", head.debug_print());
 
         let mut b = OctetsMut::with_slice(&mut buffer);
         let (header_raw, mut payload_cipher) = b.split_at(header_length).unwrap();
