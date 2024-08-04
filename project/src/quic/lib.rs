@@ -10,6 +10,7 @@ use packet::{
 };
 use rand::RngCore;
 use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
     quic::{Connection as RustlsConnection, KeyChange, Keys, PacketKeySet, Version},
     Side,
 };
@@ -117,26 +118,25 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    pub fn local_server(addr: &str) -> Self {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into());
-        let cert = rustls::pki_types::CertificateDer::from(cert.cert);
-
-        Self::new(addr, cert, key)
-    }
-
-    pub fn new(
-        addr: &str,
-        certificate: rustls::pki_types::CertificateDer<'_>,
-        pkey: rustls::pki_types::PrivateKeyDer<'_>,
-    ) -> Self {
+    pub fn new(addr: &str, cert_path: &str, key_path: &str) -> Self {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
+
+        let (cert, key) =
+            match std::fs::read(cert_path).and_then(|x| Ok((x, std::fs::read(key_path)?))) {
+                Ok((cert, key)) => (
+                    CertificateDer::from(cert),
+                    PrivateKeyDer::try_from(key).unwrap(),
+                ),
+                Err(e) => {
+                    panic!("failed to read certificate: {}", e);
+                }
+            };
 
         let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .unwrap()
             .with_no_client_auth()
-            .with_single_cert(vec![certificate.into_owned().clone()], pkey.clone_key())
+            .with_single_cert(vec![cert.clone()], key)
             .unwrap();
 
         ServerConfig {
@@ -822,7 +822,7 @@ impl Inner {
             return;
         }
 
-        // println!("generated crypto data {:x?}", buf);
+        println!("Crypto {:?}", buf.len());
 
         //create outgoing crypto frame
         let offset = self.packet_spaces[space_id].outgoing_crypto_offset;
@@ -1052,11 +1052,4 @@ impl From<Vec<u8>> for ConnectionId {
     fn from(v: Vec<u8>) -> Self {
         Self::from_vec(v)
     }
-}
-
-// Tests
-
-#[cfg(test)]
-mod tests {
-    // use super::*;
 }
