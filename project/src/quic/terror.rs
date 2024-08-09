@@ -32,6 +32,16 @@ impl Error {
     taurus_error!(crypto_error, 0x07);
     taurus_error!(quic_protocol_violation, 0x0a);
     taurus_error!(taurus_misc_error, 0xff);
+
+    pub fn quic_transport_error<T>(reason: T, code: QuicTransportError) -> Self
+    where
+        T: Into<String>,
+    {
+        Self {
+            code: code as u64,
+            msg: reason.into(),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -66,7 +76,6 @@ pub enum QuicTransportError {
     KeyUpdateError = 0x0e,
     AeadLimitReached = 0x0f,
     NoViablePath = 0x10,
-    CryptoError(CryptoError),
 }
 
 impl fmt::Display for QuicTransportError {
@@ -93,7 +102,6 @@ impl fmt::Display for QuicTransportError {
             QuicTransportError::KeyUpdateError => write!(f, "0x0e key update error"),
             QuicTransportError::AeadLimitReached => write!(f, "0x0f aead limit reached"),
             QuicTransportError::NoViablePath => write!(f, "0x10 no viable path"),
-            QuicTransportError::CryptoError(c) => write!(f, "{} crypto error", c),
         }
     }
 }

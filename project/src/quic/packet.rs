@@ -1023,6 +1023,7 @@ pub fn varint_length(num: u64) -> usize {
         0..=63 => 1,
         64..=16383 => 2,
         16384..=1073741823 => 3,
+        1073741824..=4611686018427387903 => 4,
         _ => unreachable!("number exceeded abnormally large size"),
     }
 }

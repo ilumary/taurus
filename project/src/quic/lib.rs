@@ -10,7 +10,7 @@ use packet::{
 };
 use rand::RngCore;
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    pki_types::{CertificateDer, PrivateKeyDer},
     quic::{Connection as RustlsConnection, KeyChange, Keys, PacketKeySet, Version},
     Side,
 };
@@ -349,29 +349,20 @@ impl Connection {
         let initial_local_scid = ConnectionId::generate_with_length(8);
         let orig_dcid = head.dcid.clone();
 
-        let mut transport_config = transport_parameters::TransportConfig::default();
-        transport_config
-            .original_destination_connection_id(orig_dcid.id())
-            .initial_source_connection_id(initial_local_scid.id())
-            .stateless_reset_token(
-                token::StatelessResetToken::new(&hmac_reset_key, &initial_local_scid)
-                    .token
-                    .to_vec(),
-            );
+        let mut tpc = transport_parameters::TransportConfig::default();
+        tpc.original_destination_connection_id =
+            transport_parameters::OriginalDestinationConnectionId::try_from(orig_dcid.clone())?;
+        tpc.initial_source_connection_id =
+            transport_parameters::InitialSourceConnectionId::try_from(initial_local_scid.clone())?;
+        tpc.stateless_reset_token = transport_parameters::StatelessResetTokenTP::try_from(
+            token::StatelessResetToken::new(&hmac_reset_key, &initial_local_scid),
+        )?;
 
-        //Allocate byte buffer and encode transport config to create rustls connection
-        let mut buf = [0u8; 1024];
-        let mut param_buffer = OctetsMut::with_slice(&mut buf);
-        transport_config.encode(&mut param_buffer).unwrap();
-        let (data, _) = param_buffer.split_at(param_buffer.off()).unwrap();
+        let data = tpc.encode(Side::Server)?;
 
         let conn = RustlsConnection::Server(
-            rustls::quic::ServerConnection::new(
-                server_config,
-                rustls::quic::Version::V1,
-                data.to_vec(),
-            )
-            .unwrap(),
+            rustls::quic::ServerConnection::new(server_config, rustls::quic::Version::V1, data)
+                .unwrap(),
         );
 
         let initial_space: PacketNumberSpace = PacketNumberSpace {
@@ -602,10 +593,11 @@ impl Inner {
         self.process_payload(header, packet_raw)?;
 
         if let Some(tpc) = self.tls_session.quic_transport_parameters() {
-            self.remote_tpc.update(tpc);
+            self.remote_tpc.update(tpc).unwrap();
         }
 
-        if self.remote_tpc.get_original_scid() != self.initial_remote_scid {
+        if *self.remote_tpc.initial_source_connection_id.get().unwrap() != self.initial_remote_scid
+        {
             return Err(terror::Error::quic_protocol_violation(
                 "scids from packet header and transport parameters differ",
             ));
@@ -923,7 +915,7 @@ impl Inner {
                     .sort_by(|a, b| b.cmp(a));
 
                 //TODO figure out delay
-                let ack_delay = 64 * (2 ^ self.remote_tpc.ack_delay_exponent.as_varint());
+                let ack_delay = 64 * (2 ^ self.remote_tpc.ack_delay_exponent.get().unwrap().get());
 
                 //directly generate ack frame from packet number vector
                 let ack_frame = AckFrame::from_packet_number_vec(
@@ -993,7 +985,7 @@ impl PacketNumberSpace {
 }
 
 #[derive(Eq, Hash, PartialEq, Clone)]
-struct ConnectionId {
+pub struct ConnectionId {
     id: Vec<u8>,
 }
 

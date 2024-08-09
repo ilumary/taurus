@@ -1,5 +1,6 @@
 use crate::ConnectionId;
 
+#[derive(PartialEq, Default)]
 pub struct StatelessResetToken {
     pub token: [u8; 0x10],
 }
