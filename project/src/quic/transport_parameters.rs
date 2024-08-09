@@ -69,15 +69,20 @@ impl IOHandler<StatelessResetToken> for StatelessResetToken {
         token: &StatelessResetToken,
         buf: &mut OctetsMut,
     ) -> Result<(), octets::BufferTooShortError> {
+        //stateless_reset_token is always 16 bytes long
+        buf.put_varint(0x10)?;
         buf.put_bytes(&token.token)?;
         Ok(())
     }
 
     fn decode(buf: &mut Octets) -> Result<StatelessResetToken, octets::BufferTooShortError> {
         let length = buf.get_varint()?;
-        Ok(StatelessResetToken::from(
-            buf.get_bytes(length.try_into().unwrap())?.to_vec(),
-        ))
+        if length == 16 {
+            return Ok(StatelessResetToken::from(
+                buf.get_bytes(length.try_into().unwrap())?.to_vec(),
+            ));
+        }
+        Err(octets::BufferTooShortError)
     }
 }
 

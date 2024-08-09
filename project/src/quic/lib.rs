@@ -25,7 +25,10 @@ use tokio::{
     sync::{mpsc, oneshot, RwLock},
     task::JoinHandle,
 };
-use transport_parameters::TransportConfig;
+use transport_parameters::{
+    InitialSourceConnectionId, OriginalDestinationConnectionId, StatelessResetTokenTP,
+    TransportConfig,
+};
 
 const MAX_CID_SIZE: usize = 20;
 
@@ -349,14 +352,18 @@ impl Connection {
         let initial_local_scid = ConnectionId::generate_with_length(8);
         let orig_dcid = head.dcid.clone();
 
-        let mut tpc = transport_parameters::TransportConfig::default();
-        tpc.original_destination_connection_id =
-            transport_parameters::OriginalDestinationConnectionId::try_from(orig_dcid.clone())?;
-        tpc.initial_source_connection_id =
-            transport_parameters::InitialSourceConnectionId::try_from(initial_local_scid.clone())?;
-        tpc.stateless_reset_token = transport_parameters::StatelessResetTokenTP::try_from(
-            token::StatelessResetToken::new(&hmac_reset_key, &initial_local_scid),
-        )?;
+        let tpc = TransportConfig {
+            original_destination_connection_id: OriginalDestinationConnectionId::try_from(
+                orig_dcid.clone(),
+            )?,
+            initial_source_connection_id: InitialSourceConnectionId::try_from(
+                initial_local_scid.clone(),
+            )?,
+            stateless_reset_token: StatelessResetTokenTP::try_from(
+                token::StatelessResetToken::new(&hmac_reset_key, &initial_local_scid),
+            )?,
+            ..TransportConfig::default()
+        };
 
         let data = tpc.encode(Side::Server)?;
 
