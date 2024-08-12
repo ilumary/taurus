@@ -196,10 +196,11 @@ macro_rules! transport_parameter {
             }
 
             fn decode(buf: &mut Octets) -> Result<Self, terror::Error> {
-                Ok(Self {
+                Self {
                     value: <Self::ValueType as IOHandler<Self::ValueType>>::decode(buf)
                         .map_err(|e| terror::Error::buffer_size_error(format!("{}", e)))?,
-                })
+                }
+                .validate()
             }
 
             fn encode(&self, buf: &mut OctetsMut) -> Result<(), terror::Error> {
@@ -302,7 +303,7 @@ transport_parameter!(MaxUdpPayloadSize, 0x03, VarInt, 0xfff7.into());
 
 impl MaxUdpPayloadSize {
     fn validate(self) -> Result<Self, terror::Error> {
-        if (1200..=65527).contains(&self.value.value) {
+        if !(1200..=65527).contains(&self.value.value) {
             return Err(terror::Error::quic_transport_error(
                 format!("invalid maximum udp payload size of {:?}", self.value.value),
                 terror::QuicTransportError::TransportParameterError,

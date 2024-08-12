@@ -25,6 +25,7 @@ use tokio::{
     sync::{mpsc, oneshot, RwLock},
     task::JoinHandle,
 };
+use tracing::{debug, debug_span, error, info, warn, Instrument};
 use transport_parameters::{
     InitialSourceConnectionId, OriginalDestinationConnectionId, StatelessResetTokenTP,
     TransportConfig,
@@ -73,19 +74,29 @@ impl Acceptor {
     async fn accept(&mut self) -> Option<Connection> {
         let (packet, remote, header, tsd, socket) = self.rx.recv().await.unwrap();
 
-        //TODO refactor unwrap panic with proper error handling
         let (connection, ready) =
-            Connection::early_connection((packet, remote, header), tsd, socket)
+            match Connection::early_connection((packet, remote, header), tsd, socket)
+                .instrument(debug_span!("accepting new connection"))
                 .await
-                .unwrap();
+            {
+                Ok((c, r)) => (c, r),
+                Err(e) => {
+                    // if we encounter an error within the initial packet, the connection is
+                    // immediately abandoned
+                    // TODO send close connection frame, remove conn from Distributor
+                    error!("encountered error while accepting new connection: {}", e);
+                    return None;
+                }
+            };
 
+        //send connection close frame
         match ready.await {
             Ok(terror::QuicTransportError::NoError) => return Some(connection),
             Ok(quic_error) => {
-                eprintln!("Connection could not be established: {}", quic_error);
+                error!("Connection could not be established: {}", quic_error);
             }
             Err(error) => {
-                eprintln!("Error retrieving connection state: {}", error);
+                error!("Error retrieving connection state: {}", error);
             }
         }
 
@@ -134,6 +145,8 @@ impl ServerConfig {
                     panic!("failed to read certificate: {}", e);
                 }
             };
+
+        debug!("loaded cert from {} and key from {}", cert_path, key_path);
 
         let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -211,6 +224,8 @@ impl Endpoint {
         let dist = self.distributor.clone();
         let cancellation_token = { dist.read().await.cancellation_token.clone() };
 
+        info!("listening on {}", &self.address);
+
         self.recv_loop_handle = Some(tokio::spawn(async move {
             loop {
                 let mut buffer = std::iter::repeat(0)
@@ -224,7 +239,7 @@ impl Endpoint {
                         continue;
                     }
                 };
-                println!("Received {:?} bytes from {:?}", size, src_addr);
+                info!("Received {:?} bytes from {:?}", size, src_addr);
                 //truncate vector to correct size
                 buffer.truncate(size);
 
@@ -233,33 +248,30 @@ impl Endpoint {
                     Err(error) => panic!("Error: {}", error),
                 };
 
-                print!("I: ");
-                partial_decode.debug_print();
+                debug!("I: {}", partial_decode);
 
-                //stop accepting new connections when entering graceful shutdown
-                if partial_decode.is_inital() && !cancellation_token.is_cancelled() {
-                    tx_initial
-                        .send((
-                            buffer,
-                            src_addr.to_string(),
-                            partial_decode,
-                            dist.clone(),
-                            socket.clone(),
-                        ))
+                //match incoming packet to connection
+                if let Some(handle) = dist
+                    .read()
+                    .await
+                    .connection_send_handles
+                    .get(&partial_decode.dcid)
+                {
+                    handle
+                        .send((buffer, src_addr.to_string(), partial_decode))
                         .await
                         .unwrap();
                 } else {
-                    print!("Got packet of known connection: ");
-                    partial_decode.debug_print();
-                    //TODO make search with source address and retry cid ...
-                    if let Some(handle) = dist
-                        .read()
-                        .await
-                        .connection_send_handles
-                        .get(&partial_decode.dcid)
-                    {
-                        handle
-                            .send((buffer, src_addr.to_string(), partial_decode))
+                    //stop accepting new connections when entering graceful shutdown
+                    if partial_decode.is_inital() && !cancellation_token.is_cancelled() {
+                        tx_initial
+                            .send((
+                                buffer,
+                                src_addr.to_string(),
+                                partial_decode,
+                                dist.clone(),
+                                socket.clone(),
+                            ))
                             .await
                             .unwrap();
                     }
@@ -314,6 +326,11 @@ impl Connection {
             &head.dcid,
         );
 
+        debug!(
+            origin = src_addr,
+            "initial keys ready for dcid {}", &head.dcid
+        );
+
         let header_length = match head.decrypt(&mut buffer, ikp.remote.header.as_ref()) {
             Ok(s) => s,
             Err(error) => panic!("Error: {}", error),
@@ -346,7 +363,8 @@ impl Connection {
             decrypted_payload_raw.len()
         };
 
-        //truncate payload to length returned by decrypting packet payload
+        //truncate payload to length returned by decrypting packet payload, may cause problems with
+        //coalesced packets
         buffer.truncate(dec_len);
 
         let initial_local_scid = ConnectionId::generate_with_length(8);
@@ -450,11 +468,11 @@ impl Connection {
 
         self.loop_handle = Some(tokio::spawn(async move {
             while let Some(mut msg) = recv_q.recv().await {
-                println!("received datagram inside connection {:?}", msg.1);
+                debug!(origin = msg.1, "received datagram. processing...");
 
                 //process
                 if let Err(error) = conn.recv(&mut msg) {
-                    eprint!("error processing datagram: {}", error);
+                    error!("error processing datagram: {}", error);
                 };
 
                 //send back ack at least, check for data in outgoing streams
@@ -469,7 +487,7 @@ impl Connection {
                     }
                 };
 
-                println!("sent {} bytes to {}", size, &dgram.1);
+                info!(destination = dgram.1, "sent {} bytes", size);
             }
             Ok(0)
         }));
@@ -484,7 +502,7 @@ impl Connection {
             }
         };
 
-        println!("sent {} bytes to {}", size, &dgram.1);
+        info!(destination = dgram.1, "sent {} bytes", size);
 
         Ok(())
     }
@@ -586,7 +604,6 @@ impl Inner {
     //fully decrypts packet header and payload, does tls stuff and passes packet to process_payload
     fn recv(&mut self, datagram: &mut packet::EarlyDatagram) -> Result<(), terror::Error> {
         //decrypt header and payload
-        datagram.2.debug_print();
         //TODO handle coalesced packets
         self.process_payload(&datagram.2, &mut datagram.0)?;
 
@@ -600,13 +617,14 @@ impl Inner {
         self.process_payload(header, packet_raw)?;
 
         if let Some(tpc) = self.tls_session.quic_transport_parameters() {
-            self.remote_tpc.update(tpc).unwrap();
+            self.remote_tpc.update(tpc)?;
         }
 
         if *self.remote_tpc.initial_source_connection_id.get().unwrap() != self.initial_remote_scid
         {
-            return Err(terror::Error::quic_protocol_violation(
+            return Err(terror::Error::quic_transport_error(
                 "scids from packet header and transport parameters differ",
+                terror::QuicTransportError::TransportParameterError,
             ));
         }
 
@@ -678,12 +696,7 @@ impl Inner {
                             .split_at(stream_frame.offset.unwrap() as usize)
                             .unwrap();
                     }
-
-                    println!(
-                        "stream_id {:#x} len {:#x}",
-                        stream_frame.stream_id,
-                        stream_data.len(),
-                    );
+                    debug!("stream data: {:?}", stream_data);
                 } //STREAM
                 0x10 => {
                     let _max_data = payload.get_varint().unwrap();
@@ -730,14 +743,14 @@ impl Inner {
                 } //CONNECTION_CLOSE_FRAME
                 0x1e => {
                     if self.side == Side::Server {
-                        eprintln!("Received HANDSHAKE_DONE frame as server");
+                        error!("Received HANDSHAKE_DONE frame as server");
                         self.transmit_ready(terror::QuicTransportError::ProtocolViolation);
                         continue;
                     }
 
                     self.transmit_ready(terror::QuicTransportError::NoError);
                 } // HANDSHAKE_DONE
-                _ => eprintln!(
+                _ => warn!(
                     "Error while processing frames: unrecognised frame {:#x} at {:#x}",
                     frame_code,
                     payload.off()
@@ -765,10 +778,13 @@ impl Inner {
 
     fn process_crypto_data(&mut self, crypto_frame: &CryptoFrame) {
         match self.tls_session.read_hs(crypto_frame.data()) {
-            Ok(()) => println!("Successfully read handshake data"),
+            Ok(()) => debug!(
+                "consumed {} bytes from crypto frame",
+                crypto_frame.data().len()
+            ),
             Err(err) => {
-                eprintln!("Error reading crypto data: {}", err);
-                eprintln!("{:?}", self.tls_session.alert().unwrap());
+                error!("Error reading crypto data: {}", err);
+                error!("{:?}", self.tls_session.alert().unwrap());
             }
         }
 
@@ -781,7 +797,6 @@ impl Inner {
             || has_server_name
             || !self.tls_session.is_handshaking()
         {
-            println!("Handshake data has been proccessed successfully");
             let _ = true;
         }
     }
@@ -791,10 +806,15 @@ impl Inner {
 
         //writing handshake data prompts a keychange because the packet number space is promoted
         if let Some(kc) = self.tls_session.write_hs(&mut buf) {
+            debug!("generated {} bytes of crypto data", buf.len());
             //get keys from keychange
             let keys = match kc {
-                KeyChange::Handshake { keys } => keys,
+                KeyChange::Handshake { keys } => {
+                    debug!("handshake keyset ready");
+                    keys
+                }
                 KeyChange::OneRtt { keys, next } => {
+                    debug!("data (1-rtt) keyset ready");
                     self.next_secrets = Some(next);
                     keys
                 }
@@ -821,7 +841,7 @@ impl Inner {
             return;
         }
 
-        println!("Crypto {:?}", buf.len());
+        //println!("Crypto {:?}", buf.len());
 
         //create outgoing crypto frame
         let offset = self.packet_spaces[space_id].outgoing_crypto_offset;
@@ -893,7 +913,7 @@ impl Inner {
         //maybe its cheapest to create huge vec at beginning and just trim it at the end
         //TODO replace with max mtu
         let mut data = vec![0u8; 65535];
-        let mut size = 0;
+        let size: usize;
 
         {
             let mut buf = octets::OctetsMut::with_slice(&mut data);

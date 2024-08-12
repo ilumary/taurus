@@ -22,24 +22,29 @@ macro_rules! taurus_error {
 }
 
 impl Error {
-    taurus_error!(fatal, 0x00);
-    taurus_error!(unknown_connection, 0x01);
-    taurus_error!(socket_error, 0x02);
-    taurus_error!(header_encoding_error, 0x03);
-    taurus_error!(packet_encoding_error, 0x04);
-    taurus_error!(buffer_size_error, 0x05);
-    taurus_error!(no_cipher_suite, 0x06);
-    taurus_error!(crypto_error, 0x07);
-    taurus_error!(quic_protocol_violation, 0x0a);
+    pub fn kind(&self) -> u64 {
+        self.code
+    }
+
+    taurus_error!(fatal, 0x11);
+    taurus_error!(unknown_connection, 0x12);
+    taurus_error!(socket_error, 0x13);
+    taurus_error!(header_encoding_error, 0x14);
+    taurus_error!(packet_encoding_error, 0x15);
+    taurus_error!(buffer_size_error, 0x16);
+    taurus_error!(no_cipher_suite, 0x17);
+    taurus_error!(crypto_error, 0x18);
     taurus_error!(taurus_misc_error, 0xff);
 
     pub fn quic_transport_error<T>(reason: T, code: QuicTransportError) -> Self
     where
         T: Into<String>,
     {
+        let mut msg = format!("{code} ");
+        msg.push_str(&reason.into());
         Self {
             code: code as u64,
-            msg: reason.into(),
+            msg,
         }
     }
 }
@@ -81,27 +86,27 @@ pub enum QuicTransportError {
 impl fmt::Display for QuicTransportError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
-            QuicTransportError::NoError => write!(f, "0x00 no error"),
-            QuicTransportError::InternalError => write!(f, "0x01 internal error"),
-            QuicTransportError::ConnectionRefused => write!(f, "0x02 connection refused"),
-            QuicTransportError::FlowControlError => write!(f, "0x03 flow control error"),
-            QuicTransportError::StreamLimitError => write!(f, "0x04 stream limit error"),
-            QuicTransportError::StreamStateError => write!(f, "0x05 stream state error"),
-            QuicTransportError::FinalSizeError => write!(f, "0x06 final size error"),
-            QuicTransportError::FrameEncodingError => write!(f, "0x07 frame encoding error"),
+            QuicTransportError::NoError => write!(f, "no error"),
+            QuicTransportError::InternalError => write!(f, "internal error"),
+            QuicTransportError::ConnectionRefused => write!(f, "connection refused"),
+            QuicTransportError::FlowControlError => write!(f, "flow control error"),
+            QuicTransportError::StreamLimitError => write!(f, "stream limit error"),
+            QuicTransportError::StreamStateError => write!(f, "stream state error"),
+            QuicTransportError::FinalSizeError => write!(f, "final size error"),
+            QuicTransportError::FrameEncodingError => write!(f, "frame encoding error"),
             QuicTransportError::TransportParameterError => {
-                write!(f, "0x08 transport parameter error")
+                write!(f, "transport parameter error")
             }
             QuicTransportError::ConnectionIdLimitError => {
-                write!(f, "0x09 connection id limit error")
+                write!(f, "connection id limit error")
             }
-            QuicTransportError::ProtocolViolation => write!(f, "0x0a protocol violation"),
-            QuicTransportError::InvalidToken => write!(f, "0x0b invalid token"),
-            QuicTransportError::ApplicationError => write!(f, "0x0c application error"),
-            QuicTransportError::CryptoBufferExceeded => write!(f, "0x0d crypto buffer exceeded"),
-            QuicTransportError::KeyUpdateError => write!(f, "0x0e key update error"),
-            QuicTransportError::AeadLimitReached => write!(f, "0x0f aead limit reached"),
-            QuicTransportError::NoViablePath => write!(f, "0x10 no viable path"),
+            QuicTransportError::ProtocolViolation => write!(f, "protocol violation"),
+            QuicTransportError::InvalidToken => write!(f, "invalid token"),
+            QuicTransportError::ApplicationError => write!(f, "application error"),
+            QuicTransportError::CryptoBufferExceeded => write!(f, "crypto buffer exceeded"),
+            QuicTransportError::KeyUpdateError => write!(f, "key update error"),
+            QuicTransportError::AeadLimitReached => write!(f, "aead limit reached"),
+            QuicTransportError::NoViablePath => write!(f, "no viable path"),
         }
     }
 }

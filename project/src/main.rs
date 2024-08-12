@@ -1,7 +1,20 @@
 use quic::{terror, ServerConfig};
 
+use tracing::Level;
+use tracing_subscriber::FmtSubscriber;
+
+fn main() {
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(Level::DEBUG)
+        .finish();
+
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+    let _ = run();
+}
+
 #[tokio::main]
-async fn main() -> Result<(), terror::Error> {
+async fn run() -> Result<(), terror::Error> {
     let mut cert_path = std::env::current_dir().unwrap();
     cert_path.push("cert");
     cert_path.push("cert.der");

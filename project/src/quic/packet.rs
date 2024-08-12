@@ -2,8 +2,9 @@ use crate::{terror, token::StatelessResetToken, ConnectionId, TSDistributor};
 
 use octets::Octets;
 use rustls::quic::HeaderProtectionKey;
+use tracing::{debug, info};
 
-use std::{collections::VecDeque, marker::PhantomData, sync::Arc};
+use std::{collections::VecDeque, fmt, marker::PhantomData, sync::Arc};
 
 const MAX_PKT_NUM_LEN: usize = 4;
 const SAMPLE_LEN: usize = 16;
@@ -87,6 +88,8 @@ impl DatagramBuilder {
             offset += required_space;
             i += 1;
         }
+
+        debug!("built datagram with {} packets ({} bytes)", size, offset);
 
         dgram.resize(offset, 0x00);
 
@@ -197,11 +200,9 @@ impl<C> PacketBuilder<(PacketBody, PacketHeader, C)> {
     // encodes the packet and its header into the datagram, can only be called after body and
     // header have been specified
     fn encode(&self, dgram: &mut [u8]) -> Result<(), terror::Error> {
-        println!("AVAILIBLE SPACE: {:?}", dgram.len());
+        debug!("encoding packet on buffer with size {}", dgram.len());
 
         let mut b = octets::OctetsMut::with_slice(dgram);
-
-        self.header.debug_print();
 
         //encode header
         if let Err(err) = self.header.to_bytes(&mut b) {
@@ -314,19 +315,19 @@ impl AckFrame {
     pub fn from_packet_number_vec(packet_numbers: &[u64], ack_delay: u64) -> Self {
         let mut ack = Self::empty(ack_delay);
         ack.len = 1;
-        println!("len + 1 from frame code");
+        //println!("len + 1 from frame code");
         let mut last_pn: u64 = 0;
 
         for (i, range) in Self::range_iterator_descending(packet_numbers).enumerate() {
             if i == 0 {
                 //first range contains highest ack
                 ack.add_highest_range(range[0], (range.len() - 1) as u64);
-                println!("first ack range: ha {:?} r {:?}", range[0], range.len() - 1);
+                //println!("first ack range: ha {:?} r {:?}", range[0], range.len() - 1);
                 last_pn = range[range.len() - 1];
             } else {
                 //append to ranges
                 let gap: u64 = last_pn - range[0] - 1;
-                println!("gap {:?} = lpn {:?} - r0 {:?}", gap, last_pn, range[0]);
+                //println!("gap {:?} = lpn {:?} - r0 {:?}", gap, last_pn, range[0]);
                 last_pn = range[range.len() - 1];
                 ack.add_range(gap, (range.len() - 1) as u64);
             }
@@ -337,13 +338,13 @@ impl AckFrame {
             + varint_length(ack.ack_range_count)
             + varint_length(ack.first_ack_range);
 
-        println!(
+        /*println!(
             "len + {:?} from la",
             varint_length(ack.largest_acknowledged)
         );
         println!("len + {:?} from ad", varint_length(ack.ack_delay));
         println!("len + {:?} from arc", varint_length(ack.ack_range_count));
-        println!("len + {:?} from far", varint_length(ack.first_ack_range));
+        println!("len + {:?} from far", varint_length(ack.first_ack_range));*/
 
         ack
     }
@@ -388,8 +389,8 @@ impl AckFrame {
         self.len += varint_length(gap);
         self.len += varint_length(range);
 
-        println!("len + {:?} from gap", varint_length(gap));
-        println!("len + {:?} from range", varint_length(range));
+        //println!("len + {:?} from gap", varint_length(gap));
+        //println!("len + {:?} from range", varint_length(range));
     }
 
     //TODO add support for ecn counts
@@ -990,31 +991,21 @@ impl Header {
             0x01000000..=0xffffffff => 3,
         }
     }
+}
 
-    pub fn debug_print(&self) {
-        println!(
-            "{:#04x?} version: {:#06x?} pn: {:#010x?} dcid: 0x{} scid: 0x{} token:{:x?} length:{:?} raw_length:{:?}",
-            ((self.hf & LONG_PACKET_TYPE) >> 4),
+impl fmt::Display for Header {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#b} version: {:#06x?} pn: {:#010x?} dcid: {} scid: 0x{} token:{:x?} length:{:?} raw_length:{:?}",
+            self.hf,
             self.version,
             self.packet_num,
-            self.dcid
-                .id
-                .iter()
-                .map(|val| format!("{:x}", val))
-                .collect::<Vec<String>>()
-                .join(""),
+            self.dcid,
             self.scid
                 .clone()
-                .unwrap_or(ConnectionId::from_vec(Vec::new()))
-                .id
-                .iter()
-                .map(|val| format!("{:x}", val))
-                .collect::<Vec<String>>()
-                .join(""),
+                .unwrap_or(ConnectionId::from_vec(Vec::new())),
             self.token.as_ref().unwrap_or(&vec![0u8; 0]),
             self.length,
-            self.raw_length,
-        );
+            self.raw_length)
     }
 }
 
