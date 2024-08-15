@@ -11,7 +11,9 @@ use packet::{
 use rand::RngCore;
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
-    quic::{Connection as RustlsConnection, KeyChange, Keys, PacketKeySet, Version},
+    quic::{
+        Connection as RustlsConnection, DirectionalKeys, KeyChange, Keys, PacketKeySet, Version,
+    },
     Side,
 };
 use std::{
@@ -48,7 +50,7 @@ pub struct Distributor {
     hmac_reset_key: ring::hmac::Key,
 
     //channels for each connection
-    connection_send_handles: HashMap<ConnectionId, mpsc::Sender<packet::EarlyDatagram>>,
+    connection_send_handles: HashMap<ConnectionId, mpsc::Sender<packet::Datagram>>,
 
     //cancellation token. if activated all connections are shut down
     cancellation_token: tokio_util::sync::CancellationToken,
@@ -72,22 +74,21 @@ pub struct Acceptor {
 
 impl Acceptor {
     async fn accept(&mut self) -> Option<Connection> {
-        let (packet, remote, header, tsd, socket) = self.rx.recv().await.unwrap();
+        let (packet, remote, tsd, socket) = self.rx.recv().await.unwrap();
 
-        let (connection, ready) =
-            match Connection::early_connection((packet, remote, header), tsd, socket)
-                .instrument(debug_span!("accepting new connection"))
-                .await
-            {
-                Ok((c, r)) => (c, r),
-                Err(e) => {
-                    // if we encounter an error within the initial packet, the connection is
-                    // immediately abandoned
-                    // TODO send close connection frame, remove conn from Distributor
-                    error!("encountered error while accepting new connection: {}", e);
-                    return None;
-                }
-            };
+        let (connection, ready) = match Connection::early_connection((packet, remote), tsd, socket)
+            .instrument(debug_span!("accepting new connection"))
+            .await
+        {
+            Ok((c, r)) => (c, r),
+            Err(e) => {
+                // if we encounter an error within the initial packet, the connection is
+                // immediately abandoned
+                // TODO send close connection frame, remove conn from Distributor
+                error!("encountered error while accepting new connection: {}", e);
+                return None;
+            }
+        };
 
         //send connection close frame
         match ready.await {
@@ -243,32 +244,30 @@ impl Endpoint {
                 //truncate vector to correct size
                 buffer.truncate(size);
 
-                let partial_decode: Header = match Header::from_bytes(&buffer, 8) {
+                let dcid = match Header::get_dcid(&buffer, 8) {
                     Ok(h) => h,
-                    Err(error) => panic!("Error: {}", error),
+                    Err(error) => {
+                        error!("error while retrieving dcid from packet: {}", error);
+                        continue;
+                    }
                 };
 
-                debug!("I: {}", partial_decode);
+                debug!("searching for {}", &dcid);
 
                 //match incoming packet to connection
-                if let Some(handle) = dist
-                    .read()
-                    .await
-                    .connection_send_handles
-                    .get(&partial_decode.dcid)
-                {
-                    handle
-                        .send((buffer, src_addr.to_string(), partial_decode))
-                        .await
-                        .unwrap();
+                if let Some(handle) = dist.read().await.connection_send_handles.get(&dcid) {
+                    debug!("found existing connection");
+                    handle.send((buffer, src_addr.to_string())).await.unwrap();
                 } else {
                     //stop accepting new connections when entering graceful shutdown
-                    if partial_decode.is_inital() && !cancellation_token.is_cancelled() {
+                    if ((buffer[0] & packet::LS_TYPE_BIT) >> 7) == 1
+                        && !cancellation_token.is_cancelled()
+                    {
                         tx_initial
                             .send((
                                 buffer,
                                 src_addr.to_string(),
-                                partial_decode,
+                                //partial_decode,
                                 dist.clone(),
                                 socket.clone(),
                             ))
@@ -306,17 +305,24 @@ pub struct Connection {
 impl Connection {
     //initializes a connection from an inital packet
     async fn early_connection(
-        inital_datagram: packet::EarlyDatagram,
+        inital_datagram: packet::Datagram,
         tsd: TSDistributor,
         socket: Arc<TokioUdpSocket>,
     ) -> Result<(Self, oneshot::Receiver<terror::QuicTransportError>), terror::Error> {
-        let (mut buffer, src_addr, mut head) = inital_datagram;
+        let (mut buffer, src_addr) = inital_datagram;
         let (hmac_reset_key, server_config) = {
             let t = tsd.read().await;
             (t.hmac_reset_key.clone(), t.server_config.clone())
         };
 
         let server_config = server_config.unwrap();
+
+        let mut head = packet::Header::from_bytes(&buffer, 8).map_err(|e| {
+            terror::Error::buffer_size_error(format!(
+                "error decoding header from initial packet: {}",
+                e
+            ))
+        })?;
 
         //get initial keys, use default crypto provider by ring with all suites for now
         let ikp = Connection::derive_initial_keyset(
@@ -391,11 +397,11 @@ impl Connection {
         );
 
         let initial_space: PacketNumberSpace = PacketNumberSpace {
-            keys: Some(Arc::new(ikp)),
+            keys: Some(ikp),
             ..PacketNumberSpace::new()
         };
 
-        let (transmit_q, recv_q) = mpsc::channel::<packet::EarlyDatagram>(8);
+        let (transmit_q, recv_q) = mpsc::channel::<packet::Datagram>(8);
 
         {
             tsd.write()
@@ -403,6 +409,8 @@ impl Connection {
                 .connection_send_handles
                 .insert(initial_local_scid.clone(), transmit_q);
         }
+
+        debug!("inserted new recv handle for cid {}", initial_local_scid);
 
         let (conn_read_tx, conn_ready_rx) = oneshot::channel::<terror::QuicTransportError>();
 
@@ -461,7 +469,7 @@ impl Connection {
     //starts recv_q, feeds into all other queues
     async fn start(
         mut self,
-        mut recv_q: mpsc::Receiver<packet::EarlyDatagram>,
+        mut recv_q: mpsc::Receiver<packet::Datagram>,
         mut conn: Inner,
     ) -> Result<Self, terror::Error> {
         let socket = self.socket.clone();
@@ -533,9 +541,8 @@ struct Inner {
     //tls13 session via rustls and keying material
     tls_session: RustlsConnection,
     next_secrets: Option<rustls::quic::Secrets>,
-    prev_1rtt_keys: Option<PacketKeySet>,
-    next_1rtt_keys: Option<PacketKeySet>,
-    zero_rtt_keyset: Option<Keys>,
+    next_1rtt_packet_keys: Option<PacketKeySet>,
+    zero_rtt_keyset: Option<DirectionalKeys>,
 
     //connection state
     state: ConnectionState,
@@ -581,8 +588,7 @@ impl Inner {
             version,
             tls_session,
             next_secrets: None,
-            next_1rtt_keys: None,
-            prev_1rtt_keys: None,
+            next_1rtt_packet_keys: None,
             zero_rtt_keyset: None,
             state: ConnectionState::Initial,
             initial_dcid,
@@ -601,20 +607,121 @@ impl Inner {
         }
     }
 
-    //fully decrypts packet header and payload, does tls stuff and passes packet to process_payload
-    fn recv(&mut self, datagram: &mut packet::EarlyDatagram) -> Result<(), terror::Error> {
-        //decrypt header and payload
-        //TODO handle coalesced packets
-        self.process_payload(&datagram.2, &mut datagram.0)?;
+    fn recv(&mut self, datagram: &mut packet::Datagram) -> Result<(), terror::Error> {
+        let (buffer, _origin) = datagram;
+        let mut offset: usize = 0;
+        let mut remaining: usize = buffer.len();
 
-        // if space is handshake, call to write crypto after processing payload
+        loop {
+            let mut partial_decode = match packet::Header::from_bytes(&buffer[offset..], 8) {
+                Ok(h) => h,
+                Err(e) => {
+                    if remaining == 0 {
+                        return Ok(());
+                    }
 
-        Ok(())
+                    return Err(terror::Error::buffer_size_error(format!(
+                        "error decoding packet header: {}",
+                        e
+                    )));
+                }
+            };
+
+            let processed_bytes = self.recv_single(&mut buffer[offset..], &mut partial_decode)?;
+
+            offset += processed_bytes;
+            remaining -= processed_bytes;
+        }
+    }
+
+    fn recv_single(
+        &mut self,
+        packet: &mut [u8],
+        header: &mut Header,
+    ) -> Result<usize, terror::Error> {
+        //zero rtt
+        if ((header.hf & packet::LS_TYPE_BIT) >> 7) == 0x01
+            && ((header.hf & packet::LONG_PACKET_TYPE) >> 4) == 0x01
+        {
+            if !self.zero_rtt_enabled {
+                return Err(terror::Error::quic_transport_error(
+                    "received unexpected zero rtt packet",
+                    terror::QuicTransportError::InternalError,
+                ));
+            }
+
+            let _dk = self.zero_rtt_keyset.as_ref().unwrap();
+
+            todo!("zero rtt packet handling is not yet implemented")
+        }
+
+        //retry
+        if ((header.hf & packet::LS_TYPE_BIT) >> 7) == 0x01
+            && ((header.hf & packet::LONG_PACKET_TYPE) >> 4) == 0x03
+        {
+            todo!("retry packet handling is not yet implemented")
+        }
+
+        //decrypt packet
+        let keys: &DirectionalKeys = &self.packet_spaces[header.space()]
+            .keys
+            .as_ref()
+            .unwrap()
+            .remote;
+
+        let header_length = match header.decrypt(packet, keys.header.as_ref()) {
+            Ok(s) => s,
+            Err(error) => {
+                return Err(terror::Error::crypto_error(format!(
+                    "unable to decrypt header: {}",
+                    error
+                )))
+            }
+        };
+
+        let mut payload = OctetsMut::with_slice(packet);
+        let (header_raw, mut payload_cipher) = payload.split_at(header_length)?;
+
+        let (mut payload_cipher, _) =
+            payload_cipher.split_at(header.length - header.packet_num_length as usize - 1)?;
+
+        let raw_packet_length = header_raw.len() + payload_cipher.len();
+
+        //payload cipher must be exact size without zeros from the buffer beeing to big!
+        let dec_len = {
+            let decrypted_payload_raw = match keys.packet.decrypt_in_place(
+                header.packet_num.into(),
+                header_raw.as_ref(),
+                payload_cipher.as_mut(),
+            ) {
+                Ok(p) => p,
+                Err(error) => {
+                    return Err(terror::Error::crypto_error(format!(
+                        "unable to decrypt packet body {}",
+                        error
+                    )))
+                }
+            };
+            decrypted_payload_raw.len()
+        };
+
+        let (mut payload, _) = payload_cipher.split_at(dec_len)?;
+
+        println!("{:x?}", payload);
+
+        self.process_payload(header, &mut payload)?;
+
+        Ok(raw_packet_length)
     }
 
     //accepts new connection, passes payload to process_payload
     fn accept(&mut self, header: &Header, packet_raw: &mut [u8]) -> Result<(), terror::Error> {
-        self.process_payload(header, packet_raw)?;
+        let mut payload = octets::OctetsMut::with_slice(packet_raw);
+
+        //skip forth to packet payload
+        payload.skip(header.raw_length + header.packet_num_length as usize + 1)?;
+
+        self.process_payload(header, &mut payload)?;
 
         if let Some(tpc) = self.tls_session.quic_transport_parameters() {
             self.remote_tpc.update(tpc)?;
@@ -631,25 +738,23 @@ impl Inner {
         self.generate_crypto_data(SPACE_ID_INITIAL);
         self.generate_crypto_data(SPACE_ID_HANDSHAKE);
 
+        //init zero rtt if enabled
+        if self.zero_rtt_enabled {
+            if let Some(zero_rtt_keyset) = self.tls_session.zero_rtt_keys() {
+                self.zero_rtt_keyset = Some(zero_rtt_keyset);
+            } else {
+                error!("failed to derive zero rtt keyset");
+            }
+        }
+
         Ok(())
     }
 
     fn process_payload(
         &mut self,
         header: &Header,
-        payload: &mut [u8],
+        payload: &mut OctetsMut,
     ) -> Result<(), terror::Error> {
-        let mut payload = octets::OctetsMut::with_slice(payload);
-
-        //skip forth to packet payload
-        if let Err(error) = payload.skip(header.raw_length + header.packet_num_length as usize + 1)
-        {
-            return Err(terror::Error::buffer_size_error(format!(
-                "header is longer than packet {}",
-                error
-            )));
-        };
-
         let mut ack_eliciting = false;
 
         while payload.peek_u8().is_ok() {
@@ -664,7 +769,7 @@ impl Inner {
                 } //PADDING
                 0x01 => continue, //PING
                 0x02 | 0x03 => {
-                    let _ack = AckFrame::from_bytes(&frame_code, &mut payload);
+                    let _ack = AckFrame::from_bytes(&frame_code, payload);
                 } //ACK
                 0x04 => {
                     let _stream_id = payload.get_varint().unwrap();
@@ -676,25 +781,24 @@ impl Inner {
                     let _application_protocol_error_code = payload.get_varint().unwrap();
                 } //STOP_SENDING
                 0x06 => {
-                    let crypto_frame = CryptoFrame::from_bytes(&frame_code, &mut payload);
+                    let crypto_frame = CryptoFrame::from_bytes(&frame_code, payload);
                     self.process_crypto_data(&crypto_frame);
                 } //CRYPTO
                 0x07 => {
                     if self.side != Side::Server {
-                        let _new_token = NewTokenFrame::from_bytes(&frame_code, &mut payload);
+                        let _new_token = NewTokenFrame::from_bytes(&frame_code, payload);
                     } else {
                         //Quic Error: ProtocolViolation
                     }
                 } //NEW_TOKEN
                 0x08..=0x0f => {
-                    let stream_frame = StreamFrame::from_bytes(&frame_code, &mut payload);
+                    let stream_frame = StreamFrame::from_bytes(&frame_code, payload);
                     let (_, mut stream_data) = payload.split_at(payload.off()).unwrap();
 
                     //isolate stream data if offset is present, else data extends to end of packet
                     if stream_frame.offset.is_some() {
-                        (stream_data, _) = payload
-                            .split_at(stream_frame.offset.unwrap() as usize)
-                            .unwrap();
+                        (stream_data, _) =
+                            payload.split_at(stream_frame.offset.unwrap() as usize)?;
                     }
                     debug!("stream data: {:?}", stream_data);
                 } //STREAM
@@ -725,8 +829,7 @@ impl Inner {
                     let _maximum_streams = payload.get_varint().unwrap();
                 } //STREAMS_BLOCKED (unidirectional)
                 0x18 => {
-                    let _new_connection_id =
-                        NewConnectionIdFrame::from_bytes(&frame_code, &mut payload);
+                    let _new_connection_id = NewConnectionIdFrame::from_bytes(&frame_code, payload);
                 } //NEW_CONNECTION_ID
                 0x19 => {
                     let _sequence_number = payload.get_varint().unwrap();
@@ -738,8 +841,7 @@ impl Inner {
                     let _path_response_data = payload.get_u64().unwrap();
                 } //PATH_RESPONSE
                 0x1c | 0x1d => {
-                    let _connection_close =
-                        ConnectionCloseFrame::from_bytes(&frame_code, &mut payload);
+                    let _connection_close = ConnectionCloseFrame::from_bytes(&frame_code, payload);
                 } //CONNECTION_CLOSE_FRAME
                 0x1e => {
                     if self.side == Side::Server {
@@ -822,7 +924,7 @@ impl Inner {
 
             // if space id is DATA, only the packet payload keys update, not the header keys
             if (space_id + 1) == SPACE_ID_DATA {
-                self.next_1rtt_keys = Some(
+                self.next_1rtt_packet_keys = Some(
                     self.next_secrets
                         .as_mut()
                         .expect("handshake should be completed and next secrets availible")
@@ -831,7 +933,7 @@ impl Inner {
             }
 
             //"upgrade" to next packet number space with new keying material
-            self.packet_spaces[space_id + 1].keys = Some(Arc::new(keys));
+            self.packet_spaces[space_id + 1].keys = Some(keys);
 
             //advance space
             self.current_space = space_id + 1;
@@ -840,8 +942,6 @@ impl Inner {
         if buf.is_empty() && space_id == self.current_space {
             return;
         }
-
-        //println!("Crypto {:?}", buf.len());
 
         //create outgoing crypto frame
         let offset = self.packet_spaces[space_id].outgoing_crypto_offset;
@@ -867,14 +967,7 @@ impl Inner {
                         &self.initial_remote_scid,
                         &self.initial_local_scid,
                         Some(vec![]),
-                    )?
-                    .with_crypto(
-                        self.packet_spaces[SPACE_ID_INITIAL]
-                            .keys
-                            .as_ref()
-                            .unwrap()
-                            .clone(),
-                    );
+                    )?;
                 dgram_builder.add_packet(initial);
             }
         }
@@ -891,21 +984,18 @@ impl Inner {
                         &self.initial_remote_scid,
                         &self.initial_local_scid,
                         None,
-                    )?
-                    .with_crypto(
-                        self.packet_spaces[SPACE_ID_HANDSHAKE]
-                            .keys
-                            .as_ref()
-                            .unwrap()
-                            .clone(),
-                    );
+                    )?;
                 dgram_builder.add_packet(hs);
             }
         }
 
         // data space
 
-        dgram_builder.build(self.remote.to_string())
+        dgram_builder.build(
+            self.remote.to_string(),
+            &self.packet_spaces,
+            &self.zero_rtt_keyset,
+        )
     }
 
     // fetches only early data to send, i.e. crypto & ack
@@ -984,7 +1074,7 @@ enum ConnectionState {
 
 //RFC 9000 section 12.3. we have 3 packet number spaces: initial, handshake & 1-RTT
 struct PacketNumberSpace {
-    keys: Option<Arc<Keys>>,
+    keys: Option<Keys>,
 
     outgoing_acks: Vec<u64>,
 
@@ -1008,6 +1098,21 @@ impl PacketNumberSpace {
     fn get_next_pkt_num(&mut self) -> u32 {
         self.next_pkt_num += 1;
         self.next_pkt_num - 1
+    }
+
+    // once a key replace is triggered, the next 1-rtt packet keys replace the old ones in the data
+    // space. The next 1-rtt are then derived from the secret
+    fn replace_packet_keys(&mut self, packet_keys: PacketKeySet) {
+        //maybe save old keys to keep in case a keyupdate is not completed
+        let _ = std::mem::replace(
+            &mut self.keys.as_mut().unwrap().local.packet,
+            packet_keys.local,
+        );
+
+        let _ = std::mem::replace(
+            &mut self.keys.as_mut().unwrap().remote.packet,
+            packet_keys.remote,
+        );
     }
 }
 

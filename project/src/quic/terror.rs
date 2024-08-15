@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 use std::fmt;
 
+use octets::BufferTooShortError;
+
 #[derive(Debug)]
 pub struct Error {
     code: u64,
@@ -58,6 +60,12 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn description(&self) -> &str {
         &self.msg
+    }
+}
+
+impl From<BufferTooShortError> for Error {
+    fn from(e: BufferTooShortError) -> Self {
+        Self::buffer_size_error(format!("{}", e))
     }
 }
 

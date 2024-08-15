@@ -1,16 +1,16 @@
-use crate::{terror, token::StatelessResetToken, ConnectionId, TSDistributor};
+use crate::{terror, token::StatelessResetToken, ConnectionId, PacketNumberSpace, TSDistributor};
 
 use octets::Octets;
-use rustls::quic::HeaderProtectionKey;
-use tracing::{debug, info};
+use rustls::quic::{DirectionalKeys, HeaderProtectionKey};
+use tracing::debug;
 
-use std::{collections::VecDeque, fmt, marker::PhantomData, sync::Arc};
+use std::{collections::VecDeque, fmt, marker::PhantomData};
 
 const MAX_PKT_NUM_LEN: usize = 4;
 const SAMPLE_LEN: usize = 16;
 
 pub const LS_TYPE_BIT: u8 = 0x80;
-const LONG_PACKET_TYPE: u8 = 0x30;
+pub const LONG_PACKET_TYPE: u8 = 0x30;
 const PKT_NUM_LENGTH_MASK: u8 = 0x03;
 
 pub const LONG_HEADER_TYPE_INITIAL: u8 = 0x00;
@@ -19,14 +19,10 @@ pub const LONG_HEADER_TYPE_HANDSHAKE: u8 = 0x02;
 //packet and address, either source or destination
 pub type Datagram = (Vec<u8>, String);
 
-//early packet with partial header decode
-pub type EarlyDatagram = (Vec<u8>, String, Header);
-
 //inital packet with early datagram and distributor
 pub type InitialDatagram = (
     Vec<u8>,
     String,
-    Header,
     TSDistributor,
     std::sync::Arc<tokio::net::UdpSocket>,
 );
@@ -58,14 +54,36 @@ impl DatagramBuilder {
         self.packets.push_back(packet);
     }
 
-    pub fn build(mut self, address: String) -> Result<Datagram, terror::Error> {
+    pub fn build(
+        mut self,
+        address: String,
+        spaces: &[PacketNumberSpace; 3],
+        zero_rtt_keys: &Option<DirectionalKeys>,
+    ) -> Result<Datagram, terror::Error> {
         let mut offset: usize = 0;
         let size = self.packets.len();
         let mut dgram = std::mem::take(&mut self.dgram);
         let mut i: usize = 0;
 
         while let Some(mut packet) = self.packets.pop_front() {
-            let tag_len = packet.keys.as_ref().unwrap().local.packet.tag_len();
+            //if it is a long header and its type is 0-rtt and space is data, use 0-rtt keys
+            let keys: &DirectionalKeys = if ((packet.header.hf & LS_TYPE_BIT) >> 7) == 0x01
+                && ((packet.header.hf & LONG_PACKET_TYPE) >> 4) == 0x01
+                && packet.header.space == 0x02
+            {
+                match zero_rtt_keys.as_ref() {
+                    Some(dk) => dk,
+                    None => {
+                        return Err(terror::Error::crypto_error(
+                            "No keys availible to encrypt zero-rtt packet",
+                        ))
+                    }
+                }
+            } else {
+                &spaces[packet.header.space].keys.as_ref().unwrap().local
+            };
+
+            let tag_len = keys.packet.tag_len();
             //add tag length to payload length
             packet.header.length += tag_len;
 
@@ -83,7 +101,7 @@ impl DatagramBuilder {
                 packet.header.length += additional_space;
             }
 
-            packet.encode_and_encrypt(&mut dgram[offset..offset + required_space])?;
+            packet.encode_and_encrypt(&mut dgram[offset..offset + required_space], keys)?;
 
             offset += required_space;
             i += 1;
@@ -100,13 +118,10 @@ impl DatagramBuilder {
 //Required for full packet
 pub struct PacketBody;
 pub struct PacketHeader;
-pub struct PacketCrypto;
-pub type Completed = (PacketBody, PacketHeader, PacketCrypto);
+pub type Completed = (PacketBody, PacketHeader);
 
 //Packet Builder
-pub struct PacketBuilder<S = ((), (), ())> {
-    keys: Option<Arc<rustls::quic::Keys>>,
-
+pub struct PacketBuilder<S = ((), ())> {
     //packet
     header: Header,
     body: Vec<u8>,
@@ -117,15 +132,8 @@ pub struct PacketBuilder<S = ((), (), ())> {
 }
 
 // private to control how Thing can be constructed
-fn new_packet_builder<S>(
-    keys: Option<Arc<rustls::quic::Keys>>,
-    header: Header,
-    body: Vec<u8>,
-    //packet_length: usize,
-    quic_version: u32,
-) -> PacketBuilder<S> {
+fn new_packet_builder<S>(header: Header, body: Vec<u8>, quic_version: u32) -> PacketBuilder<S> {
     PacketBuilder {
-        keys,
         header,
         body,
         quic_version,
@@ -135,13 +143,13 @@ fn new_packet_builder<S>(
 
 impl PacketBuilder {
     pub fn new(quic_version: u32) -> Self {
-        new_packet_builder(None, Header::default(), Vec::new(), quic_version)
+        new_packet_builder(Header::default(), Vec::new(), quic_version)
     }
 }
 
-impl<B, H, C> PacketBuilder<(B, H, C)> {
-    pub fn with_body(self, body: Vec<u8>) -> PacketBuilder<(PacketBody, H, C)> {
-        new_packet_builder(self.keys, self.header, body, self.quic_version)
+impl<B, H> PacketBuilder<(B, H)> {
+    pub fn with_body(self, body: Vec<u8>) -> PacketBuilder<(PacketBody, H)> {
+        new_packet_builder(self.header, body, self.quic_version)
     }
 
     pub fn with_long_header(
@@ -151,7 +159,7 @@ impl<B, H, C> PacketBuilder<(B, H, C)> {
         dcid: &ConnectionId,
         scid: &ConnectionId,
         token: Option<Vec<u8>>,
-    ) -> Result<PacketBuilder<(B, PacketHeader, C)>, terror::Error> {
+    ) -> Result<PacketBuilder<(B, PacketHeader)>, terror::Error> {
         let packet_number_length = Header::calculate_pn_length(packet_number);
         let packet_length = self.body.len() + (packet_number_length + 1) as usize;
 
@@ -165,12 +173,7 @@ impl<B, H, C> PacketBuilder<(B, H, C)> {
             packet_length,
         )?;
 
-        Ok(new_packet_builder(
-            self.keys,
-            header,
-            self.body,
-            self.quic_version,
-        ))
+        Ok(new_packet_builder(header, self.body, self.quic_version))
     }
 
     pub fn with_short_header(
@@ -179,24 +182,25 @@ impl<B, H, C> PacketBuilder<(B, H, C)> {
         dcid: &ConnectionId,
         spin_bit: u8,
         key_phase: u8,
-    ) -> Result<PacketBuilder<(B, PacketHeader, C)>, terror::Error> {
+    ) -> Result<PacketBuilder<(B, PacketHeader)>, terror::Error> {
         let header =
             Header::new_short_header(spin_bit, key_phase, self.quic_version, packet_number, dcid)?;
 
-        Ok(new_packet_builder(
-            self.keys,
-            header,
-            self.body,
-            self.quic_version,
-        ))
-    }
-
-    pub fn with_crypto(self, keys: Arc<rustls::quic::Keys>) -> PacketBuilder<(B, H, PacketCrypto)> {
-        new_packet_builder(Some(keys), self.header, self.body, self.quic_version)
+        Ok(new_packet_builder(header, self.body, self.quic_version))
     }
 }
 
-impl<C> PacketBuilder<(PacketBody, PacketHeader, C)> {
+impl PacketBuilder<Completed> {
+    fn encode_and_encrypt(
+        self,
+        packet: &mut [u8],
+        keys: &DirectionalKeys,
+    ) -> Result<(), terror::Error> {
+        self.encode(packet)?;
+        self.encrypt(packet, keys)?;
+        Ok(())
+    }
+
     // encodes the packet and its header into the datagram, can only be called after body and
     // header have been specified
     fn encode(&self, dgram: &mut [u8]) -> Result<(), terror::Error> {
@@ -222,20 +226,10 @@ impl<C> PacketBuilder<(PacketBody, PacketHeader, C)> {
 
         Ok(())
     }
-}
-
-impl PacketBuilder<Completed> {
-    fn encode_and_encrypt(self, packet: &mut [u8]) -> Result<(), terror::Error> {
-        self.encode(packet)?;
-        self.encrypt(packet)?;
-        Ok(())
-    }
 
     //encrypts the packet in dgram and consumes self, finalizing the packet
-    fn encrypt(self, packet: &mut [u8]) -> Result<(), terror::Error> {
-        let keys = self.keys.unwrap();
-
-        let tag_len = keys.local.packet.tag_len();
+    fn encrypt(self, packet: &mut [u8], keys: &DirectionalKeys) -> Result<(), terror::Error> {
+        let tag_len = keys.packet.tag_len();
 
         let header_end_off: usize =
             self.header.raw_length + self.header.packet_num_length as usize + 1;
@@ -245,7 +239,6 @@ impl PacketBuilder<Completed> {
 
         let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - tag_len);
         let tag = keys
-            .local
             .packet
             .encrypt_in_place(self.header.packet_num as u64, &*header, payload)
             .unwrap();
@@ -258,10 +251,9 @@ impl PacketBuilder<Completed> {
         let (first, rest) = header.split_at_mut(1);
         let pn_end = Ord::min(pn_offset + 3, rest.len());
 
-        keys.local
-            .header
+        keys.header
             .encrypt_in_place(
-                &sample[..keys.local.header.sample_len()],
+                &sample[..keys.header.sample_len()],
                 &mut first[0],
                 &mut rest[pn_offset - 1..pn_end],
             )
@@ -718,6 +710,9 @@ pub struct Header {
 
     //header length excluding packet num
     pub raw_length: usize,
+
+    //packet number space for key retrieval, either 0, 1 or 2
+    space: usize,
 }
 
 impl Header {
@@ -730,6 +725,8 @@ impl Header {
         token: Option<Vec<u8>>,
         packet_length: usize,
     ) -> Result<Self, terror::Error> {
+        let mut space: usize = 2;
+
         if !matches!(long_header_type, 0x00..=0x03) {
             return Err(terror::Error::header_encoding_error(format!(
                 "unsupported long header type {:?}",
@@ -746,10 +743,15 @@ impl Header {
         let mut raw_length = 1 + 4 + 1 + dcid.len() + 1 + scid.len();
 
         if long_header_type == 0x00 {
+            space = 0;
             // token length is encoded as variable length integer
             let token_length_length = varint_length(token.as_ref().unwrap().len() as u64);
 
             raw_length += token_length_length + token.as_ref().unwrap().len();
+        }
+
+        if long_header_type == 0x02 {
+            space = 1;
         }
 
         //variable length packet length always encoded as length 4
@@ -767,6 +769,7 @@ impl Header {
             token,
             packet_length,
             raw_length,
+            space,
         ))
     }
 
@@ -795,6 +798,7 @@ impl Header {
 
         Ok(Header::new(
             0x00, 0x00, spin_bit, key_phase, version, dcid, None, packet_num, None, 0, raw_length,
+            2,
         ))
     }
 
@@ -811,6 +815,7 @@ impl Header {
         token: Option<Vec<u8>>,
         length: usize,
         raw_length: usize,
+        space: usize,
     ) -> Self {
         let packet_num_length = Header::calculate_pn_length(packet_num);
         let mut hf: u8 = 0x00;
@@ -839,6 +844,7 @@ impl Header {
             token,
             length,
             raw_length,
+            space,
         }
     }
 
@@ -919,11 +925,11 @@ impl Header {
     }
 
     pub fn from_bytes(
-        // b: &mut octets::OctetsMut,
         buffer: &[u8],
         dcid_len: usize,
     ) -> Result<Header, octets::BufferTooShortError> {
         let mut b = Octets::with_slice(buffer);
+        let mut space: usize = 2;
         let hf = b.get_u8()?;
 
         if ((hf & LS_TYPE_BIT) >> 7) == 0 {
@@ -940,6 +946,7 @@ impl Header {
                 token: None,
                 length: 0, //TODO
                 raw_length: b.off(),
+                space,
             });
         }
 
@@ -957,10 +964,11 @@ impl Header {
             0x00 => {
                 // Initial
                 tok = Some(b.get_bytes_with_varint_length()?.to_vec());
+                space = 0;
             }
-            0x01 => (), // Zero-RTT
-            0x02 => (), // Handshake
-            0x03 => (), // Retry
+            0x01 => (),        // Zero-RTT
+            0x02 => space = 1, // Handshake
+            0x03 => (),        // Retry
             _ => panic!("Fatal Error with packet type"),
         }
 
@@ -976,7 +984,33 @@ impl Header {
             token: tok,
             length,
             raw_length: b.off(),
+            space,
         })
+    }
+
+    pub fn get_dcid(
+        buffer: &[u8],
+        dcid_len: usize,
+    ) -> Result<ConnectionId, octets::BufferTooShortError> {
+        let mut b = Octets::with_slice(buffer);
+        let hf = b.get_u8()?;
+
+        if ((hf & LS_TYPE_BIT) >> 7) == 0 {
+            //short packet
+            let dcid = b.get_bytes(dcid_len)?;
+            return Ok(<Vec<u8> as Into<ConnectionId>>::into(dcid.to_vec()));
+        }
+
+        let _ = b.get_u32()?;
+
+        let dcid_length = b.get_u8()?;
+        Ok(<Vec<u8> as Into<ConnectionId>>::into(
+            b.get_bytes(dcid_length as usize)?.to_vec(),
+        ))
+    }
+
+    pub fn space(&self) -> usize {
+        self.space
     }
 
     pub fn is_inital(&self) -> bool {
