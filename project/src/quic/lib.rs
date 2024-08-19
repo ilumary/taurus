@@ -5,8 +5,7 @@ mod transport_parameters;
 
 use octets::OctetsMut;
 use packet::{
-    AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, Header, NewConnectionIdFrame,
-    NewTokenFrame, StreamFrame,
+    AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, Header, NewTokenFrame, StreamFrame,
 };
 use rand::RngCore;
 use rustls::{
@@ -22,15 +21,17 @@ use std::{
     net::SocketAddr,
     sync::Arc,
 };
+use token::StatelessResetToken;
 use tokio::{
     net::UdpSocket as TokioUdpSocket,
     sync::{mpsc, oneshot, RwLock},
     task::JoinHandle,
 };
-use tracing::{debug, debug_span, error, info, warn, Instrument};
+use tracing::{debug, debug_span, error, event, info, warn, Instrument, Level};
 use transport_parameters::{
-    InitialSourceConnectionId, OriginalDestinationConnectionId, StatelessResetTokenTP,
-    TransportConfig,
+    InitialMaxData, InitialMaxStreamDataBidiLocal, InitialMaxStreamDataBidiRemote,
+    InitialMaxStreamsBidi, InitialSourceConnectionId, MaxUdpPayloadSize,
+    OriginalDestinationConnectionId, StatelessResetTokenTP, TransportConfig, VarInt,
 };
 
 const MAX_CID_SIZE: usize = 20;
@@ -77,7 +78,7 @@ impl Acceptor {
         let (packet, remote, tsd, socket) = self.rx.recv().await.unwrap();
 
         let (connection, ready) = match Connection::early_connection((packet, remote), tsd, socket)
-            .instrument(debug_span!("accepting new connection"))
+            .instrument(debug_span!("new connection"))
             .await
         {
             Ok((c, r)) => (c, r),
@@ -240,7 +241,14 @@ impl Endpoint {
                         continue;
                     }
                 };
-                info!("Received {:?} bytes from {:?}", size, src_addr);
+
+                let head = match &buffer[0] >> 7 {
+                    0x01 => "LH",
+                    0x00 => "SH",
+                    _ => "NOT RECOGNISED",
+                };
+
+                info!("Received {:?} bytes from {:?} ({})", size, src_addr, head);
                 //truncate vector to correct size
                 buffer.truncate(size);
 
@@ -386,6 +394,15 @@ impl Connection {
             stateless_reset_token: StatelessResetTokenTP::try_from(
                 token::StatelessResetToken::new(&hmac_reset_key, &initial_local_scid),
             )?,
+            max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
+            initial_max_streams_bidi: InitialMaxStreamsBidi::try_from(VarInt::from(1))?,
+            initial_max_data: InitialMaxData::try_from(VarInt::from(1024))?,
+            initial_max_stream_data_bidi_remote: InitialMaxStreamDataBidiRemote::try_from(
+                VarInt::from(1024),
+            )?,
+            initial_max_stream_data_bidi_local: InitialMaxStreamDataBidiLocal::try_from(
+                VarInt::from(1024),
+            )?,
             ..TransportConfig::default()
         };
 
@@ -398,6 +415,7 @@ impl Connection {
 
         let initial_space: PacketNumberSpace = PacketNumberSpace {
             keys: Some(ikp),
+            active: true,
             ..PacketNumberSpace::new()
         };
 
@@ -414,13 +432,18 @@ impl Connection {
 
         let (conn_read_tx, conn_ready_rx) = oneshot::channel::<terror::QuicTransportError>();
 
+        let cim = ConnectionIdManager::with_initial_cids(
+            head.scid.clone().unwrap(),
+            initial_local_scid,
+            None,
+            Some(orig_dcid),
+        );
+
         let mut inner = Inner::new(
             Side::Server,
             head.version,
             conn,
-            orig_dcid,
-            head.scid.clone().unwrap(),
-            initial_local_scid,
+            cim,
             src_addr.parse().unwrap(),
             initial_space,
             conn_read_tx,
@@ -434,8 +457,10 @@ impl Connection {
         //process inital packet inside connection, all subsequent packets are sent through channel
         inner.accept(&head, &mut buffer)?;
 
-        let initial_answer: packet::Datagram = inner.fetch_dgram()?;
-        conn.send(&initial_answer).await?;
+        let mut buf = [0u8; 65536];
+
+        let size = inner.fetch_dgram(&mut buf)?;
+        conn.send(&buf[..size], inner.remote.to_string()).await?;
 
         //promote connection state
         inner.state = ConnectionState::Handshake;
@@ -476,41 +501,45 @@ impl Connection {
 
         self.loop_handle = Some(tokio::spawn(async move {
             while let Some(mut msg) = recv_q.recv().await {
-                debug!(origin = msg.1, "received datagram. processing...");
-
                 //process
                 if let Err(error) = conn.recv(&mut msg) {
                     error!("error processing datagram: {}", error);
                 };
 
-                //send back ack at least, check for data in outgoing streams
-                //placeholder
-                let dgram: packet::Datagram = (vec![], conn.remote.to_string());
+                //prepare answer
+                let mut buffer = [0u8; 65536];
+                let size = match conn.fetch_dgram(&mut buffer) {
+                    Ok(s) => s,
+                    Err(err) => {
+                        error!("failed to fetch datagram: {}", err);
+                        continue;
+                    }
+                };
 
                 //send data back
-                let size = match socket.send_to(&dgram.0, &dgram.1).await {
+                let size = match socket.send_to(&buffer[..size], &msg.1).await {
                     Ok(size) => size,
                     Err(error) => {
                         return Err(terror::Error::socket_error(format!("{}", error)));
                     }
                 };
 
-                info!(destination = dgram.1, "sent {} bytes", size);
+                info!(destination = &msg.1, "sent {} bytes", size);
             }
             Ok(0)
         }));
         Ok(self)
     }
 
-    async fn send(&self, dgram: &packet::Datagram) -> Result<(), terror::Error> {
-        let size = match self.socket.send_to(&dgram.0, &dgram.1).await {
+    async fn send(&self, dgram: &[u8], address: String) -> Result<(), terror::Error> {
+        let size = match self.socket.send_to(dgram, &address).await {
             Ok(size) => size,
             Err(error) => {
                 return Err(terror::Error::socket_error(format!("{}", error)));
             }
         };
 
-        info!(destination = dgram.1, "sent {} bytes", size);
+        info!(destination = &address, "sent {} bytes", size);
 
         Ok(())
     }
@@ -547,14 +576,8 @@ struct Inner {
     //connection state
     state: ConnectionState,
 
-    // First received dcid
-    initial_dcid: ConnectionId,
-    // First received scid
-    initial_remote_scid: ConnectionId,
-    // First generated scid after handshake receive
-    initial_local_scid: ConnectionId,
-    // Retry Source Connection Id
-    rscid: Option<ConnectionId>,
+    //connection id manager
+    cidm: ConnectionIdManager,
 
     // Packet number spaces, inital, handshake, 1-RTT
     packet_spaces: [PacketNumberSpace; 3],
@@ -575,9 +598,7 @@ impl Inner {
         side: Side,
         version: u32,
         tls_session: RustlsConnection,
-        initial_dcid: ConnectionId,
-        initial_remote_scid: ConnectionId,
-        initial_local_scid: ConnectionId,
+        cidm: ConnectionIdManager,
         remote_address: SocketAddr,
         initial_space: PacketNumberSpace,
         conn_ready: oneshot::Sender<terror::QuicTransportError>,
@@ -591,10 +612,7 @@ impl Inner {
             next_1rtt_packet_keys: None,
             zero_rtt_keyset: None,
             state: ConnectionState::Initial,
-            initial_dcid,
-            initial_remote_scid,
-            initial_local_scid,
-            rscid: None,
+            cidm,
             packet_spaces: [
                 initial_space,
                 PacketNumberSpace::new(),
@@ -629,16 +647,25 @@ impl Inner {
 
             let processed_bytes = self.recv_single(&mut buffer[offset..], &mut partial_decode)?;
 
+            debug!(
+                "processed packet with {} bytes. remaining: {}",
+                processed_bytes,
+                remaining - processed_bytes
+            );
+
             offset += processed_bytes;
             remaining -= processed_bytes;
         }
     }
 
+    #[tracing::instrument(skip_all, fields(space = header.space()))]
     fn recv_single(
         &mut self,
         packet: &mut [u8],
         header: &mut Header,
     ) -> Result<usize, terror::Error> {
+        debug!("H: {}", header);
+
         //zero rtt
         if ((header.hf & packet::LS_TYPE_BIT) >> 7) == 0x01
             && ((header.hf & packet::LONG_PACKET_TYPE) >> 4) == 0x01
@@ -680,10 +707,24 @@ impl Inner {
         };
 
         let mut payload = OctetsMut::with_slice(packet);
-        let (header_raw, mut payload_cipher) = payload.split_at(header_length)?;
+        let (header_raw, mut rest) = payload.split_at(header_length)?;
+        let mut payload_cipher: OctetsMut;
 
-        let (mut payload_cipher, _) =
-            payload_cipher.split_at(header.length - header.packet_num_length as usize - 1)?;
+        //rfc 9000 sec 12.2: Retry packets, Version Negotiation packets, and packets with a
+        //short header do not contain a Length field and so cannot be followed by other
+        //packets in the same UDP datagram
+        //Therefore we only need to trim payload_cipher if we have an initial, handshake or
+        //zero rtt packet
+        if header.space() == SPACE_ID_INITIAL
+            || header.space() == SPACE_ID_HANDSHAKE
+            || ((header.hf & packet::LS_TYPE_BIT) >> 7) == 0x01
+                && ((header.hf & packet::LONG_PACKET_TYPE) >> 4) == 0x01
+        {
+            (payload_cipher, _) =
+                rest.split_at(header.length - header.packet_num_length as usize - 1)?;
+        } else {
+            payload_cipher = rest;
+        }
 
         let raw_packet_length = header_raw.len() + payload_cipher.len();
 
@@ -707,14 +748,17 @@ impl Inner {
 
         let (mut payload, _) = payload_cipher.split_at(dec_len)?;
 
-        println!("{:x?}", payload);
-
         self.process_payload(header, &mut payload)?;
 
         Ok(raw_packet_length)
     }
 
-    //accepts new connection, passes payload to process_payload
+    //sends initial connection packet
+    fn _connect(&mut self) -> Result<(), terror::Error> {
+        Ok(())
+    }
+
+    //accepts new connection
     fn accept(&mut self, header: &Header, packet_raw: &mut [u8]) -> Result<(), terror::Error> {
         let mut payload = octets::OctetsMut::with_slice(packet_raw);
 
@@ -727,7 +771,8 @@ impl Inner {
             self.remote_tpc.update(tpc)?;
         }
 
-        if *self.remote_tpc.initial_source_connection_id.get().unwrap() != self.initial_remote_scid
+        if self.remote_tpc.initial_source_connection_id.get().unwrap()
+            != self.cidm.get_inital_remote_scid().unwrap()
         {
             return Err(terror::Error::quic_transport_error(
                 "scids from packet header and transport parameters differ",
@@ -750,6 +795,7 @@ impl Inner {
         Ok(())
     }
 
+    #[tracing::instrument(skip_all, fields(pn = header.packet_num))]
     fn process_payload(
         &mut self,
         header: &Header,
@@ -761,15 +807,19 @@ impl Inner {
             let frame_code = payload.get_u8().unwrap();
 
             //check if frame is ack eliciting
-            ack_eliciting = !matches!(frame_code, 0x00 | 0x02 | 0x03 | 0x1c | 0x1d);
+            match frame_code {
+                0x00 | 0x02 | 0x03 | 0x1c | 0x1d => (),
+                _ => ack_eliciting = true,
+            }
 
             match frame_code {
                 0x00 => {
                     let _ = payload.get_u8();
                 } //PADDING
-                0x01 => continue, //PING
+                0x01 => {} //PING
                 0x02 | 0x03 => {
-                    let _ack = AckFrame::from_bytes(&frame_code, payload);
+                    let ack = AckFrame::from_bytes(&frame_code, payload);
+                    self.process_ack(ack, header.space())?;
                 } //ACK
                 0x04 => {
                     let _stream_id = payload.get_varint().unwrap();
@@ -783,6 +833,23 @@ impl Inner {
                 0x06 => {
                     let crypto_frame = CryptoFrame::from_bytes(&frame_code, payload);
                     self.process_crypto_data(&crypto_frame);
+
+                    //test if all required crypto data has been exchanged for the connection to be
+                    //considered established
+                    if self.tls_session.alpn_protocol().is_some()
+                        && self.tls_session.negotiated_cipher_suite().is_some()
+                        && !self.tls_session.is_handshaking()
+                        && self.state == ConnectionState::Handshake
+                    {
+                        event!(
+                            Level::INFO,
+                            "connection established to {}",
+                            self.remote.to_string()
+                        );
+
+                        self.state = ConnectionState::Connected;
+                        self.transmit_ready(terror::QuicTransportError::NoError);
+                    }
                 } //CRYPTO
                 0x07 => {
                     if self.side != Side::Server {
@@ -796,11 +863,12 @@ impl Inner {
                     let (_, mut stream_data) = payload.split_at(payload.off()).unwrap();
 
                     //isolate stream data if offset is present, else data extends to end of packet
+                    //TODO skip stream data
                     if stream_frame.offset.is_some() {
                         (stream_data, _) =
                             payload.split_at(stream_frame.offset.unwrap() as usize)?;
                     }
-                    debug!("stream data: {:?}", stream_data);
+                    println!("STREAM DATA: {:x?}", stream_data);
                 } //STREAM
                 0x10 => {
                     let _max_data = payload.get_varint().unwrap();
@@ -829,7 +897,28 @@ impl Inner {
                     let _maximum_streams = payload.get_varint().unwrap();
                 } //STREAMS_BLOCKED (unidirectional)
                 0x18 => {
-                    let _new_connection_id = NewConnectionIdFrame::from_bytes(&frame_code, payload);
+                    println!("NEW CID");
+                    let sqn = payload.get_varint().unwrap();
+                    let retire_prior_to = payload.get_varint().unwrap();
+                    let l = payload.get_u8().unwrap();
+                    let n_cid = ConnectionId::from(payload.get_bytes(l as usize).unwrap().to_vec());
+
+                    if retire_prior_to > sqn {
+                        return Err(terror::Error::quic_transport_error(
+                            "retire prior to is greater than sequence number",
+                            terror::QuicTransportError::FrameEncodingError,
+                        ));
+                    }
+
+                    //dunno what to do
+                    let _srt = StatelessResetToken::from(payload.get_bytes(0x10).unwrap().to_vec());
+
+                    debug!(
+                        "received new cid from peer: {} (sqn: {}, rpt: {})",
+                        n_cid, sqn, retire_prior_to
+                    );
+
+                    self.cidm.register_new_cid(retire_prior_to, sqn, n_cid)?;
                 } //NEW_CONNECTION_ID
                 0x19 => {
                     let _sequence_number = payload.get_varint().unwrap();
@@ -861,10 +950,33 @@ impl Inner {
         }
 
         if ack_eliciting {
-            self.packet_spaces[self.current_space]
+            self.packet_spaces[header.space()]
                 .outgoing_acks
                 .push(header.packet_num.into());
         }
+
+        Ok(())
+    }
+
+    fn process_ack(&mut self, ack: AckFrame, space: usize) -> Result<(), terror::Error> {
+        let acknowledged = ack.into_pn_vec();
+
+        debug!(
+            "got ack frame acknowledging the following packet numbers: {:?}",
+            acknowledged
+        );
+
+        //both vecs are guaranteed to be sorted with no duplicate values
+        //remove acknowledged pns from cached pns awaiting acknowledgement
+        let to_remove = std::collections::BTreeSet::from_iter(acknowledged);
+        self.packet_spaces[space]
+            .awaiting_acknowledgement
+            .retain(|e| !to_remove.contains(e));
+
+        debug!(
+            "{:?} are the packet numbers still awaiting acknowledgement",
+            self.packet_spaces[space].awaiting_acknowledgement
+        );
 
         Ok(())
     }
@@ -913,11 +1025,13 @@ impl Inner {
             let keys = match kc {
                 KeyChange::Handshake { keys } => {
                     debug!("handshake keyset ready");
+                    self.packet_spaces[SPACE_ID_HANDSHAKE].active = true;
                     keys
                 }
                 KeyChange::OneRtt { keys, next } => {
                     debug!("data (1-rtt) keyset ready");
                     self.next_secrets = Some(next);
+                    self.packet_spaces[SPACE_ID_DATA].active = true;
                     keys
                 }
             };
@@ -943,6 +1057,8 @@ impl Inner {
             return;
         }
 
+        println!("crypto data: {:x?}", buf);
+
         //create outgoing crypto frame
         let offset = self.packet_spaces[space_id].outgoing_crypto_offset;
         let length = buf.len() as u64;
@@ -952,98 +1068,134 @@ impl Inner {
         self.packet_spaces[space_id].outgoing_crypto_offset += length;
     }
 
-    fn fetch_dgram(&mut self) -> Result<packet::Datagram, terror::Error> {
-        let mut dgram_builder = packet::DatagramBuilder::new(self.version);
+    //TODO check errors on return: either no error, no_data error or other fatal error
+    fn fetch_dgram(&mut self, buffer: &mut [u8]) -> Result<usize, terror::Error> {
+        let availible = buffer.len();
+        let max_payload_size = self.remote_tpc.max_udp_payload_size.get().unwrap().get();
 
-        // initial space
-        if self.state == ConnectionState::Initial {
-            if let Ok(body) = self.fetch_early_data(SPACE_ID_INITIAL) {
-                let next_pkt_num = self.packet_spaces[SPACE_ID_INITIAL].get_next_pkt_num();
-                let initial = packet::PacketBuilder::new(self.version)
-                    .with_body(body)
-                    .with_long_header(
-                        packet::LONG_HEADER_TYPE_INITIAL,
-                        next_pkt_num,
-                        &self.initial_remote_scid,
-                        &self.initial_local_scid,
-                        Some(vec![]),
-                    )?;
-                dgram_builder.add_packet(initial);
-            }
-        }
+        let mut remaining = std::cmp::min(availible, max_payload_size as usize);
+        let mut written: usize = 0;
 
-        // handshake space
-        if self.state == ConnectionState::Handshake || self.state == ConnectionState::Initial {
-            if let Ok(body) = self.fetch_early_data(SPACE_ID_HANDSHAKE) {
-                let next_pkt_num = self.packet_spaces[SPACE_ID_HANDSHAKE].get_next_pkt_num();
-                let hs = packet::PacketBuilder::new(self.version)
-                    .with_body(body)
-                    .with_long_header(
-                        packet::LONG_HEADER_TYPE_HANDSHAKE,
-                        next_pkt_num,
-                        &self.initial_remote_scid,
-                        &self.initial_local_scid,
-                        None,
-                    )?;
-                dgram_builder.add_packet(hs);
-            }
-        }
+        let mut contains_initial = false;
+        let mut encoded_packets: usize = 0;
 
-        // data space
+        while remaining > 0 {
+            let (packet_type, space_id) = self.get_packet_type();
 
-        dgram_builder.build(
-            self.remote.to_string(),
-            &self.packet_spaces,
-            &self.zero_rtt_keyset,
-        )
-    }
-
-    // fetches only early data to send, i.e. crypto & ack
-    fn fetch_early_data(&mut self, packet_number_space: usize) -> Result<Vec<u8>, terror::Error> {
-        //maybe its cheapest to create huge vec at beginning and just trim it at the end
-        //TODO replace with max mtu
-        let mut data = vec![0u8; 65535];
-        let size: usize;
-
-        {
-            let mut buf = octets::OctetsMut::with_slice(&mut data);
-
-            //CRYPTO
-            while let Some(frame) = self.packet_spaces[packet_number_space]
-                .outgoing_crypto
-                .pop_front()
-            {
-                if let Err(err) = packet::encode_frame(&frame, &mut buf) {
-                    //no more space, put frame back
-                    self.packet_spaces[packet_number_space]
-                        .outgoing_crypto
-                        .push_front(frame);
-                };
+            if packet_type == packet::PacketType::None {
+                //either we're done or we need to throw an error
+                if encoded_packets == 0 {
+                    return Err(terror::Error::no_data("no data to send"));
+                } else {
+                    return Ok(written);
+                }
             }
 
-            //ACK
-            if !self.packet_spaces[packet_number_space]
-                .outgoing_acks
-                .is_empty()
-            {
+            debug!(
+                "building packet type {} in space {} with remaining space of {}",
+                packet_type, space_id, remaining
+            );
+
+            let pn = self.packet_spaces[space_id].get_next_pkt_num();
+            let dcid = self.cidm.get_dcid().unwrap();
+
+            let header = match packet_type {
+                packet::PacketType::Short => {
+                    //TODO find correct values for spin_bit and key_phase
+                    packet::Header::new_short_header(0x00, 0x00, self.version, pn, dcid)
+                }
+                _ => {
+                    let (token, long_header_type) = if packet_type == packet::PacketType::Initial {
+                        contains_initial = true;
+                        (Some(vec![0u8]), packet::LONG_HEADER_TYPE_INITIAL)
+                    } else {
+                        (None, packet::LONG_HEADER_TYPE_HANDSHAKE)
+                    };
+
+                    let scid = self.cidm.get_scid().unwrap();
+
+                    packet::Header::new_long_header(
+                        long_header_type,
+                        self.version,
+                        pn,
+                        dcid,
+                        scid,
+                        token,
+                        0,
+                    )
+                }
+            }?;
+
+            debug!("with header: {}", header);
+
+            let keys = if let Some(crypto) = self.packet_spaces[space_id].keys.as_ref() {
+                &crypto.local
+            } else {
+                return Err(terror::Error::crypto_error(format!(
+                    "no availible keys in space {}",
+                    space_id
+                )));
+            };
+
+            let packet_size_overhead =
+                header.raw_length + header.packet_num_length as usize + 1 + keys.packet.tag_len();
+
+            debug!("packet_size_overhead: {}", packet_size_overhead);
+
+            //check if size overhead for packet fits in rest
+            if packet_size_overhead > remaining {
+                //either we're done or we need to throw an error
+                if encoded_packets == 0 {
+                    return Err(terror::Error::buffer_size_error(format!(
+                        "insufficient sized buffer for first packet: {}",
+                        packet_size_overhead
+                    )));
+                } else {
+                    return Ok(written);
+                }
+            }
+
+            let mut buf = octets::OctetsMut::with_slice(&mut buffer[written..remaining]);
+
+            //encode header and keep track of where the length field has been encoded
+            let mut header_length_offset: usize = 0;
+            header.to_bytes(&mut buf, &mut header_length_offset)?;
+
+            //println!("after header encoding: {:x?}", &buf.buf()[..buf.off()]);
+
+            let payload_offset = buf.off();
+
+            debug!("payload_offset: {}", payload_offset);
+
+            assert!(
+                header.raw_length + header.packet_num_length as usize + 1 == buf.off(),
+                "header end offset does not match"
+            );
+
+            //fill that packet with data
+            //fetch acks
+            if !self.packet_spaces[space_id].outgoing_acks.is_empty() {
                 //sort outgoing acks in reverse to ease range building
-                self.packet_spaces[packet_number_space]
+                self.packet_spaces[space_id]
                     .outgoing_acks
                     .sort_by(|a, b| b.cmp(a));
+
+                debug!(
+                    "creating ack frame for pns {:?} in space {}",
+                    self.packet_spaces[space_id].outgoing_acks, space_id
+                );
 
                 //TODO figure out delay
                 let ack_delay = 64 * (2 ^ self.remote_tpc.ack_delay_exponent.get().unwrap().get());
 
                 //directly generate ack frame from packet number vector
                 let ack_frame = AckFrame::from_packet_number_vec(
-                    &self.packet_spaces[packet_number_space].outgoing_acks,
+                    &self.packet_spaces[space_id].outgoing_acks,
                     ack_delay,
                 );
 
                 //clear vector as packet numbers are now ack'ed
-                self.packet_spaces[packet_number_space]
-                    .outgoing_acks
-                    .clear();
+                self.packet_spaces[space_id].outgoing_acks.clear();
 
                 if let Err(err) = packet::encode_frame(&ack_frame, &mut buf) {
                     return Err(terror::Error::buffer_size_error(format!(
@@ -1053,13 +1205,86 @@ impl Inner {
                 };
             };
 
-            size = buf.off();
+            //CRYPTO
+            while let Some(frame) = self.packet_spaces[space_id].outgoing_crypto.pop_front() {
+                if let Err(err) = packet::encode_frame(&frame, &mut buf) {
+                    //no more space, put frame back
+                    self.packet_spaces[space_id]
+                        .outgoing_crypto
+                        .push_front(frame);
+
+                    return Err(terror::Error::buffer_size_error(format!(
+                        "insufficient sized buffer for crypto frame ({})",
+                        err
+                    )));
+                };
+            }
+
+            if packet_type == packet::PacketType::Short {
+                //encode stream frames
+            }
+
+            //if is last packet, pad to min size of 1200
+            if contains_initial
+                && !self.packet_spaces[std::cmp::min(space_id + 1, SPACE_ID_DATA)].wants_write()
+            {
+                //if packet header is long, add padding length to length field, if it is short skip
+                //padding length
+                if (buf.off() + written) < 1200 {
+                    let skip = std::cmp::min(1200 - buf.off() - written, 0);
+                    debug!(
+                        "datagram contains initial frame and this last packet is padded by: {}",
+                        skip
+                    );
+                    buf.skip(skip)?;
+                }
+            }
+
+            debug!(
+                "offset after payload (incl. written): {}",
+                buf.off() + written
+            );
+
+            let payload_length = buf.off() - payload_offset;
+            debug!("payload length: {}", payload_length);
+
+            let length =
+                payload_length + keys.packet.tag_len() + (header.packet_num_length as usize + 1);
+
+            //determine length of packet and encode it
+            if packet_type != packet::PacketType::Short {
+                debug!("encoded length in header: {}", length);
+
+                let (_, mut l) = buf.split_at(header_length_offset)?;
+                l.put_varint_with_len(length as u64, packet::PACKET_LENGTH_ENCODING_LENGTH)?;
+            }
+
+            //encrypt the packet
+            let packet_length = packet::encrypt(&mut buf, keys, pn, payload_offset)?;
+
+            debug!("packet_length: {}", packet_length);
+
+            encoded_packets += 1;
+            remaining -= packet_length;
+            written += packet_length;
+
+            //short packets cannot be coalesced
+            if packet_type == packet::PacketType::Short {
+                break;
+            }
         }
 
-        //dont forget to trim empty part of buffer
-        data.resize(size, 0x00);
+        Ok(written)
+    }
 
-        Ok(data)
+    fn get_packet_type(&self) -> (packet::PacketType, usize) {
+        for space in SPACE_ID_INITIAL..=SPACE_ID_DATA {
+            if self.packet_spaces[space].wants_write() {
+                return (packet::PacketType::from(space), space);
+            }
+        }
+
+        (packet::PacketType::None, 0)
     }
 }
 
@@ -1077,11 +1302,14 @@ struct PacketNumberSpace {
     keys: Option<Keys>,
 
     outgoing_acks: Vec<u64>,
+    awaiting_acknowledgement: Vec<u64>,
 
     outgoing_crypto: VecDeque<packet::CryptoFrame>,
     outgoing_crypto_offset: u64,
 
     next_pkt_num: u32,
+
+    active: bool,
 }
 
 impl PacketNumberSpace {
@@ -1089,10 +1317,18 @@ impl PacketNumberSpace {
         Self {
             keys: None,
             outgoing_acks: Vec::new(),
+            awaiting_acknowledgement: Vec::new(),
             outgoing_crypto: VecDeque::new(),
             outgoing_crypto_offset: 0,
             next_pkt_num: 0,
+            active: false,
         }
+    }
+
+    //determines if a space has outgoing crypto data or acks
+    //TODO expand with lost packets
+    fn wants_write(&self) -> bool {
+        self.active && (!self.outgoing_acks.is_empty() || !self.outgoing_crypto.is_empty())
     }
 
     fn get_next_pkt_num(&mut self) -> u32 {
@@ -1113,6 +1349,97 @@ impl PacketNumberSpace {
             &mut self.keys.as_mut().unwrap().remote.packet,
             packet_keys.remote,
         );
+    }
+}
+
+struct ConnectionIdManager {
+    //index represents sequence number
+    //set of cids maintained by peer via NEW_CONNECTION_ID frames. we retire them with
+    //RETIRE_CONNECTION_ID frames
+    dcids: Vec<ConnectionId>,
+
+    //index represents sequence number
+    //set of cids maintained by us which identify the connection on our side. we send
+    //NEW_CONNECTION_ID frames to add cids. the peer retires them with RETIRE_CONNECTION_ID frames
+    scids: Vec<ConnectionId>,
+
+    //highest received "retire prior to"
+    rpt_r: u64,
+
+    //highest sent retire_prior_to
+    rpt_s: u64,
+
+    //sent by client
+    retry_source_connection_id: Option<ConnectionId>,
+
+    original_destination_connection_id: Option<ConnectionId>,
+}
+
+impl ConnectionIdManager {
+    fn with_initial_cids(
+        dcid: ConnectionId,
+        scid: ConnectionId,
+        retry_source_connection_id: Option<ConnectionId>,
+        original_destination_connection_id: Option<ConnectionId>,
+    ) -> Self {
+        Self {
+            dcids: vec![dcid],
+            scids: vec![scid],
+            rpt_r: 0,
+            rpt_s: 0,
+            retry_source_connection_id,
+            original_destination_connection_id,
+        }
+    }
+
+    //registeres a new cid from a NEW_CONNECTION_ID frame
+    fn register_new_cid(
+        &mut self,
+        retire_prior_to: u64,
+        sqn: u64,
+        cid: ConnectionId,
+    ) -> Result<(), terror::Error> {
+        if sqn < self.rpt_r {
+            //cid is immediately retired
+            return Ok(());
+        }
+
+        self.rpt_r = std::cmp::max(self.rpt_r, retire_prior_to);
+
+        let dcids_len = self.dcids.len() as u64;
+
+        if dcids_len == sqn {
+            self.dcids.push(cid);
+            return Ok(());
+        }
+
+        if dcids_len > sqn {
+            assert_eq!(cid, self.dcids[sqn as usize]);
+        }
+
+        if dcids_len < sqn {
+            return Err(terror::Error::quic_transport_error(
+                "sequence number is not one greater than previous one",
+                terror::QuicTransportError::ProtocolViolation,
+            ));
+        }
+
+        Ok(())
+    }
+
+    //create a new cid to be used in a NEW_CONNECTION_ID frame
+    fn issue_new_cid(&mut self) {}
+
+    fn get_inital_remote_scid(&self) -> Option<&ConnectionId> {
+        self.dcids.first()
+    }
+
+    fn get_dcid(&self) -> Option<&ConnectionId> {
+        Some(&self.dcids[self.rpt_r as usize])
+    }
+
+    fn get_scid(&self) -> Option<&ConnectionId> {
+        self.scids.last()
     }
 }
 
@@ -1151,6 +1478,20 @@ impl ConnectionId {
 }
 
 impl fmt::Display for ConnectionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "0x{}",
+            self.id
+                .iter()
+                .map(|val| format!("{:x}", val))
+                .collect::<Vec<String>>()
+                .join("")
+        )
+    }
+}
+
+impl fmt::Debug for ConnectionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,

@@ -1,13 +1,16 @@
-use crate::{terror, token::StatelessResetToken, ConnectionId, PacketNumberSpace, TSDistributor};
+use crate::{
+    terror, token::StatelessResetToken, ConnectionId, TSDistributor, SPACE_ID_DATA,
+    SPACE_ID_HANDSHAKE, SPACE_ID_INITIAL,
+};
 
-use octets::Octets;
+use octets::{Octets, OctetsMut};
 use rustls::quic::{DirectionalKeys, HeaderProtectionKey};
-use tracing::debug;
 
-use std::{collections::VecDeque, fmt, marker::PhantomData};
+use std::fmt;
 
 const MAX_PKT_NUM_LEN: usize = 4;
 const SAMPLE_LEN: usize = 16;
+pub const PACKET_LENGTH_ENCODING_LENGTH: usize = 4;
 
 pub const LS_TYPE_BIT: u8 = 0x80;
 pub const LONG_PACKET_TYPE: u8 = 0x30;
@@ -27,240 +30,53 @@ pub type InitialDatagram = (
     std::sync::Arc<tokio::net::UdpSocket>,
 );
 
-pub struct DatagramBuilder {
-    dgram: Vec<u8>,
-    packets: VecDeque<PacketBuilder<Completed>>,
-    quic_version: u32,
-    contains_initial: bool,
-}
+//encrypts a packet, pn_len is in bytes starting at one and header_end_off must include packet number
+pub fn encrypt(
+    packet: &mut OctetsMut,
+    keys: &DirectionalKeys,
+    pn: u32,
+    payload_offset: usize,
+) -> Result<usize, terror::Error> {
+    let tag_len = keys.packet.tag_len();
+    let packet_length = packet.off() + tag_len;
 
-impl DatagramBuilder {
-    pub fn new(quic_version: u32) -> Self {
-        Self {
-            dgram: vec![0u8; 65536],
-            packets: VecDeque::new(),
-            quic_version,
-            contains_initial: false,
-        }
-    }
+    //println!("packet pre encrypt: {:x?}", &packet.buf()[..packet_length]);
 
-    pub fn add_packet(&mut self, packet: PacketBuilder<Completed>) {
-        if packet.header.is_inital() {
-            self.contains_initial = true;
-        }
+    let (mut p, _) = packet.split_at(packet_length)?;
 
-        assert!(self.quic_version == packet.quic_version);
+    let pn_len = Header::calculate_pn_length(pn) as usize + 1;
 
-        self.packets.push_back(packet);
-    }
+    //encrypts the packet payload and copies the tag into the buffer
+    let (mut header, mut payload_and_tag) = p.split_at(payload_offset)?;
 
-    pub fn build(
-        mut self,
-        address: String,
-        spaces: &[PacketNumberSpace; 3],
-        zero_rtt_keys: &Option<DirectionalKeys>,
-    ) -> Result<Datagram, terror::Error> {
-        let mut offset: usize = 0;
-        let size = self.packets.len();
-        let mut dgram = std::mem::take(&mut self.dgram);
-        let mut i: usize = 0;
+    let (mut payload, mut tag_storage) =
+        payload_and_tag.split_at(payload_and_tag.len() - tag_len)?;
+    let tag = keys
+        .packet
+        .encrypt_in_place(pn as u64, header.as_mut(), payload.as_mut())
+        .unwrap();
 
-        while let Some(mut packet) = self.packets.pop_front() {
-            //if it is a long header and its type is 0-rtt and space is data, use 0-rtt keys
-            let keys: &DirectionalKeys = if ((packet.header.hf & LS_TYPE_BIT) >> 7) == 0x01
-                && ((packet.header.hf & LONG_PACKET_TYPE) >> 4) == 0x01
-                && packet.header.space == 0x02
-            {
-                match zero_rtt_keys.as_ref() {
-                    Some(dk) => dk,
-                    None => {
-                        return Err(terror::Error::crypto_error(
-                            "No keys availible to encrypt zero-rtt packet",
-                        ))
-                    }
-                }
-            } else {
-                &spaces[packet.header.space].keys.as_ref().unwrap().local
-            };
+    //println!("tag: {:x?}", tag.as_ref());
 
-            let tag_len = keys.packet.tag_len();
-            //add tag length to payload length
-            packet.header.length += tag_len;
+    tag_storage.put_bytes(tag.as_ref())?;
 
-            //calculate required buffer length
-            let mut required_space = packet.header.raw_length
-                + packet.header.packet_num_length as usize
-                + 1
-                + packet.body.len()
-                + tag_len;
+    //encrypts the header
+    let pn_offset = payload_offset - pn_len;
+    let (mut header, sample) = p.split_at(pn_offset + 4)?;
+    let (mut first, mut rest) = header.split_at(1)?;
+    let pn_end = Ord::min(pn_offset + 3, rest.len());
 
-            //check for minimum size if datagram contains initial packet
-            if (i + 1) == size && self.contains_initial && (offset + required_space) < 1200 {
-                let additional_space = 1200 - (offset + required_space);
-                required_space += additional_space;
-                packet.header.length += additional_space;
-            }
+    keys.header
+        .encrypt_in_place(
+            &sample.as_ref()[..keys.header.sample_len()],
+            &mut first.as_mut()[0],
+            &mut rest.as_mut()[pn_offset - 1..pn_end],
+        )
+        .unwrap();
 
-            packet.encode_and_encrypt(&mut dgram[offset..offset + required_space], keys)?;
+    //println!("packet post encrypt: {:x?}", &packet.buf()[..packet_length]);
 
-            offset += required_space;
-            i += 1;
-        }
-
-        debug!("built datagram with {} packets ({} bytes)", size, offset);
-
-        dgram.resize(offset, 0x00);
-
-        Ok((dgram, address))
-    }
-}
-
-//Required for full packet
-pub struct PacketBody;
-pub struct PacketHeader;
-pub type Completed = (PacketBody, PacketHeader);
-
-//Packet Builder
-pub struct PacketBuilder<S = ((), ())> {
-    //packet
-    header: Header,
-    body: Vec<u8>,
-    quic_version: u32,
-
-    // required because we never use the zero-sized types
-    phantom: PhantomData<S>,
-}
-
-// private to control how Thing can be constructed
-fn new_packet_builder<S>(header: Header, body: Vec<u8>, quic_version: u32) -> PacketBuilder<S> {
-    PacketBuilder {
-        header,
-        body,
-        quic_version,
-        phantom: PhantomData,
-    }
-}
-
-impl PacketBuilder {
-    pub fn new(quic_version: u32) -> Self {
-        new_packet_builder(Header::default(), Vec::new(), quic_version)
-    }
-}
-
-impl<B, H> PacketBuilder<(B, H)> {
-    pub fn with_body(self, body: Vec<u8>) -> PacketBuilder<(PacketBody, H)> {
-        new_packet_builder(self.header, body, self.quic_version)
-    }
-
-    pub fn with_long_header(
-        self,
-        long_header_type: u8,
-        packet_number: u32,
-        dcid: &ConnectionId,
-        scid: &ConnectionId,
-        token: Option<Vec<u8>>,
-    ) -> Result<PacketBuilder<(B, PacketHeader)>, terror::Error> {
-        let packet_number_length = Header::calculate_pn_length(packet_number);
-        let packet_length = self.body.len() + (packet_number_length + 1) as usize;
-
-        let header = Header::new_long_header(
-            long_header_type,
-            self.quic_version,
-            packet_number,
-            dcid,
-            scid,
-            token,
-            packet_length,
-        )?;
-
-        Ok(new_packet_builder(header, self.body, self.quic_version))
-    }
-
-    pub fn with_short_header(
-        self,
-        packet_number: u32,
-        dcid: &ConnectionId,
-        spin_bit: u8,
-        key_phase: u8,
-    ) -> Result<PacketBuilder<(B, PacketHeader)>, terror::Error> {
-        let header =
-            Header::new_short_header(spin_bit, key_phase, self.quic_version, packet_number, dcid)?;
-
-        Ok(new_packet_builder(header, self.body, self.quic_version))
-    }
-}
-
-impl PacketBuilder<Completed> {
-    fn encode_and_encrypt(
-        self,
-        packet: &mut [u8],
-        keys: &DirectionalKeys,
-    ) -> Result<(), terror::Error> {
-        self.encode(packet)?;
-        self.encrypt(packet, keys)?;
-        Ok(())
-    }
-
-    // encodes the packet and its header into the datagram, can only be called after body and
-    // header have been specified
-    fn encode(&self, dgram: &mut [u8]) -> Result<(), terror::Error> {
-        debug!("encoding packet on buffer with size {}", dgram.len());
-
-        let mut b = octets::OctetsMut::with_slice(dgram);
-
-        //encode header
-        if let Err(err) = self.header.to_bytes(&mut b) {
-            return Err(terror::Error::buffer_size_error(format!(
-                "Fatal error while encoding header: {}",
-                err
-            )));
-        }
-
-        //encode body
-        if let Err(err) = b.put_bytes(&self.body) {
-            return Err(terror::Error::buffer_size_error(format!(
-                "Fatal error while encoding packet body: {}",
-                err
-            )));
-        }
-
-        Ok(())
-    }
-
-    //encrypts the packet in dgram and consumes self, finalizing the packet
-    fn encrypt(self, packet: &mut [u8], keys: &DirectionalKeys) -> Result<(), terror::Error> {
-        let tag_len = keys.packet.tag_len();
-
-        let header_end_off: usize =
-            self.header.raw_length + self.header.packet_num_length as usize + 1;
-
-        //encrypts the packet payload and copies the tag into the buffer
-        let (header, payload_tag) = packet.split_at_mut(header_end_off);
-
-        let (payload, tag_storage) = payload_tag.split_at_mut(payload_tag.len() - tag_len);
-        let tag = keys
-            .packet
-            .encrypt_in_place(self.header.packet_num as u64, &*header, payload)
-            .unwrap();
-
-        tag_storage.copy_from_slice(tag.as_ref());
-
-        //encrypts the header
-        let pn_offset = header_end_off - (self.header.packet_num_length as usize + 1);
-        let (header, sample) = packet.split_at_mut(pn_offset + 4);
-        let (first, rest) = header.split_at_mut(1);
-        let pn_end = Ord::min(pn_offset + 3, rest.len());
-
-        keys.header
-            .encrypt_in_place(
-                &sample[..keys.header.sample_len()],
-                &mut first[0],
-                &mut rest[pn_offset - 1..pn_end],
-            )
-            .unwrap();
-
-        Ok(())
-    }
+    Ok(packet_length)
 }
 
 pub fn encode_frame<T: Frame>(
@@ -302,6 +118,23 @@ pub struct AckFrame {
 }
 
 impl AckFrame {
+    pub fn into_pn_vec(self) -> Vec<u64> {
+        let mut vec = Vec::from_iter(
+            self.largest_acknowledged - self.first_ack_range..=self.largest_acknowledged,
+        );
+
+        for (gap, range) in &self.ack_ranges {
+            let smallest = vec.first().unwrap();
+            let to = smallest - gap - 1;
+            let from = to - *range;
+            let mut pns = Vec::from_iter(from..=to);
+            pns.append(&mut vec);
+            vec.append(&mut pns);
+        }
+
+        vec
+    }
+
     //generates an ack frame from a vector of packet numbers. The vector has to be sorted in
     //descending order, i.e. the highest packet number has to be at index 0.
     pub fn from_packet_number_vec(packet_numbers: &[u64], ack_delay: u64) -> Self {
@@ -329,14 +162,6 @@ impl AckFrame {
             + varint_length(ack.ack_delay)
             + varint_length(ack.ack_range_count)
             + varint_length(ack.first_ack_range);
-
-        /*println!(
-            "len + {:?} from la",
-            varint_length(ack.largest_acknowledged)
-        );
-        println!("len + {:?} from ad", varint_length(ack.ack_delay));
-        println!("len + {:?} from arc", varint_length(ack.ack_range_count));
-        println!("len + {:?} from far", varint_length(ack.first_ack_range));*/
 
         ack
     }
@@ -380,9 +205,6 @@ impl AckFrame {
 
         self.len += varint_length(gap);
         self.len += varint_length(range);
-
-        //println!("len + {:?} from gap", varint_length(gap));
-        //println!("len + {:?} from range", varint_length(range));
     }
 
     //TODO add support for ecn counts
@@ -605,7 +427,7 @@ impl StreamFrame {
     }
 }
 
-pub struct NewConnectionIdFrame {
+/*pub struct NewConnectionIdFrame {
     sequence_number: u64,
     retire_prior_to: u64,
     length: u8,
@@ -644,7 +466,7 @@ impl Frame for NewConnectionIdFrame {
     fn len(&self) -> usize {
         self.len
     }
-}
+}*/
 
 pub struct ConnectionCloseFrame {
     error_code: u64,
@@ -725,7 +547,13 @@ impl Header {
         token: Option<Vec<u8>>,
         packet_length: usize,
     ) -> Result<Self, terror::Error> {
-        let mut space: usize = 2;
+        let space: usize = match long_header_type {
+            LONG_HEADER_TYPE_INITIAL => SPACE_ID_INITIAL,
+            0x01 => SPACE_ID_DATA,
+            LONG_HEADER_TYPE_HANDSHAKE => SPACE_ID_HANDSHAKE,
+            0x03 => todo!("retry packets are not yet implemented"),
+            _ => unreachable!("invalid long header type: {}", long_header_type),
+        };
 
         if !matches!(long_header_type, 0x00..=0x03) {
             return Err(terror::Error::header_encoding_error(format!(
@@ -743,19 +571,14 @@ impl Header {
         let mut raw_length = 1 + 4 + 1 + dcid.len() + 1 + scid.len();
 
         if long_header_type == 0x00 {
-            space = 0;
             // token length is encoded as variable length integer
             let token_length_length = varint_length(token.as_ref().unwrap().len() as u64);
 
             raw_length += token_length_length + token.as_ref().unwrap().len();
         }
 
-        if long_header_type == 0x02 {
-            space = 1;
-        }
-
         //variable length packet length always encoded as length 4
-        raw_length += 4;
+        raw_length += PACKET_LENGTH_ENCODING_LENGTH;
 
         Ok(Header::new(
             0x01,
@@ -882,7 +705,11 @@ impl Header {
     }
 
     //TODO retry & version negotiation packets
-    pub fn to_bytes(&self, b: &mut octets::OctetsMut) -> Result<(), octets::BufferTooShortError> {
+    pub fn to_bytes(
+        &self,
+        b: &mut octets::OctetsMut,
+        lfo: &mut usize,
+    ) -> Result<(), octets::BufferTooShortError> {
         b.put_u8(self.hf)?;
 
         if let Some(scid) = &self.scid {
@@ -903,7 +730,8 @@ impl Header {
             }
 
             //packet length, always write as 4 byte varint to allow for later
-            b.put_varint_with_len(self.length as u64, 4)?;
+            *lfo = b.off();
+            b.put_varint_with_len(self.length as u64, PACKET_LENGTH_ENCODING_LENGTH)?;
         } else {
             //short header
             b.put_bytes(self.dcid.as_slice())?;
@@ -944,7 +772,7 @@ impl Header {
                 packet_num: 0,
                 packet_num_length: 0,
                 token: None,
-                length: 0, //TODO
+                length: 0,
                 raw_length: b.off(),
                 space,
             });
@@ -1014,7 +842,7 @@ impl Header {
     }
 
     pub fn is_inital(&self) -> bool {
-        ((self.hf & LS_TYPE_BIT) >> 7) == 1
+        ((self.hf & LS_TYPE_BIT) >> 7) == 1 && ((self.hf & LONG_PACKET_TYPE) >> 4) == 0
     }
 
     pub fn calculate_pn_length(packet_number: u32) -> u8 {
@@ -1050,6 +878,47 @@ pub fn varint_length(num: u64) -> usize {
         16384..=1073741823 => 3,
         1073741824..=4611686018427387903 => 4,
         _ => unreachable!("number exceeded abnormally large size"),
+    }
+}
+
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketType {
+    None = 0,
+    Initial = 1,
+    ZeroRtt = 2,
+    Handshake = 3,
+    Retry = 4,
+    Short = 5,
+}
+
+impl From<usize> for PacketType {
+    fn from(pns: usize) -> Self {
+        match pns {
+            0 => PacketType::Initial,
+            1 => PacketType::Handshake,
+            2 => PacketType::Short,
+            _ => unreachable!("cannot convert packet number space outside of range 0..=2"),
+        }
+    }
+}
+
+impl From<PacketType> for String {
+    fn from(pt: PacketType) -> String {
+        match pt {
+            PacketType::None => "None".to_string(),
+            PacketType::Initial => "Initial".to_string(),
+            PacketType::ZeroRtt => "ZeroRtt".to_string(),
+            PacketType::Handshake => "Handshake".to_string(),
+            PacketType::Retry => "Retry".to_string(),
+            PacketType::Short => "Short".to_string(),
+        }
+    }
+}
+
+impl fmt::Display for PacketType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", String::from(*self))
     }
 }
 
@@ -1130,6 +999,17 @@ mod tests {
     }
 
     #[test]
+    fn test_ack_frame_to_pn_vec() {
+        let pns: Vec<u64> = vec![10, 9, 8, 6, 5, 4, 2, 1, 0];
+        let ack = AckFrame::from_packet_number_vec(&pns, 200);
+
+        let vec = ack.into_pn_vec();
+
+        let expected: Vec<u64> = vec![0, 1, 2, 4, 5, 6, 8, 9, 10];
+
+        assert_eq!(vec, expected);
+    }
+    #[test]
     fn test_long_initial_header_creation() {
         let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
         let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
@@ -1139,7 +1019,8 @@ mod tests {
 
         let mut b = octets::OctetsMut::with_slice(&mut vec);
 
-        header.to_bytes(&mut b).unwrap();
+        let mut length_offset: usize = 0;
+        header.to_bytes(&mut b, &mut length_offset).unwrap();
 
         let expected = vec![
             0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
@@ -1164,7 +1045,8 @@ mod tests {
 
         let mut b = octets::OctetsMut::with_slice(&mut vec);
 
-        header.to_bytes(&mut b).unwrap();
+        let mut length_offset: usize = 0;
+        header.to_bytes(&mut b, &mut length_offset).unwrap();
 
         let expected = vec![
             0xe0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
@@ -1185,7 +1067,8 @@ mod tests {
 
         let mut b = octets::OctetsMut::with_slice(&mut vec);
 
-        header.to_bytes(&mut b).unwrap();
+        let mut length_offset: usize = 0;
+        header.to_bytes(&mut b, &mut length_offset).unwrap();
 
         let expected = vec![
             0xd0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
@@ -1205,7 +1088,8 @@ mod tests {
 
         let mut b = octets::OctetsMut::with_slice(&mut vec);
 
-        header.to_bytes(&mut b).unwrap();
+        let mut length_offset: usize = 0;
+        header.to_bytes(&mut b, &mut length_offset).unwrap();
 
         let expected = vec![
             0x45, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef, 0x01, 0x7c,
@@ -1214,42 +1098,4 @@ mod tests {
         assert_eq!(vec, expected);
         assert_eq!(header.raw_length, 9);
     }
-
-    #[test]
-    fn test_packet_builder_encodes_initial_packet() {
-        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
-        let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
-
-        let body = vec![
-            0x06, 0x01, 0x00, 0x01, 0x03, 0x03, 0x03, 0x92, 0x2f, 0x01, 0x2b, 0xd7, 0x8b, 0x30,
-            0xaa, 0xbd, 0xa6, 0x7c, 0x7a, 0x62, 0x75, 0xce, 0x4a, 0xbc, 0x3e, 0xd4, 0xa4, 0x23,
-            0xe1, 0x03, 0xcc, 0xef, 0x4c, 0x9f, 0xcb, 0x28, 0xa4, 0x08, 0x97, 0x00, 0x00, 0x08,
-            0x13, 0x02, 0x13, 0x01, 0x13, 0x03, 0x00, 0xff, 0x01, 0x00, 0x00, 0xd2, 0x00, 0x39,
-        ];
-
-        let mut result = vec![0u8; 2048];
-
-        let pkb = PacketBuilder::new(1);
-
-        pkb.with_body(body)
-            .with_long_header(0x00, 0, &dcid, &scid, Some(vec![]))
-            .unwrap()
-            .encode(&mut result)
-            .unwrap();
-
-        let expected: Vec<u8> = vec![
-            0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
-            0x08, 0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b, 0x00, 0x80, 0x00, 0x00, 0x39,
-            0x00, 0x06, 0x01, 0x00, 0x01, 0x03, 0x03, 0x03, 0x92, 0x2f, 0x01, 0x2b, 0xd7, 0x8b,
-            0x30, 0xaa, 0xbd, 0xa6, 0x7c, 0x7a, 0x62, 0x75, 0xce, 0x4a, 0xbc, 0x3e, 0xd4, 0xa4,
-            0x23, 0xe1, 0x03, 0xcc, 0xef, 0x4c, 0x9f, 0xcb, 0x28, 0xa4, 0x08, 0x97, 0x00, 0x00,
-            0x08, 0x13, 0x02, 0x13, 0x01, 0x13, 0x03, 0x00, 0xff, 0x01, 0x00, 0x00, 0xd2, 0x00,
-            0x39,
-        ];
-
-        assert_eq!(result[..expected.len()], expected);
-    }
-
-    #[test]
-    fn test_coalesced_packet_datagram_building() {}
 }
