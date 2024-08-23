@@ -32,8 +32,13 @@ async fn run() -> Result<(), terror::Error> {
     .build()
     .await?;
 
-    while let Some(_connection) = server.accept().await {
+    while let Some(connection) = server.accept().await {
         println!("new connection!");
+        tokio::spawn(async move {
+            while let Some(stream) = connection.accept_bidi_stream().await {
+                println!("new bidirectional stream!");
+            }
+        });
     }
 
     server.stop().await;

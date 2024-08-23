@@ -1,12 +1,12 @@
 mod packet;
+mod stream;
 pub mod terror;
 mod token;
 mod transport_parameters;
 
+use indexmap::IndexMap;
 use octets::OctetsMut;
-use packet::{
-    AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, Header, NewTokenFrame, StreamFrame,
-};
+use packet::{AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, Header, NewTokenFrame};
 use rand::RngCore;
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -15,12 +15,8 @@ use rustls::{
     },
     Side,
 };
-use std::{
-    collections::{HashMap, VecDeque},
-    fmt,
-    net::SocketAddr,
-    sync::Arc,
-};
+use std::{collections::VecDeque, fmt, net::SocketAddr, sync::Arc};
+use stream::StreamManager;
 use token::StatelessResetToken;
 use tokio::{
     net::UdpSocket as TokioUdpSocket,
@@ -51,7 +47,7 @@ pub struct Distributor {
     hmac_reset_key: ring::hmac::Key,
 
     //channels for each connection
-    connection_send_handles: HashMap<ConnectionId, mpsc::Sender<packet::Datagram>>,
+    connection_send_handles: IndexMap<ConnectionId, mpsc::Sender<packet::Datagram>>,
 
     //cancellation token. if activated all connections are shut down
     cancellation_token: tokio_util::sync::CancellationToken,
@@ -62,7 +58,8 @@ impl Distributor {
         Self {
             server_config: server_cfg,
             hmac_reset_key: key,
-            connection_send_handles: HashMap::new(),
+            connection_send_handles: IndexMap::<ConnectionId, mpsc::Sender<(Vec<u8>, String)>>::new(
+            ),
             cancellation_token: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -306,8 +303,8 @@ pub struct Connection {
     //packet recv loop for connection
     loop_handle: Option<JoinHandle<Result<u64, terror::Error>>>,
     //stream acceptor handles
-    //bidi_stream_r: mpsc::Receiver<stream::data>,
-    //uni_stream_r: mpsc::Receiver<stream::data>,
+    //bidi_stream_r: mpsc::Receiver<stream::Stream>,
+    //uni_stream_r: mpsc::Receiver<stream::Stream>,
 }
 
 impl Connection {
@@ -325,99 +322,15 @@ impl Connection {
 
         let server_config = server_config.unwrap();
 
-        let mut head = packet::Header::from_bytes(&buffer, 8).map_err(|e| {
-            terror::Error::buffer_size_error(format!(
-                "error decoding header from initial packet: {}",
-                e
-            ))
-        })?;
+        let (conn_read_tx, conn_ready_rx) = oneshot::channel::<terror::QuicTransportError>();
 
-        //get initial keys, use default crypto provider by ring with all suites for now
-        let ikp = Connection::derive_initial_keyset(
-            server_config.clone(),
-            Version::V1,
-            Side::Server,
-            &head.dcid,
-        );
-
-        debug!(
-            origin = src_addr,
-            "initial keys ready for dcid {}", &head.dcid
-        );
-
-        let header_length = match head.decrypt(&mut buffer, ikp.remote.header.as_ref()) {
-            Ok(s) => s,
-            Err(error) => panic!("Error: {}", error),
-        };
-
-        let mut b = OctetsMut::with_slice(&mut buffer);
-        let (header_raw, mut payload_cipher) = b.split_at(header_length).unwrap();
-
-        //cut off trailing 0s from buffer, substract 1 extra beacuse packet num length of 1 is
-        //encoded as 0...
-        let (mut payload_cipher, _) = payload_cipher
-            .split_at(head.length - head.packet_num_length as usize - 1)
-            .unwrap();
-
-        //payload cipher must be exact size without zeros from the buffer beeing to big!
-        let dec_len = {
-            let decrypted_payload_raw = match ikp.remote.packet.decrypt_in_place(
-                head.packet_num.into(),
-                header_raw.as_ref(),
-                payload_cipher.as_mut(),
-            ) {
-                Ok(p) => p,
-                Err(error) => {
-                    return Err(terror::Error::crypto_error(format!(
-                        "Error decrypting packet body {}",
-                        error
-                    )))
-                }
-            };
-            decrypted_payload_raw.len()
-        };
-
-        //truncate payload to length returned by decrypting packet payload, may cause problems with
-        //coalesced packets
-        buffer.truncate(dec_len);
-
-        let initial_local_scid = ConnectionId::generate_with_length(8);
-        let orig_dcid = head.dcid.clone();
-
-        let tpc = TransportConfig {
-            original_destination_connection_id: OriginalDestinationConnectionId::try_from(
-                orig_dcid.clone(),
-            )?,
-            initial_source_connection_id: InitialSourceConnectionId::try_from(
-                initial_local_scid.clone(),
-            )?,
-            stateless_reset_token: StatelessResetTokenTP::try_from(
-                token::StatelessResetToken::new(&hmac_reset_key, &initial_local_scid),
-            )?,
-            max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
-            initial_max_streams_bidi: InitialMaxStreamsBidi::try_from(VarInt::from(1))?,
-            initial_max_data: InitialMaxData::try_from(VarInt::from(1024))?,
-            initial_max_stream_data_bidi_remote: InitialMaxStreamDataBidiRemote::try_from(
-                VarInt::from(1024),
-            )?,
-            initial_max_stream_data_bidi_local: InitialMaxStreamDataBidiLocal::try_from(
-                VarInt::from(1024),
-            )?,
-            ..TransportConfig::default()
-        };
-
-        let data = tpc.encode(Side::Server)?;
-
-        let conn = RustlsConnection::Server(
-            rustls::quic::ServerConnection::new(server_config, rustls::quic::Version::V1, data)
-                .unwrap(),
-        );
-
-        let initial_space: PacketNumberSpace = PacketNumberSpace {
-            keys: Some(ikp),
-            active: true,
-            ..PacketNumberSpace::new()
-        };
+        let (mut inner, cid) = Inner::accept(
+            &mut buffer,
+            src_addr,
+            server_config,
+            hmac_reset_key,
+            conn_read_tx,
+        )?;
 
         let (transmit_q, recv_q) = mpsc::channel::<packet::Datagram>(8);
 
@@ -425,37 +338,15 @@ impl Connection {
             tsd.write()
                 .await
                 .connection_send_handles
-                .insert(initial_local_scid.clone(), transmit_q);
+                .insert(cid.clone(), transmit_q);
         }
 
-        debug!("inserted new recv handle for cid {}", initial_local_scid);
-
-        let (conn_read_tx, conn_ready_rx) = oneshot::channel::<terror::QuicTransportError>();
-
-        let cim = ConnectionIdManager::with_initial_cids(
-            head.scid.clone().unwrap(),
-            initial_local_scid,
-            None,
-            Some(orig_dcid),
-        );
-
-        let mut inner = Inner::new(
-            Side::Server,
-            head.version,
-            conn,
-            cim,
-            src_addr.parse().unwrap(),
-            initial_space,
-            conn_read_tx,
-        );
+        debug!("inserted new recv handle for cid {}", cid);
 
         let conn = Self {
             socket,
             loop_handle: None,
         };
-
-        //process inital packet inside connection, all subsequent packets are sent through channel
-        inner.accept(&head, &mut buffer)?;
 
         let mut buf = [0u8; 65536];
 
@@ -467,28 +358,6 @@ impl Connection {
 
         //start recv loop to process more incoming packets
         Ok((conn.start(recv_q, inner).await.unwrap(), conn_ready_rx))
-    }
-
-    fn derive_initial_keyset(
-        server_cfg: Arc<rustls::ServerConfig>,
-        version: Version,
-        side: Side,
-        dcid: &ConnectionId,
-    ) -> Keys {
-        /* for now only the rustls ring provider is used, so we may omit numerous checks */
-        server_cfg
-            .crypto_provider()
-            .cipher_suites
-            .iter()
-            .find_map(|cs| match (cs.suite(), cs.tls13()) {
-                (rustls::CipherSuite::TLS13_AES_128_GCM_SHA256, Some(suite)) => {
-                    Some(suite.quic_suite())
-                }
-                _ => None,
-            })
-            .flatten()
-            .expect("default crypto provider failed to provide initial cipher suite")
-            .keys(&dcid.id, side, version)
     }
 
     //starts recv_q, feeds into all other queues
@@ -548,7 +417,9 @@ impl Connection {
         self.loop_handle.unwrap().abort();
     }
 
-    //pub async fn accept_bidi_stream() {}
+    pub async fn accept_bidi_stream(&self) -> Option<stream::Stream> {
+        None
+    }
 
     //pub async fn accept_uni_stream() {}
 
@@ -579,6 +450,9 @@ struct Inner {
     //connection id manager
     cidm: ConnectionIdManager,
 
+    //stream manager, does all stream logic
+    sm: StreamManager,
+
     // Packet number spaces, inital, handshake, 1-RTT
     packet_spaces: [PacketNumberSpace; 3],
     current_space: usize,
@@ -594,35 +468,170 @@ struct Inner {
 }
 
 impl Inner {
-    fn new(
-        side: Side,
-        version: u32,
-        tls_session: RustlsConnection,
-        cidm: ConnectionIdManager,
-        remote_address: SocketAddr,
-        initial_space: PacketNumberSpace,
-        conn_ready: oneshot::Sender<terror::QuicTransportError>,
-    ) -> Self {
-        Self {
-            conn_ready,
-            side,
-            version,
-            tls_session,
+    //creates a connection from an initial packet as a server. Takes the buffer, source address,
+    //server config, hmac reset key and a oneshot channel which gets triggered as soon as the
+    //connection is ready. Returns the Connection itself and the initial source connection id which
+    //is now used by the peer as dcid and from which the connection can now be identified.
+    fn accept(
+        buffer: &mut Vec<u8>,
+        src_addr: String,
+        server_config: Arc<rustls::ServerConfig>,
+        hmac_reset_key: ring::hmac::Key,
+        conn_read_tx: oneshot::Sender<terror::QuicTransportError>,
+    ) -> Result<(Self, ConnectionId), terror::Error> {
+        let mut head = packet::Header::from_bytes(buffer, 8).map_err(|e| {
+            terror::Error::buffer_size_error(format!(
+                "error decoding header from initial packet: {}",
+                e
+            ))
+        })?;
+
+        //get initial keys, use default crypto provider by ring with all suites for now
+        let ikp = Inner::derive_initial_keyset(
+            server_config.clone(),
+            Version::V1,
+            Side::Server,
+            &head.dcid,
+        );
+
+        debug!(
+            origin = src_addr,
+            "initial keys ready for dcid {}", &head.dcid
+        );
+
+        let header_length = match head.decrypt(buffer, ikp.remote.header.as_ref()) {
+            Ok(s) => s,
+            Err(error) => panic!("Error: {}", error),
+        };
+
+        let mut b = OctetsMut::with_slice(buffer);
+        let (header_raw, mut payload_cipher) = b.split_at(header_length).unwrap();
+
+        //cut off trailing 0s from buffer, substract 1 extra beacuse packet num length of 1 is
+        //encoded as 0...
+        let (mut payload_cipher, _) = payload_cipher
+            .split_at(head.length - head.packet_num_length as usize - 1)
+            .unwrap();
+
+        //payload cipher must be exact size without zeros from the buffer beeing to big!
+        let dec_len = {
+            let decrypted_payload_raw = match ikp.remote.packet.decrypt_in_place(
+                head.packet_num.into(),
+                header_raw.as_ref(),
+                payload_cipher.as_mut(),
+            ) {
+                Ok(p) => p,
+                Err(error) => {
+                    return Err(terror::Error::crypto_error(format!(
+                        "Error decrypting packet body {}",
+                        error
+                    )))
+                }
+            };
+            decrypted_payload_raw.len()
+        };
+
+        //truncate payload is possible because as a server the initial packet from a client cant be
+        //coalesced
+        buffer.truncate(dec_len);
+
+        let initial_local_scid = ConnectionId::generate_with_length(8);
+        let orig_dcid = head.dcid.clone();
+
+        let tpc = TransportConfig {
+            original_destination_connection_id: OriginalDestinationConnectionId::try_from(
+                orig_dcid.clone(),
+            )?,
+            initial_source_connection_id: InitialSourceConnectionId::try_from(
+                initial_local_scid.clone(),
+            )?,
+            stateless_reset_token: StatelessResetTokenTP::try_from(
+                token::StatelessResetToken::new(&hmac_reset_key, &initial_local_scid),
+            )?,
+            max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
+            initial_max_streams_bidi: InitialMaxStreamsBidi::try_from(VarInt::from(1))?,
+            initial_max_data: InitialMaxData::try_from(VarInt::from(1024))?,
+            initial_max_stream_data_bidi_remote: InitialMaxStreamDataBidiRemote::try_from(
+                VarInt::from(1024),
+            )?,
+            initial_max_stream_data_bidi_local: InitialMaxStreamDataBidiLocal::try_from(
+                VarInt::from(1024),
+            )?,
+            ..TransportConfig::default()
+        };
+
+        let data = tpc.encode(Side::Server)?;
+
+        let conn = RustlsConnection::Server(
+            rustls::quic::ServerConnection::new(server_config, rustls::quic::Version::V1, data)
+                .unwrap(),
+        );
+
+        let initial_space: PacketNumberSpace = PacketNumberSpace {
+            keys: Some(ikp),
+            active: true,
+            ..PacketNumberSpace::new()
+        };
+
+        let cim = ConnectionIdManager::with_initial_cids(
+            head.scid.clone().unwrap(),
+            initial_local_scid.clone(),
+            None,
+            Some(orig_dcid),
+        );
+
+        let mut inner = Self {
+            conn_ready: conn_read_tx,
+            side: Side::Server,
+            version: head.version,
+            tls_session: conn,
             next_secrets: None,
             next_1rtt_packet_keys: None,
             zero_rtt_keyset: None,
             state: ConnectionState::Initial,
-            cidm,
+            cidm: cim,
+            sm: StreamManager::new(),
             packet_spaces: [
                 initial_space,
                 PacketNumberSpace::new(),
                 PacketNumberSpace::new(),
             ],
             current_space: SPACE_ID_INITIAL,
-            remote: remote_address,
+            remote: src_addr.parse().unwrap(),
             remote_tpc: TransportConfig::default(),
             zero_rtt_enabled: false,
-        }
+        };
+
+        //process inital packet inside connection, all subsequent packets are sent through channel
+        inner.process_initial_packet(&head, buffer)?;
+
+        Ok((inner, initial_local_scid))
+    }
+
+    /*fn _connect(&mut self, buffer: &mut [u8], dst_addr: String) -> Result<Self, terror::Error> {
+        Ok(())
+    }*/
+
+    fn derive_initial_keyset(
+        server_cfg: Arc<rustls::ServerConfig>,
+        version: Version,
+        side: Side,
+        dcid: &ConnectionId,
+    ) -> Keys {
+        /* for now only the rustls ring provider is used, so we may omit numerous checks */
+        server_cfg
+            .crypto_provider()
+            .cipher_suites
+            .iter()
+            .find_map(|cs| match (cs.suite(), cs.tls13()) {
+                (rustls::CipherSuite::TLS13_AES_128_GCM_SHA256, Some(suite)) => {
+                    Some(suite.quic_suite())
+                }
+                _ => None,
+            })
+            .flatten()
+            .expect("default crypto provider failed to provide initial cipher suite")
+            .keys(&dcid.id, side, version)
     }
 
     fn recv(&mut self, datagram: &mut packet::Datagram) -> Result<(), terror::Error> {
@@ -753,13 +762,12 @@ impl Inner {
         Ok(raw_packet_length)
     }
 
-    //sends initial connection packet
-    fn _connect(&mut self) -> Result<(), terror::Error> {
-        Ok(())
-    }
-
     //accepts new connection
-    fn accept(&mut self, header: &Header, packet_raw: &mut [u8]) -> Result<(), terror::Error> {
+    fn process_initial_packet(
+        &mut self,
+        header: &Header,
+        packet_raw: &mut [u8],
+    ) -> Result<(), terror::Error> {
         let mut payload = octets::OctetsMut::with_slice(packet_raw);
 
         //skip forth to packet payload
@@ -859,16 +867,27 @@ impl Inner {
                     }
                 } //NEW_TOKEN
                 0x08..=0x0f => {
-                    let stream_frame = StreamFrame::from_bytes(&frame_code, payload);
-                    let (_, mut stream_data) = payload.split_at(payload.off()).unwrap();
+                    let stream_id = payload.get_varint().unwrap();
+                    let mut offset: u64 = 0;
+                    let mut fin_bit_set = false;
 
-                    //isolate stream data if offset is present, else data extends to end of packet
-                    //TODO skip stream data
-                    if stream_frame.offset.is_some() {
-                        (stream_data, _) =
-                            payload.split_at(stream_frame.offset.unwrap() as usize)?;
+                    if (frame_code & 0x04) != 0 {
+                        offset = payload.get_varint().unwrap();
                     }
-                    println!("STREAM DATA: {:x?}", stream_data);
+
+                    let mut length: u64 = payload.cap() as u64;
+                    if (frame_code & 0x02) != 0 {
+                        length = payload.get_varint().unwrap();
+                    }
+
+                    if (frame_code & 0x01) != 0 {
+                        fin_bit_set = true;
+                    }
+
+                    let stream_data = payload.get_bytes(length as usize)?;
+
+                    self.sm
+                        .incoming(stream_id, offset, length, fin_bit_set, stream_data.buf())?;
                 } //STREAM
                 0x10 => {
                     let _max_data = payload.get_varint().unwrap();
