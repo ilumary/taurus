@@ -1,6 +1,6 @@
 use crate::{
-    terror, token::StatelessResetToken, ConnectionId, TSDistributor, SPACE_ID_DATA,
-    SPACE_ID_HANDSHAKE, SPACE_ID_INITIAL,
+    terror, token::StatelessResetToken, ConnectionId, SPACE_ID_DATA, SPACE_ID_HANDSHAKE,
+    SPACE_ID_INITIAL,
 };
 
 use octets::{Octets, OctetsMut};
@@ -21,14 +21,6 @@ pub const LONG_HEADER_TYPE_HANDSHAKE: u8 = 0x02;
 
 //packet and address, either source or destination
 pub type Datagram = (Vec<u8>, String);
-
-//inital packet with early datagram and distributor
-pub type InitialDatagram = (
-    Vec<u8>,
-    String,
-    TSDistributor,
-    std::sync::Arc<tokio::net::UdpSocket>,
-);
 
 //encrypts a packet, pn_len is in bytes starting at one and header_end_off must include packet number
 pub fn encrypt(

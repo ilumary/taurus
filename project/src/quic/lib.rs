@@ -1,3 +1,4 @@
+mod io;
 mod packet;
 mod stream;
 pub mod terror;
@@ -15,15 +16,11 @@ use rustls::{
     },
     Side,
 };
-use std::{collections::VecDeque, fmt, net::SocketAddr, sync::Arc};
+use std::{collections::VecDeque, fmt, future, net::SocketAddr, sync::Arc, task::Poll};
 use stream::StreamManager;
 use token::StatelessResetToken;
-use tokio::{
-    net::UdpSocket as TokioUdpSocket,
-    sync::{mpsc, oneshot, RwLock},
-    task::JoinHandle,
-};
-use tracing::{debug, debug_span, error, event, info, warn, Instrument, Level};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{debug, error, event, warn, Level};
 use transport_parameters::{
     InitialMaxData, InitialMaxStreamDataBidiLocal, InitialMaxStreamDataBidiRemote,
     InitialMaxStreamsBidi, InitialSourceConnectionId, MaxUdpPayloadSize,
@@ -36,92 +33,24 @@ const SPACE_ID_INITIAL: usize = 0x00;
 const SPACE_ID_HANDSHAKE: usize = 0x01;
 const SPACE_ID_DATA: usize = 0x02;
 
-//Thread Safe Distributor
-type TSDistributor = Arc<RwLock<Distributor>>;
-
-pub struct Distributor {
-    //server config for rustls. Will have to be updated to allow client side endpoint
-    server_config: Option<Arc<rustls::ServerConfig>>,
-
-    //RFC 2104, used to generate reset tokens from connection ids
-    hmac_reset_key: ring::hmac::Key,
-
-    //channels for each connection
-    connection_send_handles: IndexMap<ConnectionId, mpsc::Sender<packet::Datagram>>,
-
-    //cancellation token. if activated all connections are shut down
-    cancellation_token: tokio_util::sync::CancellationToken,
-}
-
-impl Distributor {
-    fn new(key: ring::hmac::Key, server_cfg: Option<Arc<rustls::ServerConfig>>) -> Self {
-        Self {
-            server_config: server_cfg,
-            hmac_reset_key: key,
-            connection_send_handles: IndexMap::<ConnectionId, mpsc::Sender<(Vec<u8>, String)>>::new(
-            ),
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-        }
-    }
-}
-
 pub struct Acceptor {
-    //queue for initial packets
-    rx: mpsc::Receiver<packet::InitialDatagram>,
+    rx: mpsc::Receiver<Connection>,
 }
 
 impl Acceptor {
     async fn accept(&mut self) -> Option<Connection> {
-        let (packet, remote, tsd, socket) = self.rx.recv().await.unwrap();
-
-        let (connection, ready) = match Connection::early_connection((packet, remote), tsd, socket)
-            .instrument(debug_span!("new connection"))
-            .await
-        {
-            Ok((c, r)) => (c, r),
-            Err(e) => {
-                // if we encounter an error within the initial packet, the connection is
-                // immediately abandoned
-                // TODO send close connection frame, remove conn from Distributor
-                error!("encountered error while accepting new connection: {}", e);
-                return None;
-            }
-        };
-
-        //send connection close frame
-        match ready.await {
-            Ok(terror::QuicTransportError::NoError) => return Some(connection),
-            Ok(quic_error) => {
-                error!("Connection could not be established: {}", quic_error);
-            }
-            Err(error) => {
-                error!("Error retrieving connection state: {}", error);
-            }
-        }
-
-        // force terminate connection recv task
-        connection.abort();
-        None
+        self.rx.recv().await
     }
 }
 
 pub struct Server {
-    endpoint: Endpoint,
     acceptor: Acceptor,
+    address: SocketAddr,
 }
 
 impl Server {
     pub async fn accept(&mut self) -> Option<Connection> {
         self.acceptor.accept().await
-    }
-
-    pub async fn stop(&mut self) {
-        self.endpoint
-            .distributor
-            .read()
-            .await
-            .cancellation_token
-            .cancel();
     }
 }
 
@@ -168,275 +97,98 @@ impl ServerConfig {
     }
 
     pub async fn build(self) -> Result<Server, terror::Error> {
-        let mut endpoint = Endpoint::new(
-            self.address.as_ref(),
-            Some(Arc::new(
+        let (new_connection_tx, new_connection_rx) = mpsc::channel::<Connection>(64);
+        let hmac_reset_key = [0u8; 64];
+        let address = self.address.parse().unwrap();
+
+        let endpoint = Endpoint {
+            connections: IndexMap::<ConnectionId, Arc<LockedInner>>::new(),
+            server_config: Some(Arc::new(
                 self.server_config
                     .expect("server config should contain valid config"),
             )),
-        )
-        .await;
+            hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
+            new_connection_tx,
+        };
 
-        let acceptor = endpoint.start_acceptor().await;
+        io::start(endpoint, address).await?;
 
-        Ok(Server { endpoint, acceptor })
+        Ok(Server {
+            address,
+            acceptor: Acceptor {
+                rx: new_connection_rx,
+            },
+        })
     }
 }
 
 pub struct Endpoint {
-    address: String,
+    //owns the actual connection objects
+    connections: IndexMap<ConnectionId, Arc<LockedInner>>,
 
-    //task handles for recv and send loops
-    recv_loop_handle: Option<JoinHandle<Result<u64, terror::Error>>>,
+    //server config for rustls. Will have to be updated to allow client side endpoint
+    server_config: Option<Arc<rustls::ServerConfig>>,
 
-    //stores connection channel sender handles
-    distributor: TSDistributor,
+    //RFC 2104, used to generate reset tokens from connection ids
+    hmac_reset_key: ring::hmac::Key,
+
+    //channels for initial and zero-rtt packets
+    new_connection_tx: mpsc::Sender<Connection>,
 }
 
-impl Endpoint {
-    pub async fn new(addr: &str, server_config: Option<Arc<rustls::ServerConfig>>) -> Self {
-        let mut hmac_reset_key = [0u8; 64];
-        rand::thread_rng().fill_bytes(&mut hmac_reset_key);
+impl Endpoint {}
 
-        let distributor = Arc::new(RwLock::new(Distributor::new(
-            ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
-            server_config,
-        )));
+pub struct LockedInner(Mutex<Inner>);
 
-        Endpoint {
-            address: addr.to_string(),
-            recv_loop_handle: None,
-            distributor,
-        }
+impl ConnectionApi for LockedInner {
+    fn accept_bidirectional_stream(&self) -> Poll<Result<Option<stream::Stream>, terror::Error>> {
+        todo!("todo");
     }
 
-    pub async fn start_acceptor(&mut self) -> Acceptor {
-        //socket lives via Arc in the recv loop and in each connection
-        let socket = Arc::new(
-            TokioUdpSocket::bind(self.address.clone())
-                .await
-                .expect("fatal error: socket bind failed"),
-        );
+    fn accept_unirectional_stream(&self) -> Result<stream::Stream, terror::Error> {
+        todo!("todo");
+    }
 
-        //TODO add to configuration of (server) endpoint maximum number of buffered inital packets
-        let (tx_initial, rx_initial) = mpsc::channel::<packet::InitialDatagram>(64);
-        let dist = self.distributor.clone();
-        let cancellation_token = { dist.read().await.cancellation_token.clone() };
+    fn close_connection(&self, _code: terror::QuicTransportError) {
+        todo!("todo");
+    }
 
-        info!("listening on {}", &self.address);
-
-        self.recv_loop_handle = Some(tokio::spawn(async move {
-            loop {
-                let mut buffer = std::iter::repeat(0)
-                    .take(u16::MAX as usize)
-                    .collect::<Vec<_>>();
-
-                let (size, src_addr) = match socket.recv_from(&mut buffer).await {
-                    Ok((size, src_addr)) => (size, src_addr),
-                    Err(error) => {
-                        println!("Error while receiving datagram: {:?}", error);
-                        continue;
-                    }
-                };
-
-                let head = match &buffer[0] >> 7 {
-                    0x01 => "LH",
-                    0x00 => "SH",
-                    _ => "NOT RECOGNISED",
-                };
-
-                info!("Received {:?} bytes from {:?} ({})", size, src_addr, head);
-                //truncate vector to correct size
-                buffer.truncate(size);
-
-                let dcid = match Header::get_dcid(&buffer, 8) {
-                    Ok(h) => h,
-                    Err(error) => {
-                        error!("error while retrieving dcid from packet: {}", error);
-                        continue;
-                    }
-                };
-
-                debug!("searching for {}", &dcid);
-
-                //match incoming packet to connection
-                if let Some(handle) = dist.read().await.connection_send_handles.get(&dcid) {
-                    debug!("found existing connection");
-                    handle.send((buffer, src_addr.to_string())).await.unwrap();
-                } else {
-                    //stop accepting new connections when entering graceful shutdown
-                    if ((buffer[0] & packet::LS_TYPE_BIT) >> 7) == 1
-                        && !cancellation_token.is_cancelled()
-                    {
-                        tx_initial
-                            .send((
-                                buffer,
-                                src_addr.to_string(),
-                                //partial_decode,
-                                dist.clone(),
-                                socket.clone(),
-                            ))
-                            .await
-                            .unwrap();
-                    }
-                }
-
-                if cancellation_token.is_cancelled() {
-                    {
-                        //return if all connections have been succesfully shut down
-                        if dist.read().await.connection_send_handles.is_empty() {
-                            return Ok(0);
-                        }
-                    }
-                }
-            }
-        }));
-
-        Acceptor { rx: rx_initial }
+    fn application_protocol(&self) -> Result<&str, terror::Error> {
+        todo!("todo");
     }
 }
 
 pub struct Connection {
-    //send socket
-    socket: Arc<TokioUdpSocket>,
-
-    //packet recv loop for connection
-    loop_handle: Option<JoinHandle<Result<u64, terror::Error>>>,
-    //stream acceptor handles
-    //bidi_stream_r: mpsc::Receiver<stream::Stream>,
-    //uni_stream_r: mpsc::Receiver<stream::Stream>,
+    api: Arc<dyn ConnectionApi>,
 }
 
 impl Connection {
-    //initializes a connection from an inital packet
-    async fn early_connection(
-        inital_datagram: packet::Datagram,
-        tsd: TSDistributor,
-        socket: Arc<TokioUdpSocket>,
-    ) -> Result<(Self, oneshot::Receiver<terror::QuicTransportError>), terror::Error> {
-        let (mut buffer, src_addr) = inital_datagram;
-        let (hmac_reset_key, server_config) = {
-            let t = tsd.read().await;
-            (t.hmac_reset_key.clone(), t.server_config.clone())
-        };
-
-        let server_config = server_config.unwrap();
-
-        let (conn_read_tx, conn_ready_rx) = oneshot::channel::<terror::QuicTransportError>();
-
-        let (mut inner, cid) = Inner::accept(
-            &mut buffer,
-            src_addr,
-            server_config,
-            hmac_reset_key,
-            conn_read_tx,
-        )?;
-
-        let (transmit_q, recv_q) = mpsc::channel::<packet::Datagram>(8);
-
-        {
-            tsd.write()
-                .await
-                .connection_send_handles
-                .insert(cid.clone(), transmit_q);
-        }
-
-        debug!("inserted new recv handle for cid {}", cid);
-
-        let conn = Self {
-            socket,
-            loop_handle: None,
-        };
-
-        let mut buf = [0u8; 65536];
-
-        let size = inner.fetch_dgram(&mut buf)?;
-        conn.send(&buf[..size], inner.remote.to_string()).await?;
-
-        //promote connection state
-        inner.state = ConnectionState::Handshake;
-
-        //start recv loop to process more incoming packets
-        Ok((conn.start(recv_q, inner).await.unwrap(), conn_ready_rx))
+    pub async fn accept_bidirectional_stream(
+        &self,
+    ) -> Result<Option<stream::Stream>, terror::Error> {
+        future::poll_fn(|_| self.api.accept_bidirectional_stream()).await
     }
+}
 
-    //starts recv_q, feeds into all other queues
-    async fn start(
-        mut self,
-        mut recv_q: mpsc::Receiver<packet::Datagram>,
-        mut conn: Inner,
-    ) -> Result<Self, terror::Error> {
-        let socket = self.socket.clone();
+trait ConnectionApi: Send + Sync {
+    fn accept_bidirectional_stream(&self) -> Poll<Result<Option<stream::Stream>, terror::Error>>;
 
-        self.loop_handle = Some(tokio::spawn(async move {
-            while let Some(mut msg) = recv_q.recv().await {
-                //process
-                if let Err(error) = conn.recv(&mut msg) {
-                    error!("error processing datagram: {}", error);
-                };
+    fn accept_unirectional_stream(&self) -> Result<stream::Stream, terror::Error>;
 
-                //prepare answer
-                let mut buffer = [0u8; 65536];
-                let size = match conn.fetch_dgram(&mut buffer) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        error!("failed to fetch datagram: {}", err);
-                        continue;
-                    }
-                };
+    fn close_connection(&self, code: terror::QuicTransportError);
 
-                //send data back
-                let size = match socket.send_to(&buffer[..size], &msg.1).await {
-                    Ok(size) => size,
-                    Err(error) => {
-                        return Err(terror::Error::socket_error(format!("{}", error)));
-                    }
-                };
-
-                info!(destination = &msg.1, "sent {} bytes", size);
-            }
-            Ok(0)
-        }));
-        Ok(self)
-    }
-
-    async fn send(&self, dgram: &[u8], address: String) -> Result<(), terror::Error> {
-        let size = match self.socket.send_to(dgram, &address).await {
-            Ok(size) => size,
-            Err(error) => {
-                return Err(terror::Error::socket_error(format!("{}", error)));
-            }
-        };
-
-        info!(destination = &address, "sent {} bytes", size);
-
-        Ok(())
-    }
-
-    fn abort(self) {
-        self.loop_handle.unwrap().abort();
-    }
-
-    pub async fn accept_bidi_stream(&self) -> Option<stream::Stream> {
-        None
-    }
-
-    //pub async fn accept_uni_stream() {}
-
-    //pub async fn init_bidi_stream() {}
-
-    //pub async fn init_uni_stream() {}
+    fn application_protocol(&self) -> Result<&str, terror::Error>;
 }
 
 struct Inner {
-    //oneshot channel
-    conn_ready: oneshot::Sender<terror::QuicTransportError>,
-
     //side
     side: Side,
 
     //quic version
     version: u32,
+
+    //pollable events
+    events: Vec<InnerEvent>,
 
     //tls13 session via rustls and keying material
     tls_session: RustlsConnection,
@@ -446,6 +198,9 @@ struct Inner {
 
     //connection state
     state: ConnectionState,
+
+    //HANDSHAKE_DONE frame received(client) or sent(server)
+    hs_done: bool,
 
     //connection id manager
     cidm: ConnectionIdManager,
@@ -470,14 +225,13 @@ struct Inner {
 impl Inner {
     //creates a connection from an initial packet as a server. Takes the buffer, source address,
     //server config, hmac reset key and a oneshot channel which gets triggered as soon as the
-    //connection is ready. Returns the Connection itself and the initial source connection id which
+    //connection is established. Returns the Connection itself and the initial source connection id which
     //is now used by the peer as dcid and from which the connection can now be identified.
     fn accept(
         buffer: &mut Vec<u8>,
         src_addr: String,
         server_config: Arc<rustls::ServerConfig>,
-        hmac_reset_key: ring::hmac::Key,
-        conn_read_tx: oneshot::Sender<terror::QuicTransportError>,
+        hmac_reset_key: &ring::hmac::Key,
     ) -> Result<(Self, ConnectionId), terror::Error> {
         let mut head = packet::Header::from_bytes(buffer, 8).map_err(|e| {
             terror::Error::buffer_size_error(format!(
@@ -546,7 +300,7 @@ impl Inner {
                 initial_local_scid.clone(),
             )?,
             stateless_reset_token: StatelessResetTokenTP::try_from(
-                token::StatelessResetToken::new(&hmac_reset_key, &initial_local_scid),
+                token::StatelessResetToken::new(hmac_reset_key, &initial_local_scid),
             )?,
             max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
             initial_max_streams_bidi: InitialMaxStreamsBidi::try_from(VarInt::from(1))?,
@@ -581,14 +335,15 @@ impl Inner {
         );
 
         let mut inner = Self {
-            conn_ready: conn_read_tx,
             side: Side::Server,
             version: head.version,
+            events: Vec::new(),
             tls_session: conn,
             next_secrets: None,
             next_1rtt_packet_keys: None,
             zero_rtt_keyset: None,
             state: ConnectionState::Initial,
+            hs_done: false,
             cidm: cim,
             sm: StreamManager::new(),
             packet_spaces: [
@@ -634,8 +389,7 @@ impl Inner {
             .keys(&dcid.id, side, version)
     }
 
-    fn recv(&mut self, datagram: &mut packet::Datagram) -> Result<(), terror::Error> {
-        let (buffer, _origin) = datagram;
+    fn recv(&mut self, buffer: &mut [u8], _origin: SocketAddr) -> Result<(), terror::Error> {
         let mut offset: usize = 0;
         let mut remaining: usize = buffer.len();
 
@@ -803,6 +557,9 @@ impl Inner {
         Ok(())
     }
 
+    //processes a packets payload. Takes the header of the packet and an OctetsMut object of the
+    //payload starting after the packet number and ending with the last byte of this packets
+    //payload. It must not include another packets header or payload.
     #[tracing::instrument(skip_all, fields(pn = header.packet_num))]
     fn process_payload(
         &mut self,
@@ -822,7 +579,10 @@ impl Inner {
 
             match frame_code {
                 0x00 => {
-                    let _ = payload.get_u8();
+                    //the first received padding indicates that the rest of the packet is also
+                    //padded and can therefore be skipped
+                    payload.skip(payload.cap())?;
+                    break;
                 } //PADDING
                 0x01 => {} //PING
                 0x02 | 0x03 => {
@@ -856,7 +616,7 @@ impl Inner {
                         );
 
                         self.state = ConnectionState::Connected;
-                        self.transmit_ready(terror::QuicTransportError::NoError);
+                        self.events.push(InnerEvent::ConnectionEstablished);
                     }
                 } //CRYPTO
                 0x07 => {
@@ -937,7 +697,9 @@ impl Inner {
                         n_cid, sqn, retire_prior_to
                     );
 
-                    self.cidm.register_new_cid(retire_prior_to, sqn, n_cid)?;
+                    self.cidm
+                        .register_new_cid(retire_prior_to, sqn, n_cid.clone())?;
+                    self.events.push(InnerEvent::NewConnectionId(n_cid));
                 } //NEW_CONNECTION_ID
                 0x19 => {
                     let _sequence_number = payload.get_varint().unwrap();
@@ -954,11 +716,8 @@ impl Inner {
                 0x1e => {
                     if self.side == Side::Server {
                         error!("Received HANDSHAKE_DONE frame as server");
-                        self.transmit_ready(terror::QuicTransportError::ProtocolViolation);
                         continue;
                     }
-
-                    self.transmit_ready(terror::QuicTransportError::NoError);
                 } // HANDSHAKE_DONE
                 _ => warn!(
                     "Error while processing frames: unrecognised frame {:#x} at {:#x}",
@@ -998,15 +757,6 @@ impl Inner {
         );
 
         Ok(())
-    }
-
-    fn transmit_ready(&mut self, error_code: terror::QuicTransportError) {
-        let (tx, _) = oneshot::channel::<terror::QuicTransportError>();
-        let ready = std::mem::replace(&mut self.conn_ready, tx);
-
-        if let Err(err) = ready.send(error_code) {
-            eprintln!("receiver of oneshot channel \"ready\" dropped {}", err);
-        }
     }
 
     fn process_crypto_data(&mut self, crypto_frame: &CryptoFrame) {
@@ -1239,6 +989,15 @@ impl Inner {
                 };
             }
 
+            //HANDSHAKE_DONE
+            if self.state == ConnectionState::Connected
+                && !self.hs_done
+                && self.side == Side::Server
+            {
+                buf.put_varint(0x1e)?;
+                self.hs_done = true;
+            }
+
             if packet_type == packet::PacketType::Short {
                 //encode stream frames
             }
@@ -1305,6 +1064,15 @@ impl Inner {
 
         (packet::PacketType::None, 0)
     }
+
+    pub fn poll_events(&self) -> &Vec<InnerEvent> {
+        &self.events
+    }
+}
+
+enum InnerEvent {
+    ConnectionEstablished,
+    NewConnectionId(ConnectionId),
 }
 
 #[derive(PartialEq)]
