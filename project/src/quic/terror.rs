@@ -37,6 +37,8 @@ impl Error {
     taurus_error!(no_cipher_suite, 0x17);
     taurus_error!(crypto_error, 0x18);
     taurus_error!(no_data, 0x19);
+    taurus_error!(stream_error, 0x1a);
+    taurus_error!(stream_reset, 0x1b);
     taurus_error!(taurus_misc_error, 0xff);
 
     pub fn quic_transport_error<T>(reason: T, code: QuicTransportError) -> Self

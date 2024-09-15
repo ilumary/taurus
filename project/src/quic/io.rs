@@ -1,5 +1,6 @@
+use parking_lot::Mutex;
 use std::{net::SocketAddr, sync::Arc};
-use tokio::{net::UdpSocket, sync::Mutex};
+use tokio::net::UdpSocket;
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -51,52 +52,58 @@ pub async fn start(mut endpoint: Endpoint, address: SocketAddr) -> Result<(), te
             //match incoming packet to connection
             if let Some(handle) = endpoint.connections.get(&dcid) {
                 debug!("found existing connection");
-                let mut c = handle.0.lock().await;
-                if let Err(error) = c.recv(&mut buffer[..size], src_addr) {
-                    //TODO match error.kind() for transport error
-                    error!("error processing datagram: {}", error);
-                    match error.kind() {
-                        0x00 => (),
-                        0x01..=0x10 => {
-                            todo!("send connection close frame");
-                        }
-                        _ => {
-                            todo!("probably nothing idk i'll have to find out at some point");
-                        }
-                    }
-                }
+                let mut transmit_ready: Option<Arc<LockedInner>> = None;
 
-                //poll for events in connection with outside effect
-                for event in c.poll_events() {
-                    match event {
-                        InnerEvent::ConnectionEstablished => {
-                            if let Err(error) = endpoint
-                                .new_connection_tx
-                                .send(crate::Connection {
-                                    api: handle.clone(),
-                                })
-                                .await
-                            {
-                                error!("error while providing new connection: {}", error);
+                {
+                    let mut c = handle.0.lock();
+                    if let Err(error) = c.recv(&mut buffer[..size], src_addr) {
+                        //TODO match error.kind() for transport error
+                        error!("error processing datagram: {}", error);
+                        match error.kind() {
+                            0x00 => (),
+                            0x01..=0x10 => {
+                                todo!("send connection close frame");
+                            }
+                            _ => {
+                                todo!("probably nothing idk i'll have to find out at some point");
                             }
                         }
-                        InnerEvent::NewConnectionId(_ncid) => {
-                            todo!("new cid insertion not yet implemented");
+                    }
+
+                    //poll for events in connection with outside effect
+                    for event in c.poll_events() {
+                        match event {
+                            InnerEvent::ConnectionEstablished => {
+                                transmit_ready = Some(handle.clone())
+                            }
+                            InnerEvent::NewConnectionId(_ncid) => {
+                                todo!("new cid insertion not yet implemented");
+                            }
                         }
                     }
+
+                    //prepare answer
+                    answer_size = match c.fetch_dgram(&mut answer) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            error!("failed to fetch datagram: {}", err);
+                            continue;
+                        }
+                    };
+
+                    dst_addr = c.remote;
                 }
 
-                //prepare answer
-                answer_size = match c.fetch_dgram(&mut answer) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        error!("failed to fetch datagram: {}", err);
-                        continue;
+                //transmit ready after guard is dropped
+                if let Some(c) = transmit_ready {
+                    if let Err(error) = endpoint
+                        .new_connection_tx
+                        .send(crate::Connection { api: c })
+                        .await
+                    {
+                        error!("error while providing new connection: {}", error);
                     }
-                };
-
-                dst_addr = c.remote;
-                drop(c);
+                }
             } else if ((buffer[0] & packet::LS_TYPE_BIT) >> 7) == 1
                 && ((buffer[0] & packet::LONG_PACKET_TYPE) >> 4) == 0
             {

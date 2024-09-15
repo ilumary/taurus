@@ -8,6 +8,7 @@ mod transport_parameters;
 use indexmap::IndexMap;
 use octets::OctetsMut;
 use packet::{AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, Header, NewTokenFrame};
+use parking_lot::Mutex;
 use rand::RngCore;
 use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -19,7 +20,7 @@ use rustls::{
 use std::{collections::VecDeque, fmt, future, net::SocketAddr, sync::Arc, task::Poll};
 use stream::StreamManager;
 use token::StatelessResetToken;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, error, event, warn, Level};
 use transport_parameters::{
     InitialMaxData, InitialMaxStreamDataBidiLocal, InitialMaxStreamDataBidiRemote,
@@ -136,25 +137,44 @@ pub struct Endpoint {
     new_connection_tx: mpsc::Sender<Connection>,
 }
 
-impl Endpoint {}
-
 pub struct LockedInner(Mutex<Inner>);
 
 impl ConnectionApi for LockedInner {
-    fn accept_bidirectional_stream(&self) -> Poll<Result<Option<stream::Stream>, terror::Error>> {
-        todo!("todo");
+    fn accept_bidirectional_stream(
+        &self,
+        cx: &mut std::task::Context,
+    ) -> Poll<Result<Option<(stream::SendStream, stream::RecvStream)>, terror::Error>> {
+        Poll::Pending
     }
 
-    fn accept_unirectional_stream(&self) -> Result<stream::Stream, terror::Error> {
-        todo!("todo");
+    fn accept_unidirectional_stream(
+        &self,
+        _cx: &mut std::task::Context,
+    ) -> Poll<Result<Option<stream::RecvStream>, terror::Error>> {
+        Poll::Pending
     }
 
-    fn close_connection(&self, _code: terror::QuicTransportError) {
-        todo!("todo");
+    fn close(
+        &self,
+        _cx: &mut std::task::Context,
+        _reason: &str,
+    ) -> Poll<Result<(), terror::Error>> {
+        Poll::Pending
     }
 
-    fn application_protocol(&self) -> Result<&str, terror::Error> {
-        todo!("todo");
+    fn application_protocol(&self) -> Option<String> {
+        if let Some(alp) = self.0.lock().tls_session.alpn_protocol() {
+            return Some(String::from_utf8(alp.to_vec()).unwrap());
+        }
+        None
+    }
+
+    fn keep_alive(&self, _enable: bool) {
+        todo!("Connection keep alive has not yet been implemented");
+    }
+
+    fn zero_rtt(&self, _enable: bool) {
+        todo!("zero_rtt enabling/disabling has not yet been implemented");
     }
 }
 
@@ -165,19 +185,43 @@ pub struct Connection {
 impl Connection {
     pub async fn accept_bidirectional_stream(
         &self,
-    ) -> Result<Option<stream::Stream>, terror::Error> {
-        future::poll_fn(|_| self.api.accept_bidirectional_stream()).await
+    ) -> Result<Option<(stream::SendStream, stream::RecvStream)>, terror::Error> {
+        future::poll_fn(|cx| self.api.accept_bidirectional_stream(cx)).await
+    }
+
+    pub async fn accept_unidirectional_stream(
+        &self,
+    ) -> Result<Option<stream::RecvStream>, terror::Error> {
+        future::poll_fn(|cx| self.api.accept_unidirectional_stream(cx)).await
+    }
+
+    pub async fn close(&self, reason: &str) -> Result<(), terror::Error> {
+        future::poll_fn(|cx| self.api.close(cx, reason)).await
+    }
+
+    pub fn application_protocol(&self) -> Option<String> {
+        self.api.application_protocol()
     }
 }
 
 trait ConnectionApi: Send + Sync {
-    fn accept_bidirectional_stream(&self) -> Poll<Result<Option<stream::Stream>, terror::Error>>;
+    fn accept_bidirectional_stream(
+        &self,
+        cx: &mut std::task::Context,
+    ) -> Poll<Result<Option<(stream::SendStream, stream::RecvStream)>, terror::Error>>;
 
-    fn accept_unirectional_stream(&self) -> Result<stream::Stream, terror::Error>;
+    fn accept_unidirectional_stream(
+        &self,
+        cx: &mut std::task::Context,
+    ) -> Poll<Result<Option<stream::RecvStream>, terror::Error>>;
 
-    fn close_connection(&self, code: terror::QuicTransportError);
+    fn close(&self, cx: &mut std::task::Context, reason: &str) -> Poll<Result<(), terror::Error>>;
 
-    fn application_protocol(&self) -> Result<&str, terror::Error>;
+    fn application_protocol(&self) -> Option<String>;
+
+    fn keep_alive(&self, enable: bool);
+
+    fn zero_rtt(&self, enable: bool);
 }
 
 struct Inner {
@@ -590,13 +634,15 @@ impl Inner {
                     self.process_ack(ack, header.space())?;
                 } //ACK
                 0x04 => {
-                    let _stream_id = payload.get_varint().unwrap();
-                    let _application_protocol_error_code = payload.get_varint().unwrap();
-                    let _final_size = payload.get_varint().unwrap();
+                    let stream_id = payload.get_varint()?;
+                    let apec = payload.get_varint()?;
+                    let final_size = payload.get_varint()?;
+
+                    self.sm.process_reset(stream_id, apec, final_size)?;
                 } //RESET_STREAM
                 0x05 => {
-                    let _stream_id = payload.get_varint().unwrap();
-                    let _application_protocol_error_code = payload.get_varint().unwrap();
+                    let _stream_id = payload.get_varint()?;
+                    let _application_protocol_error_code = payload.get_varint()?;
                 } //STOP_SENDING
                 0x06 => {
                     let crypto_frame = CryptoFrame::from_bytes(&frame_code, payload);
@@ -627,17 +673,17 @@ impl Inner {
                     }
                 } //NEW_TOKEN
                 0x08..=0x0f => {
-                    let stream_id = payload.get_varint().unwrap();
+                    let stream_id = payload.get_varint()?;
                     let mut offset: u64 = 0;
                     let mut fin_bit_set = false;
 
                     if (frame_code & 0x04) != 0 {
-                        offset = payload.get_varint().unwrap();
+                        offset = payload.get_varint()?;
                     }
 
                     let mut length: u64 = payload.cap() as u64;
                     if (frame_code & 0x02) != 0 {
-                        length = payload.get_varint().unwrap();
+                        length = payload.get_varint()?;
                     }
 
                     if (frame_code & 0x01) != 0 {
@@ -650,37 +696,37 @@ impl Inner {
                         .incoming(stream_id, offset, length, fin_bit_set, stream_data.buf())?;
                 } //STREAM
                 0x10 => {
-                    let _max_data = payload.get_varint().unwrap();
+                    let _max_data = payload.get_varint()?;
                 } //MAX_DATA
                 0x11 => {
-                    let _stream_id = payload.get_varint().unwrap();
-                    let _max_data = payload.get_varint().unwrap();
+                    let _stream_id = payload.get_varint()?;
+                    let _max_data = payload.get_varint()?;
                 } //MAX_STREAM_DATA
                 0x12 => {
-                    let _maximum_streams = payload.get_varint().unwrap();
+                    let _maximum_streams = payload.get_varint()?;
                 } //MAX_STREAMS (bidirectional)
                 0x13 => {
-                    let _maximum_streams = payload.get_varint().unwrap();
+                    let _maximum_streams = payload.get_varint()?;
                 } //MAX_STREAMS (unidirectional)
                 0x14 => {
-                    let _maximum_data = payload.get_varint().unwrap();
+                    let _maximum_data = payload.get_varint()?;
                 } //DATA_BLOCKED
                 0x15 => {
-                    let _stream_id = payload.get_varint().unwrap();
-                    let _maximum_stream_data = payload.get_varint().unwrap();
+                    let _stream_id = payload.get_varint()?;
+                    let _maximum_stream_data = payload.get_varint()?;
                 } //STREAM_DATA_BLOCKED
                 0x16 => {
-                    let _maximum_streams = payload.get_varint().unwrap();
+                    let _maximum_streams = payload.get_varint()?;
                 } //STREAMS_BLOCKED (bidirectional)
                 0x17 => {
-                    let _maximum_streams = payload.get_varint().unwrap();
+                    let _maximum_streams = payload.get_varint()?;
                 } //STREAMS_BLOCKED (unidirectional)
                 0x18 => {
                     println!("NEW CID");
                     let sqn = payload.get_varint().unwrap();
-                    let retire_prior_to = payload.get_varint().unwrap();
+                    let retire_prior_to = payload.get_varint()?;
                     let l = payload.get_u8().unwrap();
-                    let n_cid = ConnectionId::from(payload.get_bytes(l as usize).unwrap().to_vec());
+                    let n_cid = ConnectionId::from(payload.get_bytes(l as usize)?.to_vec());
 
                     if retire_prior_to > sqn {
                         return Err(terror::Error::quic_transport_error(
@@ -690,7 +736,7 @@ impl Inner {
                     }
 
                     //dunno what to do
-                    let _srt = StatelessResetToken::from(payload.get_bytes(0x10).unwrap().to_vec());
+                    let _srt = StatelessResetToken::from(payload.get_bytes(0x10)?.to_vec());
 
                     debug!(
                         "received new cid from peer: {} (sqn: {}, rpt: {})",
@@ -702,13 +748,13 @@ impl Inner {
                     self.events.push(InnerEvent::NewConnectionId(n_cid));
                 } //NEW_CONNECTION_ID
                 0x19 => {
-                    let _sequence_number = payload.get_varint().unwrap();
+                    let _sequence_number = payload.get_varint()?;
                 } //RETIRE_CONNECTION_ID
                 0x1a => {
-                    let _path_challenge_data = payload.get_u64().unwrap();
+                    let _path_challenge_data = payload.get_u64()?;
                 } //PATH_CHALLENGE
                 0x1b => {
-                    let _path_response_data = payload.get_u64().unwrap();
+                    let _path_response_data = payload.get_u64()?;
                 } //PATH_RESPONSE
                 0x1c | 0x1d => {
                     let _connection_close = ConnectionCloseFrame::from_bytes(&frame_code, payload);

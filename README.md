@@ -38,7 +38,7 @@ Feel free to open a <a href="https://github.com/ilumary/taurus/pulls">pull reque
 
 ## Build
 
-Building requires a recent version of rustc (>=1.72.0):
+Building requires a recent version of rustc (>=1.80.0):
 
 ```bash
 # Clone & Build
@@ -60,7 +60,7 @@ Currently the Client API is not yet implemented. Therefore one has to use an ext
 
 ```bash
 # Start client
-~/quinn/ $ cargo run --example client https://127.0.0.1:34254/
+~/quinn/ $ cargo run --example client https://localhost:4433/Cargo.toml
 ```
 
 ## Credits
