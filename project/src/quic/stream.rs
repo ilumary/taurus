@@ -1,9 +1,9 @@
-use crate::terror;
+use crate::{terror, Connection};
 
-use std::{collections::VecDeque, ops::Range, sync::Arc};
+use std::{collections::VecDeque, future, ops::Range, sync::Arc};
 
 use indexmap::IndexMap;
-use tracing::{error, warn};
+use tracing::{debug, warn};
 
 const STREAM_TYPE: u64 = 0x3;
 const CLIENT_INIT_BIDI: u64 = 0x00;
@@ -13,22 +13,106 @@ const SERVER_INIT_UNI: u64 = 0x03;
 
 type StreamId = u64;
 
+// public struct for the RecvStream, maybe also add reference to actual stream object to save on
+// search in indexmap
+pub struct RecvStream {
+    id: StreamId,
+    inner: Connection,
+}
+
+impl RecvStream {
+    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, terror::Error> {
+        future::poll_fn(|cx| self.inner.api.poll_recv(cx, &self.id, buf)).await
+    }
+}
+
+// public struct for the SendStream
+pub struct SendStream {
+    id: StreamId,
+    inner: Connection,
+}
+
+impl SendStream {
+    pub async fn write(&self, buf: &[u8]) -> Result<usize, terror::Error> {
+        future::poll_fn(|cx| self.inner.api.poll_send(cx, &self.id, buf)).await
+    }
+}
+
 // stores and manages streams for connection
 // TODO register callback on recv stream
 // TODO initialize with limits
 pub struct StreamManager {
-    outbound: IndexMap<StreamId, SendStream>,
-    inbound: IndexMap<StreamId, RecvStream>,
+    // all streams, sorted by inbound and outbound
+    outbound: IndexMap<StreamId, SendStreamInner>,
+    inbound: IndexMap<StreamId, RecvStreamInner>,
+
+    // [client init bidi, server init bidi, client init uni, server init uni]
+    counts: [u64; 4],
+
+    // used as least significant bit in stream ids. distinguishes between client (0x00) and server
+    // (0x01)
+    local: u8,
 }
 
 impl StreamManager {
-    pub fn new() -> Self {
+    pub fn new(local: u8) -> Self {
+        assert!(local == 0x00 || local == 0x01, "local must be 0x00 or 0x01");
+
         Self {
             inbound: IndexMap::new(),
             outbound: IndexMap::new(),
+            counts: [0, 0, 0, 0],
+            local,
         }
     }
 
+    // creates a new stream with a given stream id
+    fn create(&mut self, stream_id: StreamId, local: bool) -> Result<(), terror::Error> {
+        if self.inbound.contains_key(&stream_id) || self.outbound.contains_key(&stream_id) {
+            return Err(terror::Error::stream_error("stream does already exist"));
+        }
+
+        let stream_t = stream_id & STREAM_TYPE;
+        let sequence = stream_id >> 2;
+
+        if sequence >= self.counts[stream_t as usize] {
+            self.counts[stream_t as usize] = sequence + 1;
+        }
+
+        if stream_t == CLIENT_INIT_BIDI || stream_t == SERVER_INIT_BIDI {
+            self.inbound.insert(stream_id, RecvStreamInner::new());
+            self.outbound.insert(stream_id, SendStreamInner::new());
+        } else if (stream_t == CLIENT_INIT_UNI || stream_t == SERVER_INIT_UNI) && local {
+            // if stream is unidirectional and created locally it is always outbound
+            self.outbound.insert(stream_id, SendStreamInner::new());
+        } else if (stream_t == CLIENT_INIT_UNI || stream_t == SERVER_INIT_UNI) && !local {
+            // if it is not locally created it must be inbound
+            self.inbound.insert(stream_id, RecvStreamInner::new());
+        }
+
+        Ok(())
+    }
+
+    // issues a new stream id and creates a new stream
+    // TODO check local stream limits
+    pub fn initiate(&mut self, bidi: bool) -> Result<StreamId, terror::Error> {
+        // issue new stream id, start with locality
+        let mut id = self.local as u64;
+
+        // a bit of parsing to add bidirectionality to id
+        id |= (!bidi as u64) << 1;
+
+        // now add sequence number aka the inner id
+        id |= self.counts[id as usize] << 2;
+
+        self.create(id, true)?;
+
+        debug!("initiated new stream with id: {}", id);
+
+        Ok(id)
+    }
+
+    //TODO check stream limits
     pub fn incoming(
         &mut self,
         stream_id: u64,
@@ -41,75 +125,65 @@ impl StreamManager {
             return rs.process(offset, length, fin, data);
         }
 
-        //new incoming stream, must be at least an RecvStream because its incoming
-        let recv = RecvStream::new(stream_id, data, offset, fin);
-
-        let send = if stream_id & STREAM_TYPE == CLIENT_INIT_BIDI
-            || stream_id & STREAM_TYPE == SERVER_INIT_BIDI
-        {
-            Some(SendStream::new(stream_id))
-        } else {
-            None
-        };
-
-        if self.inbound.insert(stream_id, recv).is_none() {
-            return Err(terror::Error::stream_error(format!(
-                "failed to insert recv stream with stream id {}",
-                stream_id
-            )));
+        if (stream_id & 0x01) == self.local as u64 {
+            return Err(terror::Error::stream_error("local stream cant be incoming"));
         }
 
-        if let Some(s) = send {
-            if self.outbound.insert(stream_id, s).is_none() {
-                return Err(terror::Error::stream_error(format!(
-                    "failed to insert send stream with stream id {}",
-                    stream_id
-                )));
-            }
-        }
+        // because stream is incoming it cant be local
+        self.create(stream_id, false)?;
+
+        debug!(
+            "created new stream with id {} from incoming frame",
+            stream_id
+        );
+
+        //unwrap is safe because stream was created
+        let recv_s = self.inbound.get_mut(&stream_id).unwrap();
+        recv_s.process(offset, length, fin, data)?;
 
         Ok(())
     }
 
-    //TODO rework for bidi streams as well as uni streams
-    pub fn process_reset(
+    // Appends to an existing outbound stream. Because we can only append to send streams
+    // which must either have been created as local unidirectional stream or as incoming
+    // bidirectional stream, we return an error if send stream could not found.
+    pub fn append(
+        &mut self,
+        stream_id: StreamId,
+        data: &[u8],
+        fin: bool,
+    ) -> Result<(), terror::Error> {
+        if let Some(ss) = self.outbound.get_mut(&stream_id) {
+            return ss.append(data, fin);
+        }
+
+        Err(terror::Error::stream_error(format!(
+            "send stream with id {} no found",
+            stream_id
+        )))
+    }
+
+    // resets any given stream_id. If a receiving stream is reset, a final size must be supplied
+    pub fn reset(
         &mut self,
         stream_id: u64,
         apec: u64,
-        final_size: u64,
+        final_size: Option<u64>,
     ) -> Result<(), terror::Error> {
         if let Some(rs) = self.inbound.get_mut(&stream_id) {
-            rs.reset(apec, final_size)?;
-            warn!(
-                "stream {} has been reset with error code {}",
-                stream_id, apec
-            );
-        } else {
-            error!("received reset for stream that does not exist");
+            rs.reset(apec, final_size.unwrap())?;
+        }
+
+        if let Some(ss) = self.outbound.get_mut(&stream_id) {
+            ss.reset(apec)?;
         }
 
         Ok(())
-    }
-
-    pub fn _initiate_unidirectional(
-        &mut self,
-        _data: Vec<u8>,
-    ) -> Result<SendStream, terror::Error> {
-        todo!("initiating streams is not yet implemented");
-    }
-
-    pub fn _initiate_bidirectional(
-        &mut self,
-        _data: Vec<u8>,
-    ) -> Result<(SendStream, RecvStream), terror::Error> {
-        todo!("initiating streams is not yet implemented");
     }
 }
 
 //TODO retransmits
-pub struct SendStream {
-    id: StreamId,
-
+struct SendStreamInner {
     //data chunks ordered in outgoing direction
     data: VecDeque<Chunk>,
 
@@ -126,10 +200,9 @@ pub struct SendStream {
     apec: Option<u64>,
 }
 
-impl SendStream {
-    fn new(id: StreamId) -> Self {
+impl SendStreamInner {
+    fn new() -> Self {
         Self {
-            id,
             data: VecDeque::new(),
             pending: IndexMap::new(),
             next_off: 0,
@@ -222,9 +295,7 @@ impl SendStream {
     }
 }
 
-pub struct RecvStream {
-    id: StreamId,
-
+struct RecvStreamInner {
     //data chunks ordered by their offset
     data: IndexMap<u64, Chunk>,
 
@@ -247,8 +318,20 @@ pub struct RecvStream {
     apec: Option<u64>,
 }
 
-impl RecvStream {
-    fn new(id: StreamId, data: &[u8], off: u64, fin: bool) -> Self {
+impl RecvStreamInner {
+    fn new() -> Self {
+        Self {
+            data: IndexMap::new(),
+            gaps: Vec::new(),
+            max_off: 0,
+            max_read: 0,
+            start_recv: false,
+            final_size: None,
+            apec: None,
+        }
+    }
+
+    fn with_data(data: &[u8], off: u64, fin: bool) -> Self {
         let chunk = Chunk::new(data, off, fin);
         let mut gaps = Vec::new();
         let mut start_recv = true;
@@ -268,7 +351,6 @@ impl RecvStream {
         }
 
         Self {
-            id,
             data: map,
             gaps,
             max_off: off,
@@ -307,6 +389,11 @@ impl RecvStream {
             ));
         }
 
+        //if chunk with offset zero is received, we can emit
+        if offset == 0 {
+            self.start_recv = true;
+        }
+
         if let Some(fsize) = self.final_size {
             if offset > fsize {
                 return Err(terror::Error::quic_transport_error(
@@ -322,7 +409,7 @@ impl RecvStream {
 
             if offset > gap.end || (offset + length) > gap.end {
                 return Err(terror::Error::quic_transport_error(
-                    format!("malformed frame in stream {}", self.id),
+                    "malformed stream frame",
                     terror::QuicTransportError::ProtocolViolation,
                 ));
             }
@@ -397,10 +484,7 @@ impl RecvStream {
             .binary_search_by(|probe| probe.start.cmp(&gap.start))
         {
             Ok(_) => {
-                warn!(
-                    "tried inserting gap in recv stream {} which already existed",
-                    self.id
-                );
+                warn!("tried inserting gap in recv stream which already existed",);
             }
             Err(pos) => self.gaps.insert(pos, gap),
         }
@@ -570,10 +654,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stream_manager_create_as_server() {
+        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+
+        let bidi1 = sm.initiate(true).unwrap();
+        let bidi2 = sm.initiate(true).unwrap();
+
+        let uni1 = sm.initiate(false).unwrap();
+        let uni2 = sm.initiate(false).unwrap();
+
+        assert_eq!(bidi1, 0x01);
+        assert_eq!(bidi2, 0x05);
+        assert_eq!(uni1, 0x03);
+        assert_eq!(uni2, 0x07);
+    }
+
+    #[test]
+    fn stream_manager_create_as_client() {
+        let mut sm = StreamManager::new(rustls::Side::Client as u8);
+
+        let bidi1 = sm.initiate(true).unwrap();
+        let bidi2 = sm.initiate(true).unwrap();
+
+        let uni1 = sm.initiate(false).unwrap();
+        let uni2 = sm.initiate(false).unwrap();
+
+        assert_eq!(bidi1, 0x00);
+        assert_eq!(bidi2, 0x04);
+        assert_eq!(uni1, 0x02);
+        assert_eq!(uni2, 0x06);
+    }
+
+    #[test]
+    fn stream_manager_incoming_as_server() {
+        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+
+        let bidi1 = 0x00;
+        let bidi2 = 0x04;
+        let bidi3 = 0x08;
+
+        let uni1 = 0x02;
+
+        sm.incoming(bidi3, 0, 8, true, &[1u8; 8]).unwrap();
+
+        assert_eq!(sm.counts[0], 3);
+        assert!(sm.inbound.get(&bidi3).is_some());
+        assert!(sm.outbound.get(&bidi3).is_some());
+
+        sm.incoming(bidi2, 0, 8, true, &[1u8; 8]).unwrap();
+
+        assert!(sm.inbound.get(&bidi2).is_some());
+        assert!(sm.outbound.get(&bidi2).is_some());
+
+        sm.incoming(bidi1, 0, 8, true, &[1u8; 8]).unwrap();
+
+        assert!(sm.inbound.get(&bidi1).is_some());
+        assert!(sm.outbound.get(&bidi1).is_some());
+
+        sm.incoming(uni1, 0, 8, true, &[1u8; 8]).unwrap();
+
+        assert_eq!(sm.counts[2], 1);
+        assert!(sm.inbound.get(&uni1).is_some());
+        assert!(sm.outbound.get(&uni1).is_none());
+    }
+
+    #[test]
+    fn stream_manager_wrong_id_type_as_server() {
+        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+
+        // server init bidi recv as server should fail
+        let bidi = 0x05;
+
+        assert!(sm.incoming(bidi, 0, 8, true, &[1u8; 8]).is_err());
+    }
+
+    #[test]
     fn recv_stream_creation() {
         let data = vec![1u8; 8];
 
-        let recv_stream = RecvStream::new(0, &data, 0, true);
+        let recv_stream = RecvStreamInner::with_data(&data, 0, true);
 
         assert_eq!(recv_stream.max_off, 0);
         assert_eq!(recv_stream.final_size.unwrap(), 8);
@@ -585,7 +744,7 @@ mod tests {
         let frame2 = vec![2u8; 8];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStream::new(0, &frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
 
         assert_eq!(recv_stream.gaps[0], 8..16);
@@ -603,7 +762,7 @@ mod tests {
         let frame4 = vec![4u8; 8];
         let frame5 = vec![5u8; 8];
 
-        let mut recv_stream = RecvStream::new(0, &frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
         assert!(recv_stream.process(32, 8, true, &frame5).is_ok());
 
         assert_eq!(recv_stream.gaps[0], 8..32);
@@ -624,7 +783,7 @@ mod tests {
         let frame2 = vec![2u8; 9];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStream::new(0, &frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
         assert!(recv_stream.process(8, 9, false, &frame2).is_err());
     }
@@ -635,7 +794,7 @@ mod tests {
         let frame2 = vec![2u8; 8];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStream::new(0, &frame2, 8, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame2, 8, false);
         assert!(recv_stream.process(0, 8, false, &frame1).is_ok());
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
     }
@@ -646,7 +805,7 @@ mod tests {
         let frame2 = vec![2u8; 8];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStream::new(0, &frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
         assert!(recv_stream.process(8, 8, false, &frame2).is_ok());
 
@@ -661,7 +820,7 @@ mod tests {
         let frame2 = vec![2u8; 8];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStream::new(0, &frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
         assert!(recv_stream.process(8, 8, false, &frame2).is_ok());
 
@@ -684,7 +843,7 @@ mod tests {
 
         let mut result = [0u8; 24];
 
-        let mut recv_stream = RecvStream::new(0, &frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
 
         assert_eq!(recv_stream.final_size.unwrap(), 24);
@@ -711,7 +870,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let frame2 = vec![2u8; 8];
 
-        let mut recv_stream = RecvStream::new(0, &frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
         assert!(recv_stream.process(8, 8, false, &frame2).is_ok());
         assert!(recv_stream.reset(0x00, 16).is_ok());
     }
@@ -721,7 +880,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let frame2 = vec![2u8; 8];
 
-        let mut recv_stream = RecvStream::new(0, &frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
         assert!(recv_stream.process(8, 8, true, &frame2).is_ok());
         assert!(recv_stream.reset(0x00, 17).is_err());
     }
@@ -731,7 +890,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let frame2 = vec![2u8; 8];
 
-        let mut recv_stream = RecvStream::new(0, &frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
         assert!(recv_stream.process(8, 8, false, &frame2).is_ok());
         assert!(recv_stream.reset(0x00, 15).is_err());
     }
@@ -741,7 +900,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let mut result = vec![0u8; 8];
 
-        let mut send_stream = SendStream::new(0);
+        let mut send_stream = SendStreamInner::new();
 
         send_stream.append(&frame1, true).unwrap();
 
@@ -758,7 +917,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let mut result = [0u8; 8];
 
-        let mut send_stream = SendStream::new(0);
+        let mut send_stream = SendStreamInner::new();
 
         send_stream.append(&frame1, true).unwrap();
 
@@ -784,7 +943,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let mut result = vec![0u8; 8];
 
-        let mut send_stream = SendStream::new(0);
+        let mut send_stream = SendStreamInner::new();
 
         send_stream.append(&frame1, true).unwrap();
 
@@ -803,7 +962,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let mut result = vec![0u8; 8];
 
-        let mut send_stream = SendStream::new(0);
+        let mut send_stream = SendStreamInner::new();
 
         send_stream.append(&frame1, false).unwrap();
 

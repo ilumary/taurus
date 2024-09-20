@@ -140,10 +140,31 @@ pub struct Endpoint {
 pub struct LockedInner(Mutex<Inner>);
 
 impl ConnectionApi for LockedInner {
+    fn poll_recv(
+        &self,
+        _cx: &mut std::task::Context,
+        _id: &u64,
+        _buf: &mut [u8],
+    ) -> Poll<Result<usize, terror::Error>> {
+        let _conn = self.0.lock();
+        Poll::Pending
+    }
+
+    fn poll_send(
+        &self,
+        _cx: &mut std::task::Context,
+        _id: &u64,
+        _buf: &[u8],
+    ) -> Poll<Result<usize, terror::Error>> {
+        let _conn = self.0.lock();
+        Poll::Pending
+    }
+
     fn accept_bidirectional_stream(
         &self,
-        cx: &mut std::task::Context,
+        _cx: &mut std::task::Context,
     ) -> Poll<Result<Option<(stream::SendStream, stream::RecvStream)>, terror::Error>> {
+        let _conn = self.0.lock();
         Poll::Pending
     }
 
@@ -204,7 +225,29 @@ impl Connection {
     }
 }
 
+impl Clone for Connection {
+    fn clone(&self) -> Self {
+        Self {
+            api: self.api.clone(),
+        }
+    }
+}
+
 trait ConnectionApi: Send + Sync {
+    fn poll_recv(
+        &self,
+        cx: &mut std::task::Context,
+        id: &u64,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize, terror::Error>>;
+
+    fn poll_send(
+        &self,
+        cx: &mut std::task::Context,
+        id: &u64,
+        buf: &[u8],
+    ) -> Poll<Result<usize, terror::Error>>;
+
     fn accept_bidirectional_stream(
         &self,
         cx: &mut std::task::Context,
@@ -389,7 +432,7 @@ impl Inner {
             state: ConnectionState::Initial,
             hs_done: false,
             cidm: cim,
-            sm: StreamManager::new(),
+            sm: StreamManager::new(Side::Server as u8),
             packet_spaces: [
                 initial_space,
                 PacketNumberSpace::new(),
@@ -638,7 +681,7 @@ impl Inner {
                     let apec = payload.get_varint()?;
                     let final_size = payload.get_varint()?;
 
-                    self.sm.process_reset(stream_id, apec, final_size)?;
+                    self.sm.reset(stream_id, apec, Some(final_size))?;
                 } //RESET_STREAM
                 0x05 => {
                     let _stream_id = payload.get_varint()?;
