@@ -1,6 +1,11 @@
 use crate::{terror, Connection};
 
-use std::{collections::VecDeque, future, ops::Range, sync::Arc};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    future,
+    ops::Range,
+    sync::Arc,
+};
 
 use indexmap::IndexMap;
 use tracing::{debug, warn};
@@ -12,6 +17,7 @@ const CLIENT_INIT_UNI: u64 = 0x02;
 const SERVER_INIT_UNI: u64 = 0x03;
 
 type StreamId = u64;
+type StreamPriority = u8;
 
 // public struct for the RecvStream, maybe also add reference to actual stream object to save on
 // search in indexmap
@@ -49,6 +55,13 @@ pub struct StreamManager {
     // [client init bidi, server init bidi, client init uni, server init uni]
     counts: [u64; 4],
 
+    // keeps track of outbound streams which have data to write. tuples implement ord from left to
+    // right, so first stream id has highest priority (1)
+    outbound_ready: BTreeSet<(StreamPriority, StreamId)>,
+
+    //unhandled: [StreamId; 4],
+    //wakers: [std::task::Waker; 4],
+
     // used as least significant bit in stream ids. distinguishes between client (0x00) and server
     // (0x01)
     local: u8,
@@ -61,6 +74,7 @@ impl StreamManager {
         Self {
             inbound: IndexMap::new(),
             outbound: IndexMap::new(),
+            outbound_ready: BTreeSet::new(),
             counts: [0, 0, 0, 0],
             local,
         }
@@ -157,10 +171,21 @@ impl StreamManager {
             return ss.append(data, fin);
         }
 
+        self.outbound_ready.insert((u8::MAX, stream_id));
+
         Err(terror::Error::stream_error(format!(
             "send stream with id {} no found",
             stream_id
         )))
+    }
+
+    pub fn emit_outbound(
+        &mut self,
+        _buf: &mut [u8],
+        _pn: u64,
+    ) -> Result<(usize, bool), terror::Error> {
+        //if let Some(ss) = self.outbound_ready.pop_first()
+        Ok((0, false))
     }
 
     // resets any given stream_id. If a receiving stream is reset, a final size must be supplied
@@ -209,6 +234,20 @@ impl SendStreamInner {
             final_size: None,
             apec: None,
         }
+    }
+
+    fn readable(&self) -> bool {
+        if self.apec.is_some() {
+            return false;
+        }
+
+        if let Some(chunk) = self.data.front() {
+            if !chunk.is_empty() {
+                return true;
+            }
+        }
+
+        false
     }
 
     //emits data to be sent
@@ -729,6 +768,25 @@ mod tests {
     }
 
     #[test]
+    fn stream_manager_emit_outbound_ready() {
+        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut result = [0u8; 9];
+
+        let mut octs = octets::OctetsMut::with_slice(&mut result);
+        octs.put_u8(0x04).unwrap();
+
+        let send_stream = sm.initiate(false).unwrap();
+
+        sm.append(send_stream, &[3u8; 8], true).unwrap();
+
+        let send_stream1 = sm.initiate(false).unwrap();
+
+        sm.append(send_stream1, &[4u8; 8], true).unwrap();
+
+        //TODO
+    }
+
+    #[test]
     fn recv_stream_creation() {
         let data = vec![1u8; 8];
 
@@ -973,5 +1031,23 @@ mod tests {
         //assert appending and emitting is disabled after reset
         assert!(send_stream.append(&frame1, true).is_err());
         assert!(send_stream.emit(&mut result, 0).is_err());
+    }
+
+    #[test]
+    fn send_stream_readable() {
+        let frame1 = vec![1u8; 8];
+        let mut result = vec![0u8; 8];
+
+        let mut send_stream = SendStreamInner::new();
+
+        assert!(!send_stream.readable());
+
+        send_stream.append(&frame1, true).unwrap();
+
+        assert!(send_stream.readable());
+
+        send_stream.emit(&mut result, 0).unwrap();
+
+        assert!(!send_stream.readable());
     }
 }

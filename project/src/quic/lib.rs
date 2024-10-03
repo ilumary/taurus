@@ -160,18 +160,13 @@ impl ConnectionApi for LockedInner {
         Poll::Pending
     }
 
-    fn accept_bidirectional_stream(
+    fn poll_accept(
         &self,
         _cx: &mut std::task::Context,
-    ) -> Poll<Result<Option<(stream::SendStream, stream::RecvStream)>, terror::Error>> {
+        _type: u64,
+        _arc: Connection,
+    ) -> Poll<Result<(Option<stream::RecvStream>, Option<stream::SendStream>), terror::Error>> {
         let _conn = self.0.lock();
-        Poll::Pending
-    }
-
-    fn accept_unidirectional_stream(
-        &self,
-        _cx: &mut std::task::Context,
-    ) -> Poll<Result<Option<stream::RecvStream>, terror::Error>> {
         Poll::Pending
     }
 
@@ -206,14 +201,14 @@ pub struct Connection {
 impl Connection {
     pub async fn accept_bidirectional_stream(
         &self,
-    ) -> Result<Option<(stream::SendStream, stream::RecvStream)>, terror::Error> {
-        future::poll_fn(|cx| self.api.accept_bidirectional_stream(cx)).await
+    ) -> Result<(stream::RecvStream, stream::SendStream), terror::Error> {
+        let s = future::poll_fn(|cx| self.api.poll_accept(cx, 0x00, self.clone())).await?;
+        Ok((s.0.unwrap(), s.1.unwrap()))
     }
 
-    pub async fn accept_unidirectional_stream(
-        &self,
-    ) -> Result<Option<stream::RecvStream>, terror::Error> {
-        future::poll_fn(|cx| self.api.accept_unidirectional_stream(cx)).await
+    pub async fn accept_unidirectional_stream(&self) -> Result<stream::RecvStream, terror::Error> {
+        let s = future::poll_fn(|cx| self.api.poll_accept(cx, 0x01, self.clone())).await?;
+        Ok(s.0.unwrap())
     }
 
     pub async fn close(&self, reason: &str) -> Result<(), terror::Error> {
@@ -248,15 +243,12 @@ trait ConnectionApi: Send + Sync {
         buf: &[u8],
     ) -> Poll<Result<usize, terror::Error>>;
 
-    fn accept_bidirectional_stream(
+    fn poll_accept(
         &self,
         cx: &mut std::task::Context,
-    ) -> Poll<Result<Option<(stream::SendStream, stream::RecvStream)>, terror::Error>>;
-
-    fn accept_unidirectional_stream(
-        &self,
-        cx: &mut std::task::Context,
-    ) -> Poll<Result<Option<stream::RecvStream>, terror::Error>>;
+        _type: u64,
+        _arc: Connection,
+    ) -> Poll<Result<(Option<stream::RecvStream>, Option<stream::SendStream>), terror::Error>>;
 
     fn close(&self, cx: &mut std::task::Context, reason: &str) -> Poll<Result<(), terror::Error>>;
 
@@ -310,6 +302,11 @@ struct Inner {
 }
 
 impl Inner {
+    /*fn stream_accept() {}
+    fn stream_read() {}
+    fn stream_write() {}
+    fn stream_reset() {}*/
+
     //creates a connection from an initial packet as a server. Takes the buffer, source address,
     //server config, hmac reset key and a oneshot channel which gets triggered as soon as the
     //connection is established. Returns the Connection itself and the initial source connection id which
@@ -1079,16 +1076,19 @@ impl Inner {
             }
 
             //HANDSHAKE_DONE
-            if self.state == ConnectionState::Connected
+            /*if self.state == ConnectionState::Connected
                 && !self.hs_done
                 && self.side == Side::Server
             {
                 buf.put_varint(0x1e)?;
                 self.hs_done = true;
-            }
+            }*/
 
             if packet_type == packet::PacketType::Short {
                 //encode stream frames
+                /*if let Some(id) = self.sm.outbound_ready.pop() {
+                    self.sm.outbound.emit(&mut buf, pn);
+                }*/
             }
 
             //if is last packet, pad to min size of 1200
