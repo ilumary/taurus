@@ -56,7 +56,8 @@ pub struct StreamManager {
     counts: [u64; 4],
 
     // keeps track of outbound streams which have data to write. tuples implement ord from left to
-    // right, so first stream id has highest priority (1)
+    // right, so first stream id has highest priority (1) and multiple streams with the same
+    // priority are ordered by acending id
     outbound_ready: BTreeSet<(StreamPriority, StreamId)>,
 
     //unhandled: [StreamId; 4],
@@ -81,7 +82,12 @@ impl StreamManager {
     }
 
     // creates a new stream with a given stream id
-    fn create(&mut self, stream_id: StreamId, local: bool) -> Result<(), terror::Error> {
+    fn create(
+        &mut self,
+        stream_id: StreamId,
+        priority: Option<StreamPriority>,
+        local: bool,
+    ) -> Result<(), terror::Error> {
         if self.inbound.contains_key(&stream_id) || self.outbound.contains_key(&stream_id) {
             return Err(terror::Error::stream_error("stream does already exist"));
         }
@@ -94,14 +100,18 @@ impl StreamManager {
         }
 
         if stream_t == CLIENT_INIT_BIDI || stream_t == SERVER_INIT_BIDI {
-            self.inbound.insert(stream_id, RecvStreamInner::new());
-            self.outbound.insert(stream_id, SendStreamInner::new());
+            self.inbound
+                .insert(stream_id, RecvStreamInner::new(priority));
+            self.outbound
+                .insert(stream_id, SendStreamInner::new(priority));
         } else if (stream_t == CLIENT_INIT_UNI || stream_t == SERVER_INIT_UNI) && local {
             // if stream is unidirectional and created locally it is always outbound
-            self.outbound.insert(stream_id, SendStreamInner::new());
+            self.outbound
+                .insert(stream_id, SendStreamInner::new(priority));
         } else if (stream_t == CLIENT_INIT_UNI || stream_t == SERVER_INIT_UNI) && !local {
             // if it is not locally created it must be inbound
-            self.inbound.insert(stream_id, RecvStreamInner::new());
+            self.inbound
+                .insert(stream_id, RecvStreamInner::new(priority));
         }
 
         Ok(())
@@ -109,7 +119,11 @@ impl StreamManager {
 
     // issues a new stream id and creates a new stream
     // TODO check local stream limits
-    pub fn initiate(&mut self, bidi: bool) -> Result<StreamId, terror::Error> {
+    pub fn initiate(
+        &mut self,
+        bidi: bool,
+        priority: Option<StreamPriority>,
+    ) -> Result<StreamId, terror::Error> {
         // issue new stream id, start with locality
         let mut id = self.local as u64;
 
@@ -119,7 +133,7 @@ impl StreamManager {
         // now add sequence number aka the inner id
         id |= self.counts[id as usize] << 2;
 
-        self.create(id, true)?;
+        self.create(id, priority, true)?;
 
         debug!("initiated new stream with id: {}", id);
 
@@ -144,7 +158,7 @@ impl StreamManager {
         }
 
         // because stream is incoming it cant be local
-        self.create(stream_id, false)?;
+        self.create(stream_id, None, false)?;
 
         debug!(
             "created new stream with id {} from incoming frame",
@@ -168,24 +182,106 @@ impl StreamManager {
         fin: bool,
     ) -> Result<(), terror::Error> {
         if let Some(ss) = self.outbound.get_mut(&stream_id) {
-            return ss.append(data, fin);
-        }
+            ss.append(data, fin)?;
+            self.outbound_ready.insert((ss.prio, stream_id));
+        } else {
+            return Err(terror::Error::stream_error(format!(
+                "send stream with id {} no found",
+                stream_id
+            )));
+        };
 
-        self.outbound_ready.insert((u8::MAX, stream_id));
-
-        Err(terror::Error::stream_error(format!(
-            "send stream with id {} no found",
-            stream_id
-        )))
+        Ok(())
     }
 
-    pub fn emit_outbound(
+    //modifies a streams priority, a possible entry into outbound ready is updated
+    pub fn set_priority(
         &mut self,
-        _buf: &mut [u8],
-        _pn: u64,
-    ) -> Result<(usize, bool), terror::Error> {
-        //if let Some(ss) = self.outbound_ready.pop_first()
-        Ok((0, false))
+        stream_id: StreamId,
+        priority: StreamPriority,
+    ) -> Result<(), terror::Error> {
+        let mut old_prio = StreamPriority::MAX;
+
+        if let Some(rs) = self.inbound.get_mut(&stream_id) {
+            old_prio = rs.prio;
+            rs.prio = priority;
+        }
+
+        if let Some(ss) = self.outbound.get_mut(&stream_id) {
+            old_prio = ss.prio;
+            ss.prio = priority;
+        }
+
+        self.outbound_ready.remove(&(old_prio, stream_id));
+        self.outbound_ready.insert((priority, stream_id));
+
+        Ok(())
+    }
+
+    //emits a single stream frame onto the buffer from the stream with the highest priority i.e.
+    //the lowest number. if two streams have the same priority, the lower stream id is prioritised
+    pub fn emit_single(&mut self, buf: &mut [u8], pn: u64) -> Result<usize, terror::Error> {
+        let mut octets = octets::OctetsMut::with_slice(buf);
+
+        //take first ready stream with outbound data
+        let Some((p, ss_id)) = self.outbound_ready.first() else {
+            return Ok(0);
+        };
+
+        let Some(ss) = self.outbound.get_mut(ss_id) else {
+            return Err(terror::Error::stream_error(format!(
+                "outbound stream (id: {}) with ready data does not exist",
+                ss_id
+            )));
+        };
+
+        // peek current offset and relative length of stream that is writeable
+        let (stream_off, rel_length) = ss.peek();
+
+        // calculate stram frame overhead
+        let mut overhead = 1 + crate::packet::varint_length(*ss_id);
+
+        if stream_off > 0 {
+            overhead += crate::packet::varint_length(stream_off as u64);
+        }
+
+        //if there not enough space for frame overhead plus at least one byte of data, return
+        if overhead + 1 > octets.len() {
+            return Err(terror::Error::buffer_size_error(
+                "not enough space in buffer for stream frame",
+            ));
+        }
+
+        let mut stream_header: u8 = 0x08;
+        let (mut stream_header_raw, mut rest) = octets.split_at(1)?;
+
+        rest.put_varint(*ss_id)?;
+
+        if stream_off > 0 {
+            stream_header |= 0x04; //OFF
+            rest.put_varint(stream_off as u64)?;
+        }
+
+        if rest.cap() > rel_length {
+            //length field has to be included
+            stream_header |= 0x02;
+            overhead += rest.put_varint(rel_length as u64)?.len();
+        }
+
+        let (data_len, fin) = ss.emit(rest.as_mut(), pn)?;
+
+        if fin {
+            stream_header |= 0x01;
+        }
+
+        //write stream header last
+        stream_header_raw.put_u8(stream_header)?;
+
+        if !ss.readable() {
+            self.outbound_ready.remove(&(*p, *ss_id));
+        }
+
+        Ok(data_len + overhead)
     }
 
     // resets any given stream_id. If a receiving stream is reset, a final size must be supplied
@@ -213,41 +309,45 @@ struct SendStreamInner {
     data: VecDeque<Chunk>,
 
     //keeps track of pending stream data via packet number
+    //TODO also make this in stream manager, pointing to stream ids
     pending: IndexMap<u64, Chunk>,
-
-    //current highest offset
-    next_off: u64,
 
     //holds final size if known
     final_size: Option<usize>,
 
     //application error code in case stream is reset
     apec: Option<u64>,
+
+    //stream priority, lower is better
+    prio: StreamPriority,
+
+    //current length of all stream data
+    length: usize,
+
+    //current offset of internal data being sent
+    off: usize,
 }
 
 impl SendStreamInner {
-    fn new() -> Self {
+    fn new(priority: Option<StreamPriority>) -> Self {
         Self {
             data: VecDeque::new(),
             pending: IndexMap::new(),
-            next_off: 0,
             final_size: None,
             apec: None,
+            prio: priority.unwrap_or(u8::MAX),
+            length: 0,
+            off: 0,
         }
     }
 
     fn readable(&self) -> bool {
-        if self.apec.is_some() {
-            return false;
-        }
+        (self.length - self.off) > 0
+    }
 
-        if let Some(chunk) = self.data.front() {
-            if !chunk.is_empty() {
-                return true;
-            }
-        }
-
-        false
+    //peeks sendable data to be able to build stream frame. returns (off, rel_len)
+    fn peek(&self) -> (usize, usize) {
+        (self.off, self.length - self.off)
     }
 
     //emits data to be sent
@@ -291,6 +391,8 @@ impl SendStreamInner {
             remaining -= to_write;
         }
 
+        self.off += written;
+
         Ok((written, fin))
     }
 
@@ -310,11 +412,12 @@ impl SendStreamInner {
         }
 
         if fin {
-            self.final_size = Some(self.next_off as usize + data.len());
+            self.final_size = Some(self.length + data.len());
         }
 
-        self.data.push_back(Chunk::new(data, self.next_off, fin));
-        self.next_off += data.len() as u64;
+        self.data
+            .push_back(Chunk::new(data, self.length as u64, fin));
+        self.length += data.len();
 
         Ok(())
     }
@@ -325,7 +428,8 @@ impl SendStreamInner {
         }
 
         self.apec = Some(apec);
-        self.final_size = Some(self.next_off as usize - 1);
+        self.final_size = Some(self.length);
+        self.off = self.length;
 
         self.data.clear();
         self.pending.clear();
@@ -355,10 +459,13 @@ struct RecvStreamInner {
 
     //application error code received via reset
     apec: Option<u64>,
+
+    //stream priority
+    prio: StreamPriority,
 }
 
 impl RecvStreamInner {
-    fn new() -> Self {
+    fn new(priority: Option<StreamPriority>) -> Self {
         Self {
             data: IndexMap::new(),
             gaps: Vec::new(),
@@ -367,6 +474,7 @@ impl RecvStreamInner {
             start_recv: false,
             final_size: None,
             apec: None,
+            prio: priority.unwrap_or(u8::MAX),
         }
     }
 
@@ -397,6 +505,7 @@ impl RecvStreamInner {
             start_recv,
             final_size,
             apec: None,
+            prio: u8::MAX,
         }
     }
 
@@ -696,11 +805,11 @@ mod tests {
     fn stream_manager_create_as_server() {
         let mut sm = StreamManager::new(rustls::Side::Server as u8);
 
-        let bidi1 = sm.initiate(true).unwrap();
-        let bidi2 = sm.initiate(true).unwrap();
+        let bidi1 = sm.initiate(true, None).unwrap();
+        let bidi2 = sm.initiate(true, None).unwrap();
 
-        let uni1 = sm.initiate(false).unwrap();
-        let uni2 = sm.initiate(false).unwrap();
+        let uni1 = sm.initiate(false, None).unwrap();
+        let uni2 = sm.initiate(false, None).unwrap();
 
         assert_eq!(bidi1, 0x01);
         assert_eq!(bidi2, 0x05);
@@ -712,11 +821,11 @@ mod tests {
     fn stream_manager_create_as_client() {
         let mut sm = StreamManager::new(rustls::Side::Client as u8);
 
-        let bidi1 = sm.initiate(true).unwrap();
-        let bidi2 = sm.initiate(true).unwrap();
+        let bidi1 = sm.initiate(true, None).unwrap();
+        let bidi2 = sm.initiate(true, None).unwrap();
 
-        let uni1 = sm.initiate(false).unwrap();
-        let uni2 = sm.initiate(false).unwrap();
+        let uni1 = sm.initiate(false, None).unwrap();
+        let uni2 = sm.initiate(false, None).unwrap();
 
         assert_eq!(bidi1, 0x00);
         assert_eq!(bidi2, 0x04);
@@ -768,22 +877,151 @@ mod tests {
     }
 
     #[test]
-    fn stream_manager_emit_outbound_ready() {
+    fn stream_manager_emit_single() {
         let mut sm = StreamManager::new(rustls::Side::Server as u8);
-        let mut result = [0u8; 9];
+        let mut result = [0u8; 10];
 
-        let mut octs = octets::OctetsMut::with_slice(&mut result);
-        octs.put_u8(0x04).unwrap();
+        let send_stream = sm.initiate(false, None).unwrap();
+        sm.append(send_stream, &[4u8; 8], true).unwrap();
 
-        let send_stream = sm.initiate(false).unwrap();
+        assert_eq!(*sm.outbound_ready.first().unwrap(), (u8::MAX, send_stream));
 
-        sm.append(send_stream, &[3u8; 8], true).unwrap();
+        let written = sm.emit_single(&mut result, 0x00).unwrap();
 
-        let send_stream1 = sm.initiate(false).unwrap();
+        assert_eq!(result[0], 0x09);
+        assert_eq!(result[1] as u64, send_stream);
+        assert_eq!(result[2], 4);
+        assert_eq!(result[8], 4);
+        assert_eq!(written, 10);
+        assert!(sm.outbound_ready.is_empty());
+    }
 
-        sm.append(send_stream1, &[4u8; 8], true).unwrap();
+    #[test]
+    fn stream_manager_emit_single_with_len() {
+        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut result = [0u8; 16];
 
-        //TODO
+        let send_stream = sm.initiate(false, None).unwrap();
+        sm.append(send_stream, &[4u8; 8], true).unwrap();
+
+        assert_eq!(*sm.outbound_ready.first().unwrap(), (u8::MAX, send_stream));
+
+        let written = sm.emit_single(&mut result, 0x00).unwrap();
+
+        assert_eq!(result[0], 0x0b);
+        assert_eq!(result[1] as u64, send_stream);
+        assert_eq!(result[2], 8); //LEN
+        assert_eq!(result[3], 4); //DATA BEGIN
+        assert_eq!(result[9], 4); //DATA END
+        assert_eq!(written, 11);
+        assert!(sm.outbound_ready.is_empty());
+    }
+
+    #[test]
+    fn stream_manager_emit_single_multiple() {
+        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut result = [0u8; 32];
+
+        let send_stream = sm.initiate(false, None).unwrap();
+        sm.append(send_stream, &[4u8; 10], false).unwrap();
+
+        assert_eq!(*sm.outbound_ready.first().unwrap(), (u8::MAX, send_stream));
+
+        let written = sm.emit_single(&mut result[..8], 0x00).unwrap();
+
+        assert_eq!(result[0], 0x08);
+        assert_eq!(result[1] as u64, send_stream);
+        assert_eq!(result[2], 4); //DATA BEGIN
+        assert_eq!(result[7], 4); //DATA END
+        assert_eq!(written, 8);
+        assert!(!sm.outbound_ready.is_empty());
+
+        sm.append(send_stream, &[5u8; 10], true).unwrap();
+
+        let written2 = sm.emit_single(&mut result[8..], 0x00).unwrap();
+
+        assert_eq!(result[8], 0x0f);
+        assert_eq!(result[9] as u64, send_stream);
+        assert_eq!(result[10], 6); //OFF
+        assert_eq!(result[11], 14); //LEN
+        assert_eq!(result[12], 4); //DATA BEGIN
+        assert_eq!(result[25], 5); //DATA END
+        assert_eq!(written2, 4 + 14); //HEADER + DATA LEN
+        assert!(sm.outbound_ready.is_empty());
+    }
+
+    #[test]
+    fn stream_manager_emit_with_prio() {
+        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut result = [0u8; 32];
+
+        let send_stream = sm.initiate(false, None).unwrap();
+        sm.append(send_stream, &[4u8; 32], false).unwrap();
+
+        assert_eq!(*sm.outbound_ready.first().unwrap(), (u8::MAX, send_stream));
+
+        let send_stream2 = sm.initiate(false, Some(100)).unwrap();
+        sm.append(send_stream2, &[5u8; 16], true).unwrap();
+
+        assert_eq!(*sm.outbound_ready.first().unwrap(), (100, send_stream2));
+
+        let written = sm.emit_single(&mut result, 0x00).unwrap();
+
+        assert_eq!(result[0], 0x0b);
+        assert_eq!(result[1] as u64, send_stream2);
+        assert_eq!(result[2], 16); //LEN
+        assert_eq!(result[3], 5); //DATA BEGIN
+        assert_eq!(result[18], 5); //DATA END
+        assert_eq!(written, 19);
+
+        let written2 = sm.emit_single(&mut result[written..], 0x00).unwrap();
+
+        assert_eq!(result[19], 0x08);
+        assert_eq!(result[20] as u64, send_stream);
+        assert_eq!(result[21], 4); //DATA BEGIN
+        assert_eq!(result[31], 4); //DATA END
+        assert_eq!(written2, 13);
+        assert!(!sm.outbound_ready.is_empty());
+    }
+
+    #[test]
+    fn stream_manager_emit_and_modifiy_stream_prio() {
+        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut result = [0u8; 32];
+
+        let send_stream = sm.initiate(false, None).unwrap();
+        sm.append(send_stream, &[4u8; 32], false).unwrap();
+
+        assert_eq!(*sm.outbound_ready.first().unwrap(), (u8::MAX, send_stream));
+
+        let send_stream2 = sm.initiate(false, Some(100)).unwrap();
+        sm.append(send_stream2, &[5u8; 16], true).unwrap();
+
+        assert_eq!(*sm.outbound_ready.first().unwrap(), (100, send_stream2));
+
+        let send_stream3 = sm.initiate(false, Some(10)).unwrap();
+        sm.append(send_stream3, &[6u8; 16], true).unwrap();
+
+        assert_eq!(*sm.outbound_ready.first().unwrap(), (10, send_stream3));
+
+        let written = sm.emit_single(&mut result, 0x00).unwrap();
+
+        assert_eq!(result[0], 0x0b);
+        assert_eq!(result[1] as u64, send_stream3);
+        assert_eq!(result[2], 16); //LEN
+        assert_eq!(result[3], 6); //DATA BEGIN
+        assert_eq!(result[18], 6); //DATA END
+        assert_eq!(written, 19);
+
+        sm.set_priority(send_stream, 5).unwrap();
+        let written2 = sm.emit_single(&mut result[written..], 0x00).unwrap();
+
+        assert_eq!(result[19], 0x08);
+        assert_eq!(result[20] as u64, send_stream);
+        assert_eq!(result[21], 4); //DATA BEGIN
+        assert_eq!(result[31], 4); //DATA END
+        assert_eq!(written2, 13);
+        assert!(!sm.outbound_ready.is_empty());
     }
 
     #[test]
@@ -958,14 +1196,18 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let mut result = vec![0u8; 8];
 
-        let mut send_stream = SendStreamInner::new();
+        let mut send_stream = SendStreamInner::new(None);
 
         send_stream.append(&frame1, true).unwrap();
+
+        assert_eq!(send_stream.length, 8);
+        assert_eq!(send_stream.off, 0);
 
         let (size, fin) = send_stream.emit(&mut result, 0).unwrap();
 
         assert!(fin);
         assert_eq!(size, 8);
+        assert_eq!(send_stream.off, 8);
 
         assert!(send_stream.pending.get(&0).is_some());
     }
@@ -975,7 +1217,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let mut result = [0u8; 8];
 
-        let mut send_stream = SendStreamInner::new();
+        let mut send_stream = SendStreamInner::new(None);
 
         send_stream.append(&frame1, true).unwrap();
 
@@ -1001,7 +1243,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let mut result = vec![0u8; 8];
 
-        let mut send_stream = SendStreamInner::new();
+        let mut send_stream = SendStreamInner::new(None);
 
         send_stream.append(&frame1, true).unwrap();
 
@@ -1020,7 +1262,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let mut result = vec![0u8; 8];
 
-        let mut send_stream = SendStreamInner::new();
+        let mut send_stream = SendStreamInner::new(None);
 
         send_stream.append(&frame1, false).unwrap();
 
@@ -1038,7 +1280,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let mut result = vec![0u8; 8];
 
-        let mut send_stream = SendStreamInner::new();
+        let mut send_stream = SendStreamInner::new(None);
 
         assert!(!send_stream.readable());
 

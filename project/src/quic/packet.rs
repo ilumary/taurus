@@ -766,6 +766,7 @@ impl fmt::Display for Header {
     }
 }
 
+#[inline]
 pub fn varint_length(num: u64) -> usize {
     match num {
         0..=63 => 1,
