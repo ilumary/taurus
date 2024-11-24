@@ -22,11 +22,15 @@ type StreamPriority = u8;
 // public struct for the RecvStream, maybe also add reference to actual stream object to save on
 // search in indexmap
 pub struct RecvStream {
-    id: StreamId,
+    pub id: StreamId,
     inner: Connection,
 }
 
 impl RecvStream {
+    pub fn new(id: StreamId, inner: Connection) -> Self {
+        Self { id, inner }
+    }
+
     pub async fn read(&self, buf: &mut [u8]) -> Result<usize, terror::Error> {
         future::poll_fn(|cx| self.inner.api.poll_recv(cx, &self.id, buf)).await
     }
@@ -34,20 +38,50 @@ impl RecvStream {
 
 // public struct for the SendStream
 pub struct SendStream {
-    id: StreamId,
+    pub id: StreamId,
     inner: Connection,
 }
 
 impl SendStream {
+    pub fn new(id: StreamId, inner: Connection) -> Self {
+        Self { id, inner }
+    }
+
     pub async fn write(&self, buf: &[u8]) -> Result<usize, terror::Error> {
         future::poll_fn(|cx| self.inner.api.poll_send(cx, &self.id, buf)).await
     }
 }
 
+// stream waker, notifies task if new stream is availibe
+#[derive(Clone)]
+pub struct StreamWaker {
+    wk: std::task::Waker,
+}
+
+impl StreamCallback for StreamWaker {
+    type Callback = std::task::Waker;
+
+    fn new(wk: std::task::Waker) -> Self {
+        Self { wk }
+    }
+
+    fn invoke(self) {
+        self.wk.wake()
+    }
+}
+
+// stream callback trait. invoked if a stream is created by the peer
+pub trait StreamCallback {
+    type Callback;
+
+    fn new(wk: Self::Callback) -> Self;
+
+    fn invoke(self);
+}
+
 // stores and manages streams for connection
-// TODO register callback on recv stream
 // TODO initialize with limits
-pub struct StreamManager {
+pub struct StreamManager<C: StreamCallback> {
     // all streams, sorted by inbound and outbound
     outbound: IndexMap<StreamId, SendStreamInner>,
     inbound: IndexMap<StreamId, RecvStreamInner>,
@@ -55,24 +89,29 @@ pub struct StreamManager {
     // [client init bidi, server init bidi, client init uni, server init uni]
     counts: [u64; 4],
 
+    // holds the lowest unconsumed stream id
+    ready: [Option<u64>; 4],
+
+    // if no ready stream was found, a callback is saved. Only one callback per stream type can be
+    // saved. The callback is consumed when invoked
+    callbacks: [Option<C>; 4],
+
     // keeps track of outbound streams which have data to write. Key for the tree is a tuple
     // of StreamPriority & StreamId. Tuples implement ord from left to right, so first stream
     // id has highest priority (1) and multiple streams with the same priority are ordered by
     // acending id
     outbound_ready: BTreeSet<(StreamPriority, StreamId)>,
 
-    //keeps track of pending acks by packet number
+    // keeps track of pending acks by packet number
+    // unique set (pn, stream_id)
     ack_pending: IndexMap<u64, Vec<StreamId>>,
-
-    //unhandled: [StreamId; 4],
-    //wakers: [std::task::Waker; 4],
 
     // used as least significant bit in stream ids. distinguishes between client (0x00) and server
     // (0x01)
     local: u8,
 }
 
-impl StreamManager {
+impl<C: StreamCallback> StreamManager<C> {
     pub fn new(local: u8) -> Self {
         assert!(local == 0x00 || local == 0x01, "local must be 0x00 or 0x01");
 
@@ -82,8 +121,30 @@ impl StreamManager {
             outbound_ready: BTreeSet::new(),
             ack_pending: IndexMap::new(),
             counts: [0, 0, 0, 0],
+            ready: [None; 4],
+            callbacks: [None, None, None, None],
             local,
         }
+    }
+
+    // polls for specific stream type. if no ready stream was found, save callback
+    pub fn poll_ready(&mut self, stream_t: u64, cb: C::Callback) -> Option<StreamId> {
+        if let Some(id) = self.ready[stream_t as usize] {
+            //if ready id is availibe, check if higher id exists
+            let sequence = id >> 2;
+            if sequence < self.counts[stream_t as usize] - 1 {
+                self.ready[stream_t as usize] = Some(id + 4);
+            } else {
+                self.ready[stream_t as usize] = None;
+            }
+
+            return Some(id);
+        }
+
+        // no ready stream was found, save callback
+        self.callbacks[stream_t as usize] = Some(C::new(cb));
+
+        None
     }
 
     // creates a new stream with a given stream id
@@ -165,14 +226,22 @@ impl StreamManager {
         // because stream is incoming it cant be local
         self.create(stream_id, None, false)?;
 
-        debug!(
-            "created new stream with id {} from incoming frame",
-            stream_id
-        );
+        debug!("new stream: id {}", stream_id);
 
-        //unwrap is safe because stream was created
+        // unwrap is safe because stream was created
         let recv_s = self.inbound.get_mut(&stream_id).unwrap();
         recv_s.process(offset, length, fin, data)?;
+
+        // save stream as ready
+        let stream_t = stream_id & STREAM_TYPE;
+        if self.ready[stream_t as usize].is_none() {
+            self.ready[stream_t as usize] = Some(stream_id);
+        }
+
+        // invoke callback if present
+        if let Some(c) = self.callbacks[stream_t as usize].take() {
+            c.invoke();
+        }
 
         Ok(())
     }
@@ -305,6 +374,8 @@ impl StreamManager {
 
         //write stream header last
         stream_header_raw.put_u8(stream_header)?;
+
+        debug!("STREAM frame: id {ss_id} off {stream_off} len {data_len} fin {fin}");
 
         if !ss.readable() {
             self.outbound_ready.remove(&(*p, *ss_id));
@@ -836,9 +907,25 @@ impl std::ops::Deref for Chunk {
 mod tests {
     use super::*;
 
+    // test adapter for stream waker
+    #[derive(Clone)]
+    pub struct TestStreamWaker {
+        _waked: bool,
+    }
+
+    impl StreamCallback for TestStreamWaker {
+        type Callback = bool;
+
+        fn new(waked: bool) -> Self {
+            Self { _waked: waked }
+        }
+
+        fn invoke(self) {}
+    }
+
     #[test]
     fn stream_manager_create_as_server() {
-        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
 
         let bidi1 = sm.initiate(true, None).unwrap();
         let bidi2 = sm.initiate(true, None).unwrap();
@@ -854,7 +941,7 @@ mod tests {
 
     #[test]
     fn stream_manager_create_as_client() {
-        let mut sm = StreamManager::new(rustls::Side::Client as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Client as u8);
 
         let bidi1 = sm.initiate(true, None).unwrap();
         let bidi2 = sm.initiate(true, None).unwrap();
@@ -870,7 +957,7 @@ mod tests {
 
     #[test]
     fn stream_manager_incoming_as_server() {
-        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
 
         let bidi1 = 0x00;
         let bidi2 = 0x04;
@@ -903,7 +990,7 @@ mod tests {
 
     #[test]
     fn stream_manager_wrong_id_type_as_server() {
-        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
 
         // server init bidi recv as server should fail
         let bidi = 0x05;
@@ -913,7 +1000,7 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_single() {
-        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
         let mut result = [0u8; 10];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -931,9 +1018,63 @@ mod tests {
         assert!(sm.outbound_ready.is_empty());
     }
 
+    //TODO test that a stream id higher than the current sequence implicitly creates all streams
+    //inbetween
+
+    #[test]
+    fn stream_manager_poll_ready() {
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+
+        let bidi1 = 0x00;
+        sm.incoming(bidi1, 0, 8, true, &[1u8; 8]).unwrap();
+
+        assert_eq!(sm.ready[0x00], Some(0x00));
+
+        let id = sm.poll_ready(0x00, false).unwrap();
+
+        assert_eq!(id, 0x00);
+        assert!(sm.ready[0x00].is_none());
+    }
+
+    #[test]
+    fn stream_manager_poll_ready_multiple() {
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+
+        let bidi1 = 0x00;
+        sm.incoming(bidi1, 0, 8, true, &[1u8; 8]).unwrap();
+
+        assert_eq!(sm.ready[0x00], Some(0x00));
+
+        let bidi2 = 0x04;
+        sm.incoming(bidi2, 0, 8, true, &[2u8; 8]).unwrap();
+
+        assert_eq!(sm.ready[0x00], Some(0x00));
+
+        let id = sm.poll_ready(0x00, false).unwrap();
+
+        assert_eq!(id, 0x00);
+        assert_eq!(sm.ready[0x00], Some(0x04));
+    }
+
+    #[test]
+    fn stream_manager_incoming_invokes_callback() {
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+
+        let id = sm.poll_ready(0x00, false);
+
+        assert!(id.is_none());
+        assert!(sm.callbacks[0x00].is_some());
+
+        let bidi1 = 0x00;
+        sm.incoming(bidi1, 0, 8, true, &[1u8; 8]).unwrap();
+
+        assert_eq!(sm.ready[0x00], Some(0x00));
+        assert!(sm.callbacks[0x00].is_none());
+    }
+
     #[test]
     fn stream_manager_emit_single_with_len() {
-        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
         let mut result = [0u8; 16];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -954,7 +1095,7 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_single_multiple() {
-        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
         let mut result = [0u8; 32];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -987,7 +1128,7 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_with_prio() {
-        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
         let mut result = [0u8; 32];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -1021,7 +1162,7 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_and_modifiy_stream_prio() {
-        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
         let mut result = [0u8; 32];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -1061,7 +1202,7 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_fill() {
-        let mut sm = StreamManager::new(rustls::Side::Server as u8);
+        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
         let mut result = [0u8; 48];
 
         let send_stream = sm.initiate(false, None).unwrap();

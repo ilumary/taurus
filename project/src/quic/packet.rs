@@ -1,7 +1,4 @@
-use crate::{
-    terror, token::StatelessResetToken, ConnectionId, SPACE_ID_DATA, SPACE_ID_HANDSHAKE,
-    SPACE_ID_INITIAL,
-};
+use crate::{terror, ConnectionId, SPACE_ID_DATA, SPACE_ID_HANDSHAKE, SPACE_ID_INITIAL};
 
 use octets::{Octets, OctetsMut};
 use rustls::quic::{DirectionalKeys, HeaderProtectionKey};
@@ -19,14 +16,11 @@ const PKT_NUM_LENGTH_MASK: u8 = 0x03;
 pub const LONG_HEADER_TYPE_INITIAL: u8 = 0x00;
 pub const LONG_HEADER_TYPE_HANDSHAKE: u8 = 0x02;
 
-//packet and address, either source or destination
-pub type Datagram = (Vec<u8>, String);
-
 //encrypts a packet, pn_len is in bytes starting at one and header_end_off must include packet number
 pub fn encrypt(
     packet: &mut OctetsMut,
     keys: &DirectionalKeys,
-    pn: u32,
+    pn: u64,
     payload_offset: usize,
 ) -> Result<usize, terror::Error> {
     let tag_len = keys.packet.tag_len();
@@ -36,7 +30,7 @@ pub fn encrypt(
 
     let (mut p, _) = packet.split_at(packet_length)?;
 
-    let pn_len = Header::calculate_pn_length(pn) as usize + 1;
+    let pn_len = Header::calculate_pn_length(pn as u32) as usize + 1;
 
     //encrypts the packet payload and copies the tag into the buffer
     let (mut header, mut payload_and_tag) = p.split_at(payload_offset)?;
@@ -45,7 +39,7 @@ pub fn encrypt(
         payload_and_tag.split_at(payload_and_tag.len() - tag_len)?;
     let tag = keys
         .packet
-        .encrypt_in_place(pn as u64, header.as_mut(), payload.as_mut())
+        .encrypt_in_place(pn, header.as_mut(), payload.as_mut())
         .unwrap();
 
     //println!("tag: {:x?}", tag.as_ref());
@@ -277,92 +271,6 @@ impl Frame for AckFrame {
     }
 }
 
-pub struct CryptoFrame {
-    offset: u64,
-    crypto_data: Vec<u8>,
-    len: usize,
-}
-
-impl CryptoFrame {
-    pub fn new(offset: u64, crypto_data: Vec<u8>) -> Self {
-        let len =
-            1 + varint_length(offset) + varint_length(crypto_data.len() as u64) + crypto_data.len();
-        Self {
-            offset,
-            crypto_data,
-            len,
-        }
-    }
-}
-
-impl Frame for CryptoFrame {
-    fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self {
-        let begin = bytes.off() - 1;
-        let offset = bytes.get_varint().unwrap();
-
-        CryptoFrame {
-            offset,
-            crypto_data: bytes.get_bytes_with_varint_length().unwrap().to_vec(),
-            len: bytes.off() - begin,
-        }
-    }
-
-    fn to_bytes(
-        &self,
-        bytes: &mut octets::OctetsMut<'_>,
-    ) -> Result<(), octets::BufferTooShortError> {
-        bytes.put_u8(0x06)?;
-        bytes.put_varint(self.offset)?;
-        bytes.put_varint(self.crypto_data.len().try_into().unwrap())?;
-        bytes.put_bytes(self.crypto_data.as_ref())?;
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
-impl CryptoFrame {
-    pub fn data(&self) -> &[u8] {
-        self.crypto_data.as_ref()
-    }
-
-    pub fn vec(&self) -> &Vec<u8> {
-        &self.crypto_data
-    }
-}
-
-pub struct NewTokenFrame {
-    token_length: u64,
-    token: Vec<u8>,
-    len: usize,
-}
-
-impl Frame for NewTokenFrame {
-    fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self {
-        let begin = bytes.off() - 1;
-        let token_length = bytes.get_varint().unwrap();
-
-        NewTokenFrame {
-            token_length,
-            token: bytes.get_bytes(token_length as usize).unwrap().to_vec(),
-            len: bytes.off() - begin,
-        }
-    }
-
-    fn to_bytes(
-        &self,
-        bytes: &mut octets::OctetsMut<'_>,
-    ) -> Result<(), octets::BufferTooShortError> {
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
 pub struct ConnectionCloseFrame {
     error_code: u64,
     frame_type: Option<u64>,
@@ -398,7 +306,7 @@ impl Frame for ConnectionCloseFrame {
 
     fn to_bytes(
         &self,
-        bytes: &mut octets::OctetsMut<'_>,
+        _bytes: &mut octets::OctetsMut<'_>,
     ) -> Result<(), octets::BufferTooShortError> {
         Ok(())
     }
@@ -419,7 +327,7 @@ pub struct Header {
     pub token: Option<Vec<u8>>,
 
     //The following fields are under header protection
-    pub packet_num: u32,
+    pub packet_num: u64,
     pub packet_num_length: u8,
 
     //packet length including packet_num
@@ -436,7 +344,7 @@ impl Header {
     pub fn new_long_header(
         long_header_type: u8,
         version: u32,
-        packet_num: u32,
+        packet_num: u64,
         dcid: &ConnectionId,
         scid: &ConnectionId,
         token: Option<Vec<u8>>,
@@ -495,7 +403,7 @@ impl Header {
         spin_bit: u8,
         key_phase: u8,
         version: u32,
-        packet_num: u32,
+        packet_num: u64,
         dcid: &ConnectionId,
     ) -> Result<Self, terror::Error> {
         if !matches!(spin_bit, 0x00 | 0x01) {
@@ -529,13 +437,13 @@ impl Header {
         version: u32,
         dcid: &ConnectionId,
         scid: Option<&ConnectionId>,
-        packet_num: u32,
+        packet_num: u64,
         token: Option<Vec<u8>>,
         length: usize,
         raw_length: usize,
         space: usize,
     ) -> Self {
-        let packet_num_length = Header::calculate_pn_length(packet_num);
+        let packet_num_length = Header::calculate_pn_length(packet_num as u32);
         let mut hf: u8 = 0x00;
 
         //set header form bit
@@ -589,10 +497,10 @@ impl Header {
         self.packet_num_length = self.hf & PKT_NUM_LENGTH_MASK;
 
         self.packet_num = match self.packet_num_length {
-            0 => u32::from(b.get_u8()?),
-            1 => u32::from(b.get_u16()?),
-            2 => b.get_u24()?,
-            3 => b.get_u32()?,
+            0 => u64::from(b.get_u8()?),
+            1 => u64::from(b.get_u16()?),
+            2 => b.get_u24()? as u64,
+            3 => b.get_u32()? as u64,
             _ => return Err(octets::BufferTooShortError),
         };
 
@@ -636,8 +544,8 @@ impl Header {
         match self.packet_num_length {
             0 => b.put_u8(self.packet_num.try_into().unwrap())?,
             1 => b.put_u16(self.packet_num.try_into().unwrap())?,
-            2 => b.put_u24(self.packet_num)?,
-            3 => b.put_u32(self.packet_num)?,
+            2 => b.put_u24(self.packet_num as u32)?,
+            3 => b.put_u32(self.packet_num as u32)?,
             _ => unreachable!(
                 "unsupported packet number length {}",
                 self.packet_num_length

@@ -6,8 +6,8 @@ mod token;
 mod transport_parameters;
 
 use indexmap::IndexMap;
-use octets::OctetsMut;
-use packet::{AckFrame, ConnectionCloseFrame, CryptoFrame, Frame, Header, NewTokenFrame};
+use octets::{varint_len, OctetsMut};
+use packet::{AckFrame, ConnectionCloseFrame, Frame, Header};
 use parking_lot::Mutex;
 use rand::RngCore;
 use rustls::{
@@ -21,7 +21,7 @@ use std::{collections::VecDeque, fmt, future, net::SocketAddr, sync::Arc, task::
 use stream::StreamManager;
 use token::StatelessResetToken;
 use tokio::sync::mpsc;
-use tracing::{debug, error, event, warn, Level};
+use tracing::{debug, error, event, span, warn, Level};
 use transport_parameters::{
     InitialMaxData, InitialMaxStreamDataBidiLocal, InitialMaxStreamDataBidiRemote,
     InitialMaxStreamsBidi, InitialSourceConnectionId, MaxUdpPayloadSize,
@@ -143,7 +143,7 @@ impl ConnectionApi for LockedInner {
     fn poll_recv(
         &self,
         _cx: &mut std::task::Context,
-        _id: &u64,
+        _s_id: &u64,
         _buf: &mut [u8],
     ) -> Poll<Result<usize, terror::Error>> {
         let _conn = self.0.lock();
@@ -153,7 +153,7 @@ impl ConnectionApi for LockedInner {
     fn poll_send(
         &self,
         _cx: &mut std::task::Context,
-        _id: &u64,
+        _s_id: &u64,
         _buf: &[u8],
     ) -> Poll<Result<usize, terror::Error>> {
         let _conn = self.0.lock();
@@ -162,11 +162,23 @@ impl ConnectionApi for LockedInner {
 
     fn poll_accept(
         &self,
-        _cx: &mut std::task::Context,
-        _type: u64,
-        _arc: Connection,
+        cx: &mut std::task::Context,
+        stream_t: u64,
+        arc: Connection,
     ) -> Poll<Result<(Option<stream::RecvStream>, Option<stream::SendStream>), terror::Error>> {
-        let _conn = self.0.lock();
+        let mut conn = self.0.lock();
+
+        if let Some(id) = conn.stream_accept(stream_t, cx.waker().clone()) {
+            let mut ss: Option<stream::SendStream> = None;
+            let rs: Option<stream::RecvStream> = Some(stream::RecvStream::new(id, arc.clone()));
+
+            if stream_t == 0x00 {
+                ss = Some(stream::SendStream::new(id, arc.clone()))
+            }
+
+            return Poll::Ready(Ok((rs, ss)));
+        }
+
         Poll::Pending
     }
 
@@ -207,7 +219,7 @@ impl Connection {
     }
 
     pub async fn accept_unidirectional_stream(&self) -> Result<stream::RecvStream, terror::Error> {
-        let s = future::poll_fn(|cx| self.api.poll_accept(cx, 0x01, self.clone())).await?;
+        let s = future::poll_fn(|cx| self.api.poll_accept(cx, 0x02, self.clone())).await?;
         Ok(s.0.unwrap())
     }
 
@@ -246,7 +258,7 @@ trait ConnectionApi: Send + Sync {
     fn poll_accept(
         &self,
         cx: &mut std::task::Context,
-        _type: u64,
+        _stream_t: u64,
         _arc: Connection,
     ) -> Poll<Result<(Option<stream::RecvStream>, Option<stream::SendStream>), terror::Error>>;
 
@@ -278,14 +290,11 @@ struct Inner {
     //connection state
     state: ConnectionState,
 
-    //HANDSHAKE_DONE frame received(client) or sent(server)
-    hs_done: bool,
-
     //connection id manager
     cidm: ConnectionIdManager,
 
     //stream manager, does all stream logic
-    sm: StreamManager,
+    sm: StreamManager<stream::StreamWaker>,
 
     // Packet number spaces, inital, handshake, 1-RTT
     packet_spaces: [PacketNumberSpace; 3],
@@ -302,10 +311,22 @@ struct Inner {
 }
 
 impl Inner {
-    /*fn stream_accept() {}
+    // returns stream id
+    fn stream_accept(&mut self, stream_t: u64, wk: std::task::Waker) -> Option<u64> {
+        let stream_t = stream_t & (self.side as u8) as u64;
+
+        if let Some(id) = self.sm.poll_ready(stream_t, wk) {
+            return Some(id);
+        }
+
+        None
+    }
+
+    /*
     fn stream_read() {}
     fn stream_write() {}
-    fn stream_reset() {}*/
+    fn stream_reset() {}
+    */
 
     //creates a connection from an initial packet as a server. Takes the buffer, source address,
     //server config, hmac reset key and a oneshot channel which gets triggered as soon as the
@@ -427,7 +448,6 @@ impl Inner {
             next_1rtt_packet_keys: None,
             zero_rtt_keyset: None,
             state: ConnectionState::Initial,
-            hs_done: false,
             cidm: cim,
             sm: StreamManager::new(Side::Server as u8),
             packet_spaces: [
@@ -578,7 +598,7 @@ impl Inner {
         //payload cipher must be exact size without zeros from the buffer beeing to big!
         let dec_len = {
             let decrypted_payload_raw = match keys.packet.decrypt_in_place(
-                header.packet_num.into(),
+                header.packet_num,
                 header_raw.as_ref(),
                 payload_cipher.as_mut(),
             ) {
@@ -685,8 +705,10 @@ impl Inner {
                     let _application_protocol_error_code = payload.get_varint()?;
                 } //STOP_SENDING
                 0x06 => {
-                    let crypto_frame = CryptoFrame::from_bytes(&frame_code, payload);
-                    self.process_crypto_data(&crypto_frame);
+                    let _offset = payload.get_varint()?;
+                    let crypto_data = payload.get_bytes_with_varint_length()?.to_vec();
+
+                    self.process_crypto_data(&crypto_data);
 
                     //test if all required crypto data has been exchanged for the connection to be
                     //considered established
@@ -707,7 +729,7 @@ impl Inner {
                 } //CRYPTO
                 0x07 => {
                     if self.side != Side::Server {
-                        let _new_token = NewTokenFrame::from_bytes(&frame_code, payload);
+                        //let _new_token = NewTokenFrame::from_bytes(&frame_code, payload);
                     } else {
                         //Quic Error: ProtocolViolation
                     }
@@ -731,6 +753,11 @@ impl Inner {
                     }
 
                     let stream_data = payload.get_bytes(length as usize)?;
+
+                    println!(
+                        "incoming stream data: {:?}",
+                        std::str::from_utf8(&stream_data.to_vec())
+                    );
 
                     self.sm
                         .incoming(stream_id, offset, length, fin_bit_set, stream_data.buf())?;
@@ -762,7 +789,6 @@ impl Inner {
                     let _maximum_streams = payload.get_varint()?;
                 } //STREAMS_BLOCKED (unidirectional)
                 0x18 => {
-                    println!("NEW CID");
                     let sqn = payload.get_varint().unwrap();
                     let retire_prior_to = payload.get_varint()?;
                     let l = payload.get_u8().unwrap();
@@ -816,7 +842,7 @@ impl Inner {
         if ack_eliciting {
             self.packet_spaces[header.space()]
                 .outgoing_acks
-                .push(header.packet_num.into());
+                .push(header.packet_num);
         }
 
         Ok(())
@@ -845,12 +871,9 @@ impl Inner {
         Ok(())
     }
 
-    fn process_crypto_data(&mut self, crypto_frame: &CryptoFrame) {
-        match self.tls_session.read_hs(crypto_frame.data()) {
-            Ok(()) => debug!(
-                "consumed {} bytes from crypto frame",
-                crypto_frame.data().len()
-            ),
+    fn process_crypto_data(&mut self, crypto_data: &[u8]) {
+        match self.tls_session.read_hs(crypto_data) {
+            Ok(()) => debug!("consumed {} bytes from crypto frame", crypto_data.len()),
             Err(err) => {
                 error!("Error reading crypto data: {}", err);
                 error!("{:?}", self.tls_session.alert().unwrap());
@@ -919,7 +942,7 @@ impl Inner {
         let length = buf.len() as u64;
         self.packet_spaces[space_id]
             .outgoing_crypto
-            .push_back(packet::CryptoFrame::new(offset, buf));
+            .push_back((offset, buf));
         self.packet_spaces[space_id].outgoing_crypto_offset += length;
     }
 
@@ -937,6 +960,14 @@ impl Inner {
         while remaining > 0 {
             let (packet_type, space_id) = self.get_packet_type();
 
+            let span = span!(
+                Level::DEBUG,
+                "fetch_dgram",
+                space = space_id,
+                pn = tracing::field::Empty
+            )
+            .entered();
+
             if packet_type == packet::PacketType::None {
                 //either we're done or we need to throw an error
                 if encoded_packets == 0 {
@@ -946,13 +977,13 @@ impl Inner {
                 }
             }
 
-            debug!(
-                "building packet type {} in space {} with remaining space of {}",
-                packet_type, space_id, remaining
-            );
+            debug!("building {} packet", packet_type);
+            debug!("remaining space {}", remaining);
 
             let pn = self.packet_spaces[space_id].get_next_pkt_num();
             let dcid = self.cidm.get_dcid().unwrap();
+
+            span.record("pn", pn);
 
             let header = match packet_type {
                 packet::PacketType::Short => {
@@ -981,7 +1012,7 @@ impl Inner {
                 }
             }?;
 
-            debug!("with header: {}", header);
+            debug!("Header: {}", header);
 
             let keys = if let Some(crypto) = self.packet_spaces[space_id].keys.as_ref() {
                 &crypto.local
@@ -1020,7 +1051,7 @@ impl Inner {
 
             let payload_offset = buf.off();
 
-            debug!("payload_offset: {}", payload_offset);
+            //debug!("payload_offset: {}", payload_offset);
 
             assert!(
                 header.raw_length + header.packet_num_length as usize + 1 == buf.off(),
@@ -1028,7 +1059,7 @@ impl Inner {
             );
 
             //fill that packet with data
-            //fetch acks
+            //ack frames
             if !self.packet_spaces[space_id].outgoing_acks.is_empty() {
                 //sort outgoing acks in reverse to ease range building
                 self.packet_spaces[space_id]
@@ -1036,8 +1067,8 @@ impl Inner {
                     .sort_by(|a, b| b.cmp(a));
 
                 debug!(
-                    "creating ack frame for pns {:?} in space {}",
-                    self.packet_spaces[space_id].outgoing_acks, space_id
+                    "ACK frame: {:?}",
+                    self.packet_spaces[space_id].outgoing_acks,
                 );
 
                 //TODO figure out delay
@@ -1049,46 +1080,39 @@ impl Inner {
                     ack_delay,
                 );
 
-                //clear vector as packet numbers are now ack'ed
-                self.packet_spaces[space_id].outgoing_acks.clear();
-
                 if let Err(err) = packet::encode_frame(&ack_frame, &mut buf) {
                     return Err(terror::Error::buffer_size_error(format!(
                         "insufficient sized buffer for ack frame ({})",
                         err
                     )));
                 };
+
+                //clear vector as packet numbers are now ack'ed
+                self.packet_spaces[space_id].outgoing_acks.clear();
             };
 
-            //CRYPTO
-            while let Some(frame) = self.packet_spaces[space_id].outgoing_crypto.pop_front() {
-                if let Err(err) = packet::encode_frame(&frame, &mut buf) {
-                    //no more space, put frame back
-                    self.packet_spaces[space_id]
-                        .outgoing_crypto
-                        .push_front(frame);
+            //crypto frames
+            while let Some((off, data)) = self.packet_spaces[space_id].outgoing_crypto.front() {
+                let enc_len = 1 + varint_len(*off) + varint_len(data.len() as u64) + data.len();
 
-                    return Err(terror::Error::buffer_size_error(format!(
-                        "insufficient sized buffer for crypto frame ({})",
-                        err
-                    )));
-                };
+                if buf.cap() >= enc_len {
+                    debug!("CRYPTO frame: off {} len {}", off, data.len());
+
+                    buf.put_u8(0x06)?;
+                    buf.put_varint(*off)?;
+                    buf.put_varint(data.len() as u64)?;
+                    buf.put_bytes(data)?;
+
+                    self.packet_spaces[space_id].outgoing_crypto.pop_front();
+                } else {
+                    warn!("not enough space left to encode crypto frame with len {enc_len}");
+                }
             }
 
-            //HANDSHAKE_DONE
-            /*if self.state == ConnectionState::Connected
-                && !self.hs_done
-                && self.side == Side::Server
-            {
-                buf.put_varint(0x1e)?;
-                self.hs_done = true;
-            }*/
-
+            //stream frames
             if packet_type == packet::PacketType::Short {
-                //encode stream frames
-                /*if let Some(id) = self.sm.outbound_ready.pop() {
-                    self.sm.outbound.emit(&mut buf, pn);
-                }*/
+                let sframe_len = self.sm.emit_fill(buf.as_mut(), pn)?;
+                buf.skip(sframe_len)?;
             }
 
             //if is last packet, pad to min size of 1200
@@ -1098,7 +1122,7 @@ impl Inner {
                 //if packet header is long, add padding length to length field, if it is short skip
                 //padding length
                 if (buf.off() + written) < 1200 {
-                    let skip = std::cmp::min(1200 - buf.off() - written, 0);
+                    let skip = std::cmp::max(1200 - buf.off() - written, 0);
                     debug!(
                         "datagram contains initial frame and this last packet is padded by: {}",
                         skip
@@ -1106,11 +1130,6 @@ impl Inner {
                     buf.skip(skip)?;
                 }
             }
-
-            debug!(
-                "offset after payload (incl. written): {}",
-                buf.off() + written
-            );
 
             let payload_length = buf.off() - payload_offset;
             debug!("payload length: {}", payload_length);
@@ -1154,8 +1173,8 @@ impl Inner {
         (packet::PacketType::None, 0)
     }
 
-    pub fn poll_events(&self) -> &Vec<InnerEvent> {
-        &self.events
+    pub fn poll_event(&mut self) -> Option<InnerEvent> {
+        self.events.pop()
     }
 }
 
@@ -1180,10 +1199,10 @@ struct PacketNumberSpace {
     outgoing_acks: Vec<u64>,
     awaiting_acknowledgement: Vec<u64>,
 
-    outgoing_crypto: VecDeque<packet::CryptoFrame>,
+    outgoing_crypto: VecDeque<(u64, Vec<u8>)>,
     outgoing_crypto_offset: u64,
 
-    next_pkt_num: u32,
+    next_pkt_num: u64,
 
     active: bool,
 }
@@ -1207,7 +1226,7 @@ impl PacketNumberSpace {
         self.active && (!self.outgoing_acks.is_empty() || !self.outgoing_crypto.is_empty())
     }
 
-    fn get_next_pkt_num(&mut self) -> u32 {
+    fn get_next_pkt_num(&mut self) -> u64 {
         self.next_pkt_num += 1;
         self.next_pkt_num - 1
     }

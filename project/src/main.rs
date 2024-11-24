@@ -38,7 +38,7 @@ async fn run() -> Result<(), terror::Error> {
             while let Ok((_recv_stream, _send_stream)) =
                 connection.accept_bidirectional_stream().await
             {
-                println!("new bidirectional stream!");
+                println!("NEW BIDIRECTIONAL STREAM FROM MAIN!");
             }
         });
     }

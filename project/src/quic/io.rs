@@ -71,7 +71,7 @@ pub async fn start(mut endpoint: Endpoint, address: SocketAddr) -> Result<(), te
                     }
 
                     //poll for events in connection with outside effect
-                    for event in c.poll_events() {
+                    while let Some(event) = c.poll_event() {
                         match event {
                             InnerEvent::ConnectionEstablished => {
                                 transmit_ready = Some(handle.clone())
