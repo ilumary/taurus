@@ -46,7 +46,7 @@ impl Acceptor {
 
 pub struct Server {
     acceptor: Acceptor,
-    address: SocketAddr,
+    pub address: SocketAddr,
 }
 
 impl Server {
@@ -143,10 +143,16 @@ impl ConnectionApi for LockedInner {
     fn poll_recv(
         &self,
         _cx: &mut std::task::Context,
-        _s_id: &u64,
-        _buf: &mut [u8],
+        s_id: &u64,
+        buf: &mut [u8],
     ) -> Poll<Result<usize, terror::Error>> {
-        let _conn = self.0.lock();
+        let mut conn = self.0.lock();
+        let bytes_read = conn.stream_read(s_id, buf)?;
+
+        if bytes_read > 0 {
+            return Poll::Ready(Ok(bytes_read));
+        }
+
         Poll::Pending
     }
 
@@ -221,6 +227,16 @@ impl Connection {
     pub async fn accept_unidirectional_stream(&self) -> Result<stream::RecvStream, terror::Error> {
         let s = future::poll_fn(|cx| self.api.poll_accept(cx, 0x02, self.clone())).await?;
         Ok(s.0.unwrap())
+    }
+
+    pub async fn open_bidirectional_stream(
+        &self,
+    ) -> Result<(stream::RecvStream, stream::SendStream), terror::Error> {
+        todo!()
+    }
+
+    pub async fn open_unidirectional_stream(&self) -> Result<stream::RecvStream, terror::Error> {
+        todo!()
     }
 
     pub async fn close(&self, reason: &str) -> Result<(), terror::Error> {
@@ -312,7 +328,11 @@ struct Inner {
 
 impl Inner {
     // returns stream id
-    fn stream_accept(&mut self, stream_t: u64, wk: std::task::Waker) -> Option<u64> {
+    fn stream_accept(
+        &mut self,
+        stream_t: u64,
+        wk: <stream::StreamWaker as stream::StreamCallback>::Callback,
+    ) -> Option<u64> {
         let stream_t = stream_t & (self.side as u8) as u64;
 
         if let Some(id) = self.sm.poll_ready(stream_t, wk) {
@@ -322,8 +342,11 @@ impl Inner {
         None
     }
 
+    fn stream_read(&mut self, stream_id: &u64, buf: &mut [u8]) -> Result<usize, terror::Error> {
+        self.sm.consume(stream_id, buf)
+    }
+
     /*
-    fn stream_read() {}
     fn stream_write() {}
     fn stream_reset() {}
     */
@@ -1233,7 +1256,7 @@ impl PacketNumberSpace {
 
     // once a key replace is triggered, the next 1-rtt packet keys replace the old ones in the data
     // space. The next 1-rtt are then derived from the secret
-    fn replace_packet_keys(&mut self, packet_keys: PacketKeySet) {
+    fn _replace_packet_keys(&mut self, packet_keys: PacketKeySet) {
         //maybe save old keys to keep in case a keyupdate is not completed
         let _ = std::mem::replace(
             &mut self.keys.as_mut().unwrap().local.packet,

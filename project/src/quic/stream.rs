@@ -52,7 +52,9 @@ impl SendStream {
     }
 }
 
-// stream waker, notifies task if new stream is availibe
+// stream waker for async lib, wakes stored task waker when invoked. allows tasks to wait until a
+// new stream is ready or readable data arrived in a recv_stream. also used when certain stream
+// limits are exceeded
 #[derive(Clone)]
 pub struct StreamWaker {
     wk: std::task::Waker,
@@ -70,7 +72,7 @@ impl StreamCallback for StreamWaker {
     }
 }
 
-// stream callback trait. invoked if a stream is created by the peer
+// stream callback trait. requires that the callback type can be cloned
 pub trait StreamCallback {
     type Callback;
 
@@ -95,6 +97,8 @@ pub struct StreamManager<C: StreamCallback> {
     // if no ready stream was found, a callback is saved. Only one callback per stream type can be
     // saved. The callback is consumed when invoked
     callbacks: [Option<C>; 4],
+
+    //awaiting_read: IndexMap<StreamId, C::Callback>,
 
     // keeps track of outbound streams which have data to write. Key for the tree is a tuple
     // of StreamPriority & StreamId. Tuples implement ord from left to right, so first stream
@@ -123,26 +127,28 @@ impl<C: StreamCallback> StreamManager<C> {
             counts: [0, 0, 0, 0],
             ready: [None; 4],
             callbacks: [None, None, None, None],
+            //awaiting_read: IndexMap::new(),
             local,
         }
     }
 
     // polls for specific stream type. if no ready stream was found, save callback
     pub fn poll_ready(&mut self, stream_t: u64, cb: C::Callback) -> Option<StreamId> {
-        if let Some(id) = self.ready[stream_t as usize] {
+        let stream_t: usize = stream_t as usize;
+        if let Some(id) = self.ready[stream_t] {
             //if ready id is availibe, check if higher id exists
             let sequence = id >> 2;
-            if sequence < self.counts[stream_t as usize] - 1 {
-                self.ready[stream_t as usize] = Some(id + 4);
+            if sequence < self.counts[stream_t] - 1 {
+                self.ready[stream_t] = Some(id + 4);
             } else {
-                self.ready[stream_t as usize] = None;
+                self.ready[stream_t] = None;
             }
 
             return Some(id);
         }
 
         // no ready stream was found, save callback
-        self.callbacks[stream_t as usize] = Some(C::new(cb));
+        self.callbacks[stream_t] = Some(C::new(cb));
 
         None
     }
@@ -266,6 +272,19 @@ impl<C: StreamCallback> StreamManager<C> {
         };
 
         Ok(())
+    }
+
+    // consumes data from an existing inbound stream
+    pub fn consume(
+        &mut self,
+        stream_id: &StreamId,
+        buf: &mut [u8],
+    ) -> Result<usize, terror::Error> {
+        let stream = match self.inbound.get_mut(stream_id) {
+            Some(s) => s,
+            None => return Err(terror::Error::invalid_stream("invalid stream id")),
+        };
+        stream.consume(buf)
     }
 
     //modifies a streams priority, a possible entry into outbound ready is updated

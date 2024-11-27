@@ -32,6 +32,8 @@ async fn run() -> Result<(), terror::Error> {
     .build()
     .await?;
 
+    println!("{}", server.address);
+
     while let Some(connection) = server.accept().await {
         println!("new connection!");
         tokio::spawn(async move {

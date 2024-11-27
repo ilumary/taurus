@@ -644,10 +644,6 @@ impl Header {
         self.space
     }
 
-    pub fn is_inital(&self) -> bool {
-        ((self.hf & LS_TYPE_BIT) >> 7) == 1 && ((self.hf & LONG_PACKET_TYPE) >> 4) == 0
-    }
-
     pub fn calculate_pn_length(packet_number: u32) -> u8 {
         match packet_number {
             0x00..=0xff => 0,
