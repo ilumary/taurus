@@ -14,21 +14,24 @@ This repository contains my bachelor thesis from Heinrich-Heine Universität Dü
 
 ## Key Features
 
-The QUIC library is still in a very early development stage and a majority of the features required for any kind of meaningful use are not yet implemented. As I lack the resources of the likes of Amazon, Cloudflare and co, development may only progress slowly. Currently availible are:
+The QUIC library is still in a very early development stage and a majority of the features required for any kind of meaningful use are not yet implemented. As I lack the resources of the likes of Amazon, Cloudflare and co, development may only progress slowly. The following features are implemented:
 
-* QUIC 1-RTT Handshake
-* Full TLS 1.3 Integration using <a href="https://github.com/rustls/rustls">rustls</a>
-* Server API for easy integration with HTTP/3 or other Application Protocols
+* QUIC 1-RTT handshake
+* QUIC stream implementation
+* Async socket io
+* Full TLS 1.3 integration using <a href="https://github.com/rustls/rustls">rustls</a>
+* Server API for easy integration with HTTP/3 or other application protocols
 
-The current implementation works with <a href="https://github.com/quinn-rs/quinn">quinn's</a> example client implementation as described in the `Run` section. The handshake is completed successfully and the client-initiated bidirectional stream is successfully proccessed on my side.
+The current implementation works with <a href="https://github.com/quinn-rs/quinn">quinn's</a> example client implementation as described in the `Run` section. The handshake is completed successfully and the client-initiated bidirectional stream is successfully proccessed on my side. An answer is successfully sent. The required certificate to accept a connection from quinn's client can be found in their repo.
 
-Though it may seem to work fine for now, the async library design is still only in its infant stage. Currently in development are:
+Though it may seem to work fine, the core library and its async wrapper lack many of the features required for any kind of robustcommunication. Currently in development are:
 
-* Async wrapper for quic library
-* QUIC stream implementation (with async wrapper)
-* Congestion and flow control
+* Async wrapper for core quic library
+* Congestion control with loss detection and retransmissions
+* Flow control
+* Client API implementation
   
-The Server API design (Client API coming sometime in the future) is heavily inspired by <a href="https://github.com/aws/s2n-quic">Amazons QUIC API design</a>. As of now it is still in development and neither fully functional nor feature complete.
+The top level server API design (Client API coming sometime in the future) is heavily inspired by <a href="https://github.com/aws/s2n-quic">Amazons QUIC API design</a>.
 
 I am also only learning the deep ends of Rust through this project so dont expect top-notch Rust code.
 
