@@ -24,7 +24,7 @@ The QUIC library is still in a very early development stage and a majority of th
 
 The current implementation works with <a href="https://github.com/quinn-rs/quinn">quinn's</a> example client implementation as described in the `Run` section. The handshake is completed successfully and the client-initiated bidirectional stream is successfully proccessed on my side. An answer is successfully sent. The required certificate to accept a connection from quinn's client can be found in their repo.
 
-Though it may seem to work fine, the core library and its async wrapper lack many of the features required for any kind of robustcommunication. Currently in development are:
+Though it may seem to work fine, the core library and its async wrapper lack many of the features required for any kind of robust communication. Currently in development are:
 
 * Async wrapper for core quic library
 * Congestion control with loss detection and retransmissions
