@@ -34,13 +34,20 @@ async fn run() -> Result<(), terror::Error> {
 
     println!("{}", server.address);
 
+    let mut data = [0u8; 1024];
+
     while let Some(connection) = server.accept().await {
         println!("new connection!");
+
         tokio::spawn(async move {
-            while let Ok((_recv_stream, _send_stream)) =
-                connection.accept_bidirectional_stream().await
-            {
-                println!("NEW BIDIRECTIONAL STREAM FROM MAIN!");
+            while let Ok((recv, _send)) = connection.accept_bidirectional_stream().await {
+                tokio::spawn(async move {
+                    println!("NEW BIDIRECTIONAL STREAM FROM MAIN!");
+
+                    while let Ok(Some(read)) = recv.read(&mut data).await {
+                        println!("read stream data: {:?}", std::str::from_utf8(&data[..read]));
+                    }
+                });
             }
         });
     }

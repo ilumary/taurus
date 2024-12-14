@@ -8,6 +8,7 @@ use std::{
 };
 
 use indexmap::IndexMap;
+use octets::varint_len;
 use tracing::{debug, warn};
 
 const STREAM_TYPE: u64 = 0x3;
@@ -31,7 +32,10 @@ impl RecvStream {
         Self { id, inner }
     }
 
-    pub async fn read(&self, buf: &mut [u8]) -> Result<usize, terror::Error> {
+    // Reads data from a stream into the provided buffer. If successfull, returns number of bytes
+    // read. Existing data in the buffer is overwritten. Returns [`None`] if the stream is finished
+    // or has been reset.
+    pub async fn read(&self, buf: &mut [u8]) -> Result<Option<usize>, terror::Error> {
         future::poll_fn(|cx| self.inner.api.poll_recv(cx, &self.id, buf)).await
     }
 }
@@ -47,8 +51,11 @@ impl SendStream {
         Self { id, inner }
     }
 
-    pub async fn write(&self, buf: &[u8]) -> Result<usize, terror::Error> {
-        future::poll_fn(|cx| self.inner.api.poll_send(cx, &self.id, buf)).await
+    // Writes data to a send stream. Returns the number of bytes written. Due to flow control
+    // limits it is not guaranteed that all data will be appended. Writing to a finished or reset
+    // stream returns an error.
+    pub async fn write(&self, buf: &[u8], fin: bool) -> Result<usize, terror::Error> {
+        future::poll_fn(|cx| self.inner.api.poll_send(cx, &self.id, buf, fin)).await
     }
 }
 
@@ -86,7 +93,7 @@ pub trait StreamCallback {
 pub struct StreamManager<C: StreamCallback> {
     // all streams, sorted by inbound and outbound
     outbound: IndexMap<StreamId, SendStreamInner>,
-    inbound: IndexMap<StreamId, RecvStreamInner>,
+    inbound: IndexMap<StreamId, RecvStreamInner<C>>,
 
     // [client init bidi, server init bidi, client init uni, server init uni]
     counts: [u64; 4],
@@ -97,8 +104,6 @@ pub struct StreamManager<C: StreamCallback> {
     // if no ready stream was found, a callback is saved. Only one callback per stream type can be
     // saved. The callback is consumed when invoked
     callbacks: [Option<C>; 4],
-
-    //awaiting_read: IndexMap<StreamId, C::Callback>,
 
     // keeps track of outbound streams which have data to write. Key for the tree is a tuple
     // of StreamPriority & StreamId. Tuples implement ord from left to right, so first stream
@@ -127,7 +132,6 @@ impl<C: StreamCallback> StreamManager<C> {
             counts: [0, 0, 0, 0],
             ready: [None; 4],
             callbacks: [None, None, None, None],
-            //awaiting_read: IndexMap::new(),
             local,
         }
     }
@@ -186,6 +190,8 @@ impl<C: StreamCallback> StreamManager<C> {
                 .insert(stream_id, RecvStreamInner::new(priority));
         }
 
+        debug!("created stream {{id: {stream_id}}}");
+
         Ok(())
     }
 
@@ -206,8 +212,6 @@ impl<C: StreamCallback> StreamManager<C> {
         id |= self.counts[id as usize] << 2;
 
         self.create(id, priority, true)?;
-
-        debug!("initiated new stream with id: {}", id);
 
         Ok(id)
     }
@@ -231,8 +235,6 @@ impl<C: StreamCallback> StreamManager<C> {
 
         // because stream is incoming it cant be local
         self.create(stream_id, None, false)?;
-
-        debug!("new stream: id {}", stream_id);
 
         // unwrap is safe because stream was created
         let recv_s = self.inbound.get_mut(&stream_id).unwrap();
@@ -260,18 +262,16 @@ impl<C: StreamCallback> StreamManager<C> {
         stream_id: StreamId,
         data: &[u8],
         fin: bool,
-    ) -> Result<(), terror::Error> {
+    ) -> Result<usize, terror::Error> {
         if let Some(ss) = self.outbound.get_mut(&stream_id) {
-            ss.append(data, fin)?;
+            let len = ss.append(data, fin)?;
             self.outbound_ready.insert((ss.prio, stream_id));
-        } else {
-            return Err(terror::Error::stream_error(format!(
-                "send stream with id {} no found",
-                stream_id
-            )));
-        };
+            return Ok(len);
+        }
 
-        Ok(())
+        Err(terror::Error::invalid_stream(format!(
+            "invalid stream id {stream_id}",
+        )))
     }
 
     // consumes data from an existing inbound stream
@@ -279,12 +279,20 @@ impl<C: StreamCallback> StreamManager<C> {
         &mut self,
         stream_id: &StreamId,
         buf: &mut [u8],
-    ) -> Result<usize, terror::Error> {
+        wk: C::Callback,
+    ) -> Result<Option<usize>, terror::Error> {
         let stream = match self.inbound.get_mut(stream_id) {
             Some(s) => s,
             None => return Err(terror::Error::invalid_stream("invalid stream id")),
         };
-        stream.consume(buf)
+
+        let read = stream.consume(buf);
+
+        if let Some(0) = read {
+            stream.callback = Some(C::new(wk));
+        }
+
+        Ok(read)
     }
 
     //modifies a streams priority, a possible entry into outbound ready is updated
@@ -351,10 +359,10 @@ impl<C: StreamCallback> StreamManager<C> {
         let (stream_off, rel_length) = ss.peek();
 
         // calculate stram frame overhead
-        let mut overhead = 1 + crate::packet::varint_length(*ss_id);
+        let mut overhead = 1 + varint_len(*ss_id);
 
         if stream_off > 0 {
-            overhead += crate::packet::varint_length(stream_off as u64);
+            overhead += varint_len(stream_off as u64);
         }
 
         //if there not enough space for frame overhead plus at least one byte of data, return
@@ -459,6 +467,7 @@ struct SendStreamInner {
 
     //current offset of internal data being sent
     off: usize,
+    //Callback, triggered when either a) new data can be appended b) the stream is reset
 }
 
 impl SendStreamInner {
@@ -529,7 +538,8 @@ impl SendStreamInner {
         Ok((written, fin))
     }
 
-    fn append(&mut self, data: &[u8], fin: bool) -> Result<(), terror::Error> {
+    // TODO flow control limits
+    fn append(&mut self, data: &[u8], fin: bool) -> Result<usize, terror::Error> {
         if self.final_size.is_some() {
             return Err(terror::Error::stream_error(
                 "cannot append to finalized or reset stream",
@@ -544,7 +554,7 @@ impl SendStreamInner {
             .push_back(Chunk::new(data, self.length as u64, fin));
         self.length += data.len();
 
-        Ok(())
+        Ok(data.len())
     }
 
     fn reset(&mut self, apec: u64) -> Result<(), terror::Error> {
@@ -563,7 +573,7 @@ impl SendStreamInner {
     }
 }
 
-struct RecvStreamInner {
+struct RecvStreamInner<C: StreamCallback> {
     //data chunks ordered by their offset
     data: IndexMap<u64, Chunk>,
 
@@ -576,6 +586,9 @@ struct RecvStreamInner {
     //highest chunk offset into [`data`] that has been read
     max_read: u64,
 
+    //number of bytes that have been read from the stream
+    bytes_read: usize,
+
     //received stream frame with offset 0
     start_recv: bool,
 
@@ -587,50 +600,24 @@ struct RecvStreamInner {
 
     //stream priority
     prio: StreamPriority,
+
+    //Callback, triggered when either a) new incoming data is available b) the stream is reset
+    callback: Option<C>,
 }
 
-impl RecvStreamInner {
+impl<C: StreamCallback> RecvStreamInner<C> {
     fn new(priority: Option<StreamPriority>) -> Self {
         Self {
             data: IndexMap::new(),
             gaps: Vec::new(),
             max_off: 0,
             max_read: 0,
+            bytes_read: 0,
             start_recv: false,
             final_size: None,
             apec: None,
             prio: priority.unwrap_or(u8::MAX),
-        }
-    }
-
-    fn with_data(data: &[u8], off: u64, fin: bool) -> Self {
-        let chunk = Chunk::new(data, off, fin);
-        let mut gaps = Vec::new();
-        let mut start_recv = true;
-        let mut final_size = None;
-
-        //if first received frame is actually second, insert first gap
-        if off > 0 {
-            gaps.push(0..off);
-            start_recv = false;
-        }
-
-        let mut map = IndexMap::new();
-        map.insert(off, chunk);
-
-        if fin {
-            final_size = Some(data.len() as u64);
-        }
-
-        Self {
-            data: map,
-            gaps,
-            max_off: off,
-            max_read: 0,
-            start_recv,
-            final_size,
-            apec: None,
-            prio: u8::MAX,
+            callback: None,
         }
     }
 
@@ -719,6 +706,11 @@ impl RecvStreamInner {
             self.final_size = Some(offset + length);
         }
 
+        // invoke callback to notify that new data is available
+        if let Some(c) = self.callback.take() {
+            c.invoke();
+        }
+
         Ok(())
     }
 
@@ -745,8 +737,13 @@ impl RecvStreamInner {
         self.final_size = Some(final_size);
         self.apec = Some(apec);
 
-        //clear data
+        // clear data
         self.data.clear();
+
+        // invoke callback in case stream is reset
+        if let Some(c) = self.callback.take() {
+            c.invoke();
+        }
 
         Ok(())
     }
@@ -784,16 +781,19 @@ impl RecvStreamInner {
         None
     }
 
-    fn consume(&mut self, buf: &mut [u8]) -> Result<usize, terror::Error> {
+    fn consume(&mut self, buf: &mut [u8]) -> Option<usize> {
         if !self.start_recv {
-            return Ok(0);
+            return Some(0);
         }
 
-        if let Some(apec) = self.apec {
-            return Err(terror::Error::stream_error(format!(
-                "stream has been reset with error code {}",
-                apec
-            )));
+        if self.apec.is_some() {
+            return None;
+        }
+
+        if let Some(fs) = self.final_size {
+            if fs == self.bytes_read as u64 {
+                return None;
+            }
         }
 
         let mut written = 0;
@@ -818,7 +818,7 @@ impl RecvStreamInner {
 
             let to_write = std::cmp::min(remaining, chunk.len());
 
-            buf[written..written + to_write].copy_from_slice(&chunk.data);
+            buf[written..written + to_write].copy_from_slice(&chunk.data[..to_write]);
 
             chunk.consume(to_write);
 
@@ -827,13 +827,14 @@ impl RecvStreamInner {
 
             //check if all data has been consumed
             if chunk.is_empty() && chunk.fin {
-                return Ok(written);
+                return Some(written);
             }
         }
 
         self.max_read = max_read;
+        self.bytes_read += written;
 
-        Ok(written)
+        Some(written)
     }
 }
 
@@ -925,6 +926,42 @@ impl std::ops::Deref for Chunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl<C: StreamCallback> RecvStreamInner<C> {
+        // test only implementation to allow creation with data
+        fn with_data(data: &[u8], off: u64, fin: bool) -> Self {
+            let chunk = Chunk::new(data, off, fin);
+            let mut gaps = Vec::new();
+            let mut start_recv = true;
+            let mut final_size = None;
+
+            //if first received frame is actually second, insert first gap
+            if off > 0 {
+                gaps.push(0..off);
+                start_recv = false;
+            }
+
+            let mut map = IndexMap::new();
+            map.insert(off, chunk);
+
+            if fin {
+                final_size = Some(data.len() as u64);
+            }
+
+            Self {
+                data: map,
+                gaps,
+                max_off: off,
+                max_read: 0,
+                bytes_read: 0,
+                start_recv,
+                final_size,
+                apec: None,
+                prio: u8::MAX,
+                callback: None,
+            }
+        }
+    }
 
     // test adapter for stream waker
     #[derive(Clone)]
@@ -1269,7 +1306,7 @@ mod tests {
     fn recv_stream_creation() {
         let data = vec![1u8; 8];
 
-        let recv_stream = RecvStreamInner::with_data(&data, 0, true);
+        let recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&data, 0, true);
 
         assert_eq!(recv_stream.max_off, 0);
         assert_eq!(recv_stream.final_size.unwrap(), 8);
@@ -1281,7 +1318,7 @@ mod tests {
         let frame2 = vec![2u8; 8];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
 
         assert_eq!(recv_stream.gaps[0], 8..16);
@@ -1299,7 +1336,7 @@ mod tests {
         let frame4 = vec![4u8; 8];
         let frame5 = vec![5u8; 8];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
         assert!(recv_stream.process(32, 8, true, &frame5).is_ok());
 
         assert_eq!(recv_stream.gaps[0], 8..32);
@@ -1320,7 +1357,7 @@ mod tests {
         let frame2 = vec![2u8; 9];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
         assert!(recv_stream.process(8, 9, false, &frame2).is_err());
     }
@@ -1331,7 +1368,7 @@ mod tests {
         let frame2 = vec![2u8; 8];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame2, 8, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame2, 8, false);
         assert!(recv_stream.process(0, 8, false, &frame1).is_ok());
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
     }
@@ -1342,7 +1379,7 @@ mod tests {
         let frame2 = vec![2u8; 8];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
         assert!(recv_stream.process(8, 8, false, &frame2).is_ok());
 
@@ -1357,7 +1394,7 @@ mod tests {
         let frame2 = vec![2u8; 8];
         let frame3 = vec![3u8; 8];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
         assert!(recv_stream.process(8, 8, false, &frame2).is_ok());
 
@@ -1373,6 +1410,25 @@ mod tests {
     }
 
     #[test]
+    fn recv_stream_read_twice() {
+        let frame1 = vec![1u8; 8];
+        let frame2 = vec![2u8; 8];
+
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
+        assert!(recv_stream.process(8, 8, true, &frame2).is_ok());
+
+        let output = [1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2];
+        let mut result = [0u8; 16];
+
+        let size1 = recv_stream.consume(&mut result[..4]).unwrap();
+        let size2 = recv_stream.consume(&mut result[4..]).unwrap();
+
+        assert_eq!(size1, 4);
+        assert_eq!(size2, 12);
+        assert_eq!(output, result);
+    }
+
+    #[test]
     fn recv_stream_read_with_gap() {
         let frame1 = vec![1u8; 8];
         let frame2 = vec![2u8; 8];
@@ -1380,7 +1436,7 @@ mod tests {
 
         let mut result = [0u8; 24];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
 
         assert_eq!(recv_stream.final_size.unwrap(), 24);
@@ -1407,7 +1463,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let frame2 = vec![2u8; 8];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
         assert!(recv_stream.process(8, 8, false, &frame2).is_ok());
         assert!(recv_stream.reset(0x00, 16).is_ok());
     }
@@ -1417,7 +1473,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let frame2 = vec![2u8; 8];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
         assert!(recv_stream.process(8, 8, true, &frame2).is_ok());
         assert!(recv_stream.reset(0x00, 17).is_err());
     }
@@ -1427,7 +1483,7 @@ mod tests {
         let frame1 = vec![1u8; 8];
         let frame2 = vec![2u8; 8];
 
-        let mut recv_stream = RecvStreamInner::with_data(&frame1, 0, false);
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&frame1, 0, false);
         assert!(recv_stream.process(8, 8, false, &frame2).is_ok());
         assert!(recv_stream.reset(0x00, 15).is_err());
     }
@@ -1478,25 +1534,6 @@ mod tests {
         assert!(send_stream.pending.get(&1).is_some());
         assert!(send_stream.data.front().is_none());
     }
-
-    /*#[test]
-    fn send_stream_ack() {
-        let frame1 = vec![1u8; 8];
-        let mut result = vec![0u8; 8];
-
-        let mut send_stream = SendStreamInner::new(None);
-
-        send_stream.append(&frame1, true).unwrap();
-
-        let (size, fin) = send_stream.emit(&mut result, 0).unwrap();
-
-        assert!(fin);
-        assert_eq!(size, 8);
-
-        send_stream.ack(&[0]);
-
-        assert!(send_stream.pending.is_empty());
-    }*/
 
     #[test]
     fn send_stream_reset() {

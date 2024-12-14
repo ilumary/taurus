@@ -142,28 +142,28 @@ pub struct LockedInner(Mutex<Inner>);
 impl ConnectionApi for LockedInner {
     fn poll_recv(
         &self,
-        _cx: &mut std::task::Context,
+        cx: &mut std::task::Context,
         s_id: &u64,
         buf: &mut [u8],
-    ) -> Poll<Result<usize, terror::Error>> {
+    ) -> Poll<Result<Option<usize>, terror::Error>> {
         let mut conn = self.0.lock();
-        let bytes_read = conn.stream_read(s_id, buf)?;
+        let bytes_read = conn.stream_read(s_id, buf, cx.waker().clone())?;
 
-        if bytes_read > 0 {
-            return Poll::Ready(Ok(bytes_read));
+        match bytes_read {
+            Some(0) => Poll::Pending,
+            _ => Poll::Ready(Ok(bytes_read)),
         }
-
-        Poll::Pending
     }
 
     fn poll_send(
         &self,
         _cx: &mut std::task::Context,
-        _s_id: &u64,
-        _buf: &[u8],
+        s_id: &u64,
+        buf: &[u8],
+        fin: bool,
     ) -> Poll<Result<usize, terror::Error>> {
-        let _conn = self.0.lock();
-        Poll::Pending
+        let mut conn = self.0.lock();
+        Poll::Ready(conn.stream_write(*s_id, buf, fin))
     }
 
     fn poll_accept(
@@ -262,13 +262,14 @@ trait ConnectionApi: Send + Sync {
         cx: &mut std::task::Context,
         id: &u64,
         buf: &mut [u8],
-    ) -> Poll<Result<usize, terror::Error>>;
+    ) -> Poll<Result<Option<usize>, terror::Error>>;
 
     fn poll_send(
         &self,
         cx: &mut std::task::Context,
         id: &u64,
         buf: &[u8],
+        fin: bool,
     ) -> Poll<Result<usize, terror::Error>>;
 
     fn poll_accept(
@@ -327,7 +328,6 @@ struct Inner {
 }
 
 impl Inner {
-    // returns stream id
     fn stream_accept(
         &mut self,
         stream_t: u64,
@@ -342,14 +342,23 @@ impl Inner {
         None
     }
 
-    fn stream_read(&mut self, stream_id: &u64, buf: &mut [u8]) -> Result<usize, terror::Error> {
-        self.sm.consume(stream_id, buf)
+    fn stream_read(
+        &mut self,
+        stream_id: &u64,
+        buf: &mut [u8],
+        wk: <stream::StreamWaker as stream::StreamCallback>::Callback,
+    ) -> Result<Option<usize>, terror::Error> {
+        self.sm.consume(stream_id, buf, wk)
     }
 
-    /*
-    fn stream_write() {}
-    fn stream_reset() {}
-    */
+    fn stream_write(
+        &mut self,
+        stream_id: u64,
+        buf: &[u8],
+        fin: bool,
+    ) -> Result<usize, terror::Error> {
+        self.sm.append(stream_id, buf, fin)
+    }
 
     //creates a connection from an initial packet as a server. Takes the buffer, source address,
     //server config, hmac reset key and a oneshot channel which gets triggered as soon as the
@@ -398,7 +407,7 @@ impl Inner {
         //payload cipher must be exact size without zeros from the buffer beeing to big!
         let dec_len = {
             let decrypted_payload_raw = match ikp.remote.packet.decrypt_in_place(
-                head.packet_num.into(),
+                head.packet_num,
                 header_raw.as_ref(),
                 payload_cipher.as_mut(),
             ) {
@@ -776,11 +785,6 @@ impl Inner {
                     }
 
                     let stream_data = payload.get_bytes(length as usize)?;
-
-                    println!(
-                        "incoming stream data: {:?}",
-                        std::str::from_utf8(&stream_data.to_vec())
-                    );
 
                     self.sm
                         .incoming(stream_id, offset, length, fin_bit_set, stream_data.buf())?;
@@ -1346,7 +1350,7 @@ impl ConnectionIdManager {
     }
 
     //create a new cid to be used in a NEW_CONNECTION_ID frame
-    fn issue_new_cid(&mut self) {}
+    fn _issue_new_cid(&mut self) {}
 
     fn get_inital_remote_scid(&self) -> Option<&ConnectionId> {
         self.dcids.first()

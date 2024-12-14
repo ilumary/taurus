@@ -1,6 +1,6 @@
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
-use octets::{Octets, OctetsMut};
+use octets::{varint_len, Octets, OctetsMut};
 
 use crate::{terror, token::StatelessResetToken, ConnectionId, MAX_CID_SIZE};
 
@@ -46,7 +46,7 @@ impl From<u64> for VarInt {
 
 impl IOHandler<VarInt> for VarInt {
     fn encode(value: &VarInt, buf: &mut OctetsMut) -> Result<(), octets::BufferTooShortError> {
-        let length = crate::packet::varint_length(value.value) as u64;
+        let length = varint_len(value.value) as u64;
         println!(
             "encoding {:x?} with length field {:x?}",
             value.value, length

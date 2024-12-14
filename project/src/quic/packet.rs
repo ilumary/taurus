@@ -1,6 +1,6 @@
 use crate::{terror, ConnectionId, SPACE_ID_DATA, SPACE_ID_HANDSHAKE, SPACE_ID_INITIAL};
 
-use octets::{Octets, OctetsMut};
+use octets::{varint_len, Octets, OctetsMut};
 use rustls::quic::{DirectionalKeys, HeaderProtectionKey};
 
 use std::fmt;
@@ -144,10 +144,10 @@ impl AckFrame {
             }
         }
 
-        ack.len += varint_length(ack.largest_acknowledged)
-            + varint_length(ack.ack_delay)
-            + varint_length(ack.ack_range_count)
-            + varint_length(ack.first_ack_range);
+        ack.len += varint_len(ack.largest_acknowledged)
+            + varint_len(ack.ack_delay)
+            + varint_len(ack.ack_range_count)
+            + varint_len(ack.first_ack_range);
 
         ack
     }
@@ -189,17 +189,17 @@ impl AckFrame {
         self.ack_ranges.push((gap, range));
         self.ack_range_count += 1;
 
-        self.len += varint_length(gap);
-        self.len += varint_length(range);
+        self.len += varint_len(gap);
+        self.len += varint_len(range);
     }
 
     //TODO add support for ecn counts
     fn _add_ecn_counts(&mut self, ecn_counts: (u64, u64, u64)) {
         self.ecn_counts = Some(ecn_counts);
 
-        self.len += varint_length(ecn_counts.0);
-        self.len += varint_length(ecn_counts.1);
-        self.len += varint_length(ecn_counts.2);
+        self.len += varint_len(ecn_counts.0);
+        self.len += varint_len(ecn_counts.1);
+        self.len += varint_len(ecn_counts.2);
     }
 }
 
@@ -375,7 +375,7 @@ impl Header {
 
         if long_header_type == 0x00 {
             // token length is encoded as variable length integer
-            let token_length_length = varint_length(token.as_ref().unwrap().len() as u64);
+            let token_length_length = varint_len(token.as_ref().unwrap().len() as u64);
 
             raw_length += token_length_length + token.as_ref().unwrap().len();
         }
@@ -667,17 +667,6 @@ impl fmt::Display for Header {
             self.token.as_ref().unwrap_or(&vec![0u8; 0]),
             self.length,
             self.raw_length)
-    }
-}
-
-#[inline]
-pub fn varint_length(num: u64) -> usize {
-    match num {
-        0..=63 => 1,
-        64..=16383 => 2,
-        16384..=1073741823 => 3,
-        1073741824..=4611686018427387903 => 4,
-        _ => unreachable!("number exceeded abnormally large size"),
     }
 }
 
