@@ -618,6 +618,20 @@ impl TransportConfig {
 
         Ok(vec)
     }
+
+    pub fn get_initial_limits(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.initial_max_data.get().unwrap().get(),
+            self.initial_max_stream_data_bidi_local.get().unwrap().get(),
+            self.initial_max_stream_data_bidi_remote
+                .get()
+                .unwrap()
+                .get(),
+            self.initial_max_stream_data_uni.get().unwrap().get(),
+            self.initial_max_streams_bidi.get().unwrap().get(),
+            self.initial_max_streams_uni.get().unwrap().get(),
+        )
+    }
 }
 
 #[cfg(test)]

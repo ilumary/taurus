@@ -1,3 +1,4 @@
+mod fc;
 mod io;
 mod packet;
 mod stream;
@@ -23,9 +24,8 @@ use token::StatelessResetToken;
 use tokio::sync::mpsc;
 use tracing::{debug, error, event, span, warn, Level};
 use transport_parameters::{
-    InitialMaxData, InitialMaxStreamDataBidiLocal, InitialMaxStreamDataBidiRemote,
-    InitialMaxStreamsBidi, InitialSourceConnectionId, MaxUdpPayloadSize,
-    OriginalDestinationConnectionId, StatelessResetTokenTP, TransportConfig, VarInt,
+    InitialSourceConnectionId, MaxUdpPayloadSize, OriginalDestinationConnectionId,
+    StatelessResetTokenTP, TransportConfig, VarInt,
 };
 
 const MAX_CID_SIZE: usize = 20;
@@ -429,7 +429,7 @@ impl Inner {
         let initial_local_scid = ConnectionId::generate_with_length(8);
         let orig_dcid = head.dcid.clone();
 
-        let tpc = TransportConfig {
+        let mut tpc = TransportConfig {
             original_destination_connection_id: OriginalDestinationConnectionId::try_from(
                 orig_dcid.clone(),
             )?,
@@ -440,16 +440,11 @@ impl Inner {
                 token::StatelessResetToken::new(hmac_reset_key, &initial_local_scid),
             )?,
             max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
-            initial_max_streams_bidi: InitialMaxStreamsBidi::try_from(VarInt::from(1))?,
-            initial_max_data: InitialMaxData::try_from(VarInt::from(1024))?,
-            initial_max_stream_data_bidi_remote: InitialMaxStreamDataBidiRemote::try_from(
-                VarInt::from(1024),
-            )?,
-            initial_max_stream_data_bidi_local: InitialMaxStreamDataBidiLocal::try_from(
-                VarInt::from(1024),
-            )?,
             ..TransportConfig::default()
         };
+
+        let mut sm = StreamManager::new(Side::Server as u8);
+        sm.fill_initial_local_tpc(&mut tpc, 1, 0)?;
 
         let data = tpc.encode(Side::Server)?;
 
@@ -481,7 +476,7 @@ impl Inner {
             zero_rtt_keyset: None,
             state: ConnectionState::Initial,
             cidm: cim,
-            sm: StreamManager::new(Side::Server as u8),
+            sm,
             packet_spaces: [
                 initial_space,
                 PacketNumberSpace::new(),
@@ -668,6 +663,14 @@ impl Inner {
         if let Some(tpc) = self.tls_session.quic_transport_parameters() {
             self.remote_tpc.update(tpc)?;
         }
+
+        //register stream limits in stream manager
+        let (imd, imsdbl, imsdbr, imsdu, imsb, imsu) = self.remote_tpc.get_initial_limits();
+
+        self.sm.set_initial_data_limits(imsdbl, imsdbr, imsdu);
+        self.sm.set_max_data(imd);
+        self.sm.set_max_streams_bidi(imsb);
+        self.sm.set_max_streams_uni(imsu);
 
         if self.remote_tpc.initial_source_connection_id.get().unwrap()
             != self.cidm.get_inital_remote_scid().unwrap()
@@ -1140,6 +1143,10 @@ impl Inner {
             if packet_type == packet::PacketType::Short {
                 let sframe_len = self.sm.emit_fill(buf.as_mut(), pn)?;
                 buf.skip(sframe_len)?;
+
+                // poll for [sending] DATA_BLOCKED, STREAMS_BLOCKED, STREAM_DATA_BLOCKED
+
+                // poll for [receiving] for MAX_DATA, MAX_STREAMS, MAX_STREAM_DATA
             }
 
             //if is last packet, pad to min size of 1200
