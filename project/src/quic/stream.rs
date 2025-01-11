@@ -25,6 +25,12 @@ const SERVER_INIT_BIDI: u64 = 0x01;
 const CLIENT_INIT_UNI: u64 = 0x02;
 const SERVER_INIT_UNI: u64 = 0x03;
 
+// if peer stream seq upgrade is triggered, max_streams is increased by
+const MAX_STREAMS_UPGRADE: u64 = 0x05;
+
+// if less than said streams can be openend by peer, upgrade is triggered
+const MAX_STREAMS_TRIGGER: u64 = 0x02;
+
 type StreamId = u64;
 type StreamPriority = u8;
 
@@ -96,6 +102,41 @@ pub trait StreamCallback {
     fn invoke(self);
 }
 
+// stream manager config for initial flow control and stream limits
+// TODO add config param for how many incoming streams may be held ready at any time (or data of
+// unconsumed streams)
+#[derive(Default)]
+pub struct StreamManagerConfig {
+    // initial limits for our recv streams sent in our transport parameters
+    initial_inbound_limits: fc::InitialStreamDataLimits,
+
+    // initial amount of data allowed to be received
+    initial_max_data: u64,
+
+    // initial amount of bidirectional streams the peer can initiate
+    initial_max_bidi_streams: u64,
+
+    // initial amount of unirectional streams the peer can initiate
+    initial_max_uni_streams: u64,
+}
+
+impl StreamManagerConfig {
+    pub fn new(initial_max_bidi_streams: u64, initial_max_uni_streams: u64) -> Self {
+        let initial_inbound_limits = fc::InitialStreamDataLimits {
+            max_stream_data_bidi_local: fc::INITIAL_MAX_DATA_BIDI_STREAM,
+            max_stream_data_bidi_remote: fc::INITIAL_MAX_DATA_BIDI_STREAM,
+            max_stream_data_uni: fc::INITIAL_MAX_DATA_UNI_STREAM,
+        };
+
+        Self {
+            initial_inbound_limits,
+            initial_max_data: fc::INITIAL_MAX_DATA,
+            initial_max_bidi_streams,
+            initial_max_uni_streams,
+        }
+    }
+}
+
 // stores and manages streams for connection
 pub struct StreamManager<C: StreamCallback> {
     // all streams, sorted by inbound and outbound
@@ -111,9 +152,6 @@ pub struct StreamManager<C: StreamCallback> {
     // holds unconsumed stream ids in binary min heap. incoming path only requires
     // .push() call which is O(1) and querying is O(log n) which is neglegible because it is only
     // done by the application and does not impact packet processing times.
-    // MAYBE keep track of how much data has arrived as new stream and is unconsumed for fc
-    // TODO add config param for how many incoming streams may be held ready at any time
-    // TODO this "Window" should be used for flow control
     ready: [BinaryHeap<std::cmp::Reverse<u64>>; 4],
 
     // if no ready stream was found, a callback is saved. Only one callback per stream type can be
@@ -126,14 +164,20 @@ pub struct StreamManager<C: StreamCallback> {
     // acending id
     outbound_ready: BTreeSet<(StreamPriority, StreamId)>,
 
+    // holds stream_ids which need an increase in their max_data
+    pending_max_stream_data: VecDeque<StreamId>,
+
     // keeps track of pending acks by packet number
     // unique set (pn, stream_id)
     ack_pending: IndexMap<u64, Vec<StreamId>>,
 
-    // initial limits from peers transport parameters
-    initial_stream_data_limits: fc::InitialStreamDataLimits,
+    // initial limits from peers transport parameters for send streams
+    initial_outbound_limits: fc::InitialStreamDataLimits,
 
-    // flow control max data from peer
+    // initial limits for our recv streams sent in our transport parameters
+    initial_inbound_limits: fc::InitialStreamDataLimits,
+
+    // the maximum amount of data we are allowed to send. set by peer
     max_data: usize,
 
     // connection level flow control for our receiving end
@@ -148,19 +192,29 @@ pub struct StreamManager<C: StreamCallback> {
 }
 
 impl<C: StreamCallback> StreamManager<C> {
-    pub fn new(local: u8) -> Self {
+    pub fn new(config: StreamManagerConfig, local: u8) -> Self {
         assert!(local == 0x00 || local == 0x01, "local must be 0x00 or 0x01");
+
+        // set inbound limits
+        let mut limits = [0u64; 4];
+        limits[(local ^ 0x01) as usize] = config.initial_max_bidi_streams;
+        limits[((local ^ 0x01) as usize) | 0x02] = config.initial_max_uni_streams;
 
         Self {
             inbound: IndexMap::new(),
             outbound: IndexMap::new(),
             outbound_ready: BTreeSet::new(),
+            pending_max_stream_data: VecDeque::new(),
             ack_pending: IndexMap::new(),
             counts: [0; 4],
-            limits: [0; 4],
-            initial_stream_data_limits: fc::InitialStreamDataLimits::default(),
+            limits,
+            initial_outbound_limits: fc::InitialStreamDataLimits::default(),
+            initial_inbound_limits: config.initial_inbound_limits,
             max_data: 0,
-            flow_control: fc::FlowControl::default(),
+            flow_control: fc::FlowControl::with_max_data(
+                config.initial_max_data,
+                fc::MAX_WINDOW_CONNECTION,
+            ),
             sent: 0,
             ready: [(); 4].map(|_| BinaryHeap::with_capacity(16)),
             callbacks: [(); 4].map(|_| None),
@@ -168,68 +222,155 @@ impl<C: StreamCallback> StreamManager<C> {
         }
     }
 
-    pub fn data_blocked(&self) -> bool {
-        self.max_data == self.sent
+    // TODO test
+    pub fn fill_initial_local_tpc(
+        &mut self,
+        tpc: &mut TransportConfig,
+    ) -> Result<(), terror::Error> {
+        tpc.initial_max_data = InitialMaxData::try_from(VarInt::from(fc::INITIAL_MAX_DATA))?;
+
+        tpc.initial_max_streams_bidi =
+            InitialMaxStreamsBidi::try_from(VarInt::from(self.limits[!self.local as usize]))?;
+        tpc.initial_max_streams_uni = InitialMaxStreamsUni::try_from(VarInt::from(
+            self.limits[(!self.local as usize) & 0x02],
+        ))?;
+
+        tpc.initial_max_stream_data_bidi_remote = InitialMaxStreamDataBidiRemote::try_from(
+            VarInt::from(fc::INITIAL_MAX_DATA_BIDI_STREAM),
+        )?;
+        tpc.initial_max_stream_data_bidi_local = InitialMaxStreamDataBidiLocal::try_from(
+            VarInt::from(fc::INITIAL_MAX_DATA_BIDI_STREAM),
+        )?;
+        tpc.initial_max_stream_data_uni =
+            InitialMaxStreamDataUni::try_from(VarInt::from(fc::INITIAL_MAX_DATA_UNI_STREAM))?;
+
+        Ok(())
     }
 
-    pub fn bidi_streams_blocked(&self) -> bool {
-        self.limits[self.local as usize] <= self.counts[self.local as usize]
+    // if bidi streams are blocked, returns sequence number they are blocked at
+    pub fn bidi_streams_blocked(&self) -> Option<u64> {
+        let bidi_t = self.local as usize;
+        if self.limits[bidi_t] <= self.counts[bidi_t] {
+            return Some(self.limits[bidi_t]);
+        }
+        None
     }
 
-    pub fn uni_streams_blocked(&self) -> bool {
-        let uni_id = (self.local | 0x02) as usize;
-        self.limits[uni_id] <= self.counts[uni_id]
+    // if uni streams are blocked, returns sequence number they are blocked at
+    pub fn uni_streams_blocked(&self) -> Option<u64> {
+        let uni_t = (self.local | 0x02) as usize;
+        if self.limits[uni_t] <= self.counts[uni_t] {
+            return Some(self.limits[uni_t]);
+        }
+        None
     }
 
+    // max amount of bidi streams we are allowed to open. set by peer
     pub fn set_max_streams_bidi(&mut self, max_streams_bidi: u64) {
         self.limits[self.local as usize] = max_streams_bidi;
     }
 
+    // max amount of uni streams we are allowed to open. set by peer
     pub fn set_max_streams_uni(&mut self, max_streams_uni: u64) {
         self.limits[(self.local | 0x02) as usize] = max_streams_uni;
     }
 
+    // max amount of data we are allowed to send over the whole connection. set by peer
     pub fn set_max_data(&mut self, max_data: u64) {
         self.max_data = max_data as usize;
     }
 
-    pub fn set_max_stream_data(&mut self, max_data: u64, stream_id: StreamId) {
+    // max amount of data we are allowed to send over the specified stream. set by peer
+    pub fn set_max_stream_data(
+        &mut self,
+        max_data: u64,
+        stream_id: StreamId,
+    ) -> Result<(), terror::Error> {
         if let Some(ss_id) = self.outbound.get_mut(&stream_id) {
             ss_id.set_max_data(max_data);
+            return Ok(());
         }
+
+        // if we receive a MAX_STREAM_DATA for a receive only stream, we return a
+        // stream_state_error
+        Err(terror::Error::quic_transport_error(
+            "received MAX_STREAM_DATA frame for receive only stream",
+            terror::QuicTransportError::StreamStateError,
+        ))
     }
 
+    // used to set limits from peer transport_parameters
     pub fn set_initial_data_limits(
         &mut self,
         initial_max_stream_data_bidi_local: u64,
         initial_max_stream_data_bidi_remote: u64,
         initial_max_stream_data_uni: u64,
     ) {
-        self.initial_stream_data_limits.max_stream_data_bidi_local =
+        self.initial_outbound_limits.max_stream_data_bidi_local =
             initial_max_stream_data_bidi_local;
-        self.initial_stream_data_limits.max_stream_data_bidi_remote =
+        self.initial_outbound_limits.max_stream_data_bidi_remote =
             initial_max_stream_data_bidi_remote;
-        self.initial_stream_data_limits.max_stream_data_uni = initial_max_stream_data_uni;
+        self.initial_outbound_limits.max_stream_data_uni = initial_max_stream_data_uni;
     }
 
-    pub fn fill_initial_local_tpc(
+    pub fn nearly_full(&self) -> bool {
+        self.flow_control.nearly_full()
+    }
+
+    pub fn upgrade_max_data(&mut self) -> u64 {
+        // adjust window size without throttling for connection
+        self.flow_control.adjust_window_size(false);
+
+        self.flow_control.poll_max_data()
+    }
+
+    pub fn upgrade_max_stream_data(
         &mut self,
-        tpc: &mut TransportConfig,
-        initial_bidi_streams: u64,
-        initial_uni_streams: u64,
+        buf: &mut octets::OctetsMut,
     ) -> Result<(), terror::Error> {
-        tpc.initial_max_data = InitialMaxData::try_from(VarInt::from(1024))?;
+        while let Some(rs_id) = self.pending_max_stream_data.front() {
+            if let Some(rs) = self.inbound.get_mut(rs_id) {
+                // only upgrade max data if enough space is left in buffer, i.e.
+                // 8 (max id) + 4 (max max_data) + 1 (frame code)
+                if buf.cap() >= 0x0d {
+                    let n_md = rs.upgrade_max_data();
 
-        tpc.initial_max_streams_bidi =
-            InitialMaxStreamsBidi::try_from(VarInt::from(initial_bidi_streams))?;
-        tpc.initial_max_streams_uni =
-            InitialMaxStreamsUni::try_from(VarInt::from(initial_uni_streams))?;
+                    buf.put_varint(0x11)?;
+                    buf.put_varint(*rs_id)?;
+                    buf.put_varint(n_md)?;
+                } else {
+                    break;
+                }
+            }
+        }
 
-        tpc.initial_max_stream_data_bidi_remote =
-            InitialMaxStreamDataBidiRemote::try_from(VarInt::from(1024))?;
-        tpc.initial_max_stream_data_bidi_local =
-            InitialMaxStreamDataBidiLocal::try_from(VarInt::from(1024))?;
-        tpc.initial_max_stream_data_uni = InitialMaxStreamDataUni::try_from(VarInt::from(512))?;
+        Ok(())
+    }
+
+    // check our limit we send to the peer. if we have less than MAX_STREAMS_TRIGGER remaining
+    // streams, we encode an MAX_STREAMS frame and add MAX_STREAMS_UPGRADE streams to the limit
+    pub fn upgrade_peer_stream_limits(
+        &mut self,
+        buf: &mut octets::OctetsMut,
+    ) -> Result<(), terror::Error> {
+        let crnt_bidi_limit = self.limits[(self.local ^ 0x01) as usize];
+        let crnt_bidi_seq = self.counts[(self.local ^ 0x01) as usize];
+
+        // MAYBE change to something more sophisticated
+        if crnt_bidi_limit - crnt_bidi_seq < MAX_STREAMS_TRIGGER && buf.cap() >= 0x02 {
+            buf.put_varint(0x12)?;
+            buf.put_varint(crnt_bidi_limit + MAX_STREAMS_UPGRADE)?;
+            self.limits[(self.local ^ 0x01) as usize] += MAX_STREAMS_UPGRADE;
+        }
+
+        let crnt_uni_limit = self.limits[(self.local ^ 0x01 | 0x02) as usize];
+        let crnt_uni_seq = self.counts[(self.local ^ 0x01 | 0x02) as usize];
+
+        if crnt_uni_limit - crnt_uni_seq < MAX_STREAMS_TRIGGER && buf.cap() >= 0x02 {
+            buf.put_varint(0x13)?;
+            buf.put_varint(crnt_uni_limit + MAX_STREAMS_UPGRADE)?;
+            self.limits[(self.local ^ 0x01 | 0x02) as usize] += MAX_STREAMS_UPGRADE;
+        }
 
         Ok(())
     }
@@ -247,29 +388,25 @@ impl<C: StreamCallback> StreamManager<C> {
         None
     }
 
-    // creates a new stream with a given stream id
+    // creates a new stream with a given stream type and stream sequence. does not error check
     fn create(
         &mut self,
-        stream_id: StreamId,
+        stream_t: u64,
+        stream_s: u64,
         priority: Option<StreamPriority>,
         local: bool,
         max_data_send: u64,
-        _max_data_recv: u64,
-    ) -> Result<(), terror::Error> {
-        if self.inbound.contains_key(&stream_id) || self.outbound.contains_key(&stream_id) {
-            return Err(terror::Error::stream_error("stream does already exist"));
+        max_data_recv: u64,
+    ) -> StreamId {
+        if stream_s >= self.counts[stream_t as usize] {
+            self.counts[stream_t as usize] = stream_s + 1;
         }
 
-        let stream_t = stream_id & STREAM_TYPE;
-        let sequence = stream_id >> 2;
-
-        if sequence >= self.counts[stream_t as usize] {
-            self.counts[stream_t as usize] = sequence + 1;
-        }
+        let stream_id = stream_t | (stream_s << 2);
 
         if stream_t == CLIENT_INIT_BIDI || stream_t == SERVER_INIT_BIDI {
             self.inbound
-                .insert(stream_id, RecvStreamInner::new(priority));
+                .insert(stream_id, RecvStreamInner::new(priority, max_data_recv));
             self.outbound
                 .insert(stream_id, SendStreamInner::new(priority, max_data_send));
         } else if (stream_t == CLIENT_INIT_UNI || stream_t == SERVER_INIT_UNI) && local {
@@ -279,49 +416,54 @@ impl<C: StreamCallback> StreamManager<C> {
         } else if (stream_t == CLIENT_INIT_UNI || stream_t == SERVER_INIT_UNI) && !local {
             // if it is not locally created it must be inbound
             self.inbound
-                .insert(stream_id, RecvStreamInner::new(priority));
+                .insert(stream_id, RecvStreamInner::new(priority, max_data_recv));
         }
 
         debug!("created stream {{id: {stream_id}}}");
 
-        Ok(())
+        stream_id
     }
 
     // issues a new stream id and creates a new stream
+    // TODO add callback to be invoked as soon as new streams can be initiated
     pub fn initiate(
         &mut self,
         bidi: bool,
         priority: Option<StreamPriority>,
     ) -> Result<Option<StreamId>, terror::Error> {
-        // issue new stream id, start with locality
-        let mut id = self.local as u64;
+        // deduct stream type from locality and bidirectionality
+        let mut stream_t = self.local as u64;
+        stream_t |= (!bidi as u64) << 1;
 
-        // a bit of parsing to add bidirectionality to id
-        id |= (!bidi as u64) << 1;
+        // get next sequence number
+        let sequence = self.counts[stream_t as usize];
 
-        let sequence = self.counts[id as usize];
-
-        // check peer limits
-        if self.limits[id as usize] <= sequence {
-            warn!("reached stream limit for stream type {id}");
+        // check peer's limits
+        let limit = self.limits[stream_t as usize];
+        if limit == 0 || sequence > limit - 1 {
+            warn!("reached stream limit for stream type {stream_t}");
             return Ok(None);
         }
 
-        // now add sequence number aka the inner id
-        id |= sequence << 2;
-
-        let initial_max_data = match bidi {
-            false => self.initial_stream_data_limits.max_stream_data_uni,
-            true => self.initial_stream_data_limits.max_stream_data_bidi_remote,
+        // set initial recv and send limit for peer created inbound stream, either bidi or uni
+        let (initial_max_data_send, initial_max_data_recv) = match bidi {
+            false => (self.initial_outbound_limits.max_stream_data_uni, 0),
+            true => (
+                self.initial_outbound_limits.max_stream_data_bidi_remote,
+                self.initial_inbound_limits.max_stream_data_bidi_local,
+            ),
         };
 
-        // TODO max data for receiving end
-        self.create(id, priority, true, initial_max_data, 0)?;
-
-        Ok(Some(id))
+        Ok(Some(self.create(
+            stream_t,
+            sequence,
+            priority,
+            true,
+            initial_max_data_send,
+            initial_max_data_recv,
+        )))
     }
 
-    //TODO check stream limits
     pub fn incoming(
         &mut self,
         stream_id: u64,
@@ -330,28 +472,57 @@ impl<C: StreamCallback> StreamManager<C> {
         fin: bool,
         data: &[u8],
     ) -> Result<(), terror::Error> {
+        // validate against flow control limit. use current len as off
+        self.flow_control
+            .validate(self.flow_control.len(), length)?;
+
         if let Some(rs) = self.inbound.get_mut(&stream_id) {
-            return rs.process(offset, length, fin, data);
+            if rs.process(offset, length, fin, data)? {
+                self.pending_max_stream_data.push_back(stream_id);
+            }
+            return Ok(());
         }
 
         if (stream_id & 0x01) == self.local as u64 {
             return Err(terror::Error::stream_error("local stream cant be incoming"));
         }
 
-        // TODO check our limits, return possible error
+        let sequence = stream_id >> 2;
+        let stream_t = stream_id & STREAM_TYPE;
 
-        let initial_max_data = match (stream_id & 0x10) == 0x00 {
-            false => 0, // TODO incoming uni is our limit sent to them
-            true => self.initial_stream_data_limits.max_stream_data_bidi_local,
+        // limit 0 means no streams but id 0 is first stream id
+        let limit = self.limits[stream_t as usize];
+        if limit == 0 || sequence > limit - 1 {
+            return Err(terror::Error::quic_transport_error(
+                "incoming stream exceeds stream limit",
+                terror::QuicTransportError::StreamLimitError,
+            ));
+        }
+
+        // set initial recv and send limit for peer created inbound stream, either bidi or uni
+        let (initial_max_data_send, initial_max_data_recv) = match (stream_id & 0x10) == 0x00 {
+            false => (0, self.initial_inbound_limits.max_stream_data_uni),
+            true => (
+                self.initial_outbound_limits.max_stream_data_bidi_local,
+                self.initial_inbound_limits.max_stream_data_bidi_remote,
+            ),
         };
 
         // because stream is incoming it cant be local
-        // TODO max data for receiving end
-        self.create(stream_id, None, false, initial_max_data, 0)?;
+        self.create(
+            stream_t,
+            sequence,
+            None,
+            false,
+            initial_max_data_send,
+            initial_max_data_recv,
+        );
 
         // unwrap is safe because stream was created
         let recv_s = self.inbound.get_mut(&stream_id).unwrap();
-        recv_s.process(offset, length, fin, data)?;
+        if recv_s.process(offset, length, fin, data)? {
+            self.pending_max_stream_data.push_back(stream_id);
+        }
 
         // save stream as ready
         let stream_t = (stream_id & STREAM_TYPE) as usize;
@@ -430,7 +601,7 @@ impl<C: StreamCallback> StreamManager<C> {
         Ok(())
     }
 
-    // fills the frame with stream frames
+    // fills the buffer with stream frames. encodes (STREAM_)DATA_BLOCKED frames implicitly
     pub fn emit_fill(&mut self, buf: &mut [u8], pn: u64) -> Result<usize, terror::Error> {
         let mut written = 0;
         let mut remaining = buf.len();
@@ -444,6 +615,18 @@ impl<C: StreamCallback> StreamManager<C> {
 
             remaining -= b;
             written += b;
+        }
+
+        // DATA BLOCKED
+        let data_blocked_len = varint_len(0x14) + varint_len(self.max_data as u64);
+        if self.max_data == self.sent && data_blocked_len <= buf.len() - written {
+            trace!("connection data blocked at {}", self.max_data);
+
+            let mut octets = octets::OctetsMut::with_slice(&mut buf[written..]);
+            octets.put_varint(0x14)?;
+            octets.put_varint(self.max_data as u64)?;
+
+            written += data_blocked_len;
         }
 
         Ok(written)
@@ -503,17 +686,25 @@ impl<C: StreamCallback> StreamManager<C> {
         rest.put_varint(*ss_id)?;
 
         if stream_off > 0 {
-            stream_header |= 0x04; //OFF
+            stream_header |= 0x04; // OFF
             rest.put_varint(stream_off as u64)?;
         }
 
-        if rest.cap() > rel_length {
+        let fc_len = std::cmp::min(rel_length, self.max_data - self.sent);
+
+        // edge case where length field encoding length plus data length is exactly the buffer
+        // length, length field must be included. should be reinvestigated but I cant think of any
+        // other or betteror better solution right now
+        if rest.cap() >= fc_len + varint_len(fc_len as u64) {
             // length field has to be included
             stream_header |= 0x02;
-            overhead += rest.put_varint(rel_length as u64)?.len();
+            overhead += rest.put_varint(fc_len as u64)?.len();
         }
 
-        let (data_len, fin) = ss.emit(rest.as_mut(), pn)?;
+        // compute flow control send limit
+        let fc_limit = std::cmp::min(rest.cap(), fc_len);
+
+        let (data_len, fin) = ss.emit(&mut rest.as_mut()[..fc_limit], pn)?;
 
         if fin {
             stream_header |= 0x01;
@@ -528,8 +719,6 @@ impl<C: StreamCallback> StreamManager<C> {
 
         // write stream header last
         stream_header_raw.put_u8(stream_header)?;
-
-        debug!("STREAM frame: id {ss_id} off {stream_off} len {data_len} fin {fin}");
 
         if !ss.readable() {
             self.outbound_ready.remove(&(*p, *ss_id));
@@ -576,7 +765,6 @@ impl<C: StreamCallback> StreamManager<C> {
 }
 
 // TODO retransmits
-// TODO peer fc limits
 struct SendStreamInner {
     // data chunks ordered in outgoing direction
     data: VecDeque<Chunk>,
@@ -617,7 +805,6 @@ impl SendStreamInner {
             length: 0,
             off: 0,
             max_data,
-            //sent: 0,
         }
     }
 
@@ -645,12 +832,12 @@ impl SendStreamInner {
         (self.length - self.off) > 0
     }
 
-    //peeks sendable data to be able to build stream frame. returns (off, rel_len)
+    // peeks sendable data to be able to build stream frame. returns (off, rel_len)
     fn peek(&self) -> (usize, usize) {
         (self.off, self.length - self.off)
     }
 
-    //emits data to be sent
+    // emits data to be sent
     fn emit(&mut self, buf: &mut [u8], pn: u64) -> Result<(usize, bool), terror::Error> {
         if self.apec.is_some() {
             return Err(terror::Error::stream_error("stream has been reset"));
@@ -664,12 +851,12 @@ impl SendStreamInner {
         let mut fin = false;
 
         while remaining > 0 {
-            //take first chunk
+            // take first chunk
             let Some(mut chunk) = self.data.pop_front() else {
                 break;
             };
 
-            //check if there is anything in the current chunk to read
+            // check if there is anything in the current chunk to read
             if chunk.is_empty() {
                 warn!("zero sized chunk occured");
                 continue;
@@ -677,7 +864,7 @@ impl SendStreamInner {
 
             let to_write = std::cmp::min(remaining, chunk.len());
 
-            //split chunk if neccessary
+            // split chunk if neccessary
             if to_write < chunk.len() {
                 let rest = chunk.split_at(to_write);
                 self.data.push_front(rest);
@@ -687,20 +874,19 @@ impl SendStreamInner {
 
             fin = chunk.fin;
 
-            //enter chunk into pending
+            // enter chunk into pending
             self.pending.insert(pn, chunk);
 
             written += to_write;
             remaining -= to_write;
         }
 
-        // TODO only add if new data is being sent
+        // TODO only add if new data is being sent, i.e. no retransmits
         self.off += written;
 
         Ok((written, fin))
     }
 
-    // TODO flow control limits
     fn append(&mut self, data: &[u8], fin: bool) -> Result<usize, terror::Error> {
         if self.final_size.is_some() {
             return Err(terror::Error::stream_error(
@@ -736,79 +922,75 @@ impl SendStreamInner {
 }
 
 struct RecvStreamInner<C: StreamCallback> {
-    //data chunks ordered by their offset
+    // data chunks ordered by their offset
     data: IndexMap<u64, Chunk>,
 
-    //keeps track of gaps in received data. must be sorted at all times
+    // keeps track of gaps in received data. must be sorted at all times
     gaps: Vec<Range<u64>>,
 
-    //highest offset received
-    max_off: u64,
-
-    //highest chunk offset into [`data`] that has been read
+    // highest chunk offset into [`data`] that has been read
     max_read: u64,
 
-    //number of bytes that have been read from the stream
+    // number of bytes that have been read from the stream
     bytes_read: usize,
 
-    //received stream frame with offset 0
+    // received stream frame with offset 0
     start_recv: bool,
 
-    //final size in case of reset
+    // final size in case of reset
     final_size: Option<u64>,
 
-    //application error code received via reset
+    // application error code received via reset
     apec: Option<u64>,
 
-    //stream priority
+    // stream priority
     prio: StreamPriority,
 
     // stream level flow control for our receiving end
     flow_control: fc::FlowControl,
 
-    //Callback, triggered when either a) new incoming data is available b) the stream is reset
+    // Callback, triggered when either a) new incoming data is available b) the stream is reset
     callback: Option<C>,
 }
 
 impl<C: StreamCallback> RecvStreamInner<C> {
-    fn new(priority: Option<StreamPriority>) -> Self {
+    fn new(priority: Option<StreamPriority>, max_data: u64) -> Self {
         Self {
             data: IndexMap::new(),
             gaps: Vec::new(),
-            max_off: 0,
             max_read: 0,
             bytes_read: 0,
             start_recv: false,
             final_size: None,
             apec: None,
             prio: priority.unwrap_or(u8::MAX),
-            flow_control: fc::FlowControl::default(),
+            flow_control: fc::FlowControl::with_max_data(max_data, fc::MAX_WINDOW_STREAM),
             callback: None,
         }
     }
 
-    //processes a single stream frame on the receiving end. should a gap emerge, incoming frames
-    //which have not been received already are matched to those gaps via their offset. Per RFC 9000 sec.
-    //2.2: The data at a given offset MUST NOT change if it is sent multiple times; an endpoint MAY
-    //  treat receipt of different data at the same offset within a stream as a connection error of
-    //  type PROTOCOL_VIOLATION.
-    //Therefore if a frame cannot be matched to a gap and no already received offset with matching
-    //length exists, a Quic Transport Error is thrown.
+    // processes a single stream frame on the receiving end. should a gap emerge, incoming frames
+    // which have not been received already are matched to those gaps via their offset. Per RFC 9000 sec.
+    // 2.2: The data at a given offset MUST NOT change if it is sent multiple times; an endpoint MAY
+    //   treat receipt of different data at the same offset within a stream as a connection error of
+    //   type PROTOCOL_VIOLATION.
+    // Therefore if a frame cannot be matched to a gap and no already received offset with matching
+    // length exists, a Quic Transport Error is thrown. Returns wether flow control is nearly full.
     fn process(
         &mut self,
         offset: u64,
         length: u64,
         fin: bool,
         data: &[u8],
-    ) -> Result<(), terror::Error> {
-        //check if offset and length match any already received chunks
+    ) -> Result<bool, terror::Error> {
+        // check if offset and length match any already received chunks
         if let Some(chunk) = self.data.get(&offset) {
             if chunk.len == length as usize {
-                return Ok(());
+                return Ok(self.flow_control.nearly_full());
             }
         }
 
-        //if the stream has been reset or an offset is higher than the final
+        // if the stream has been reset or an offset is higher than the final
         if self.apec.is_some() {
             return Err(terror::Error::stream_error(
                 "cannot process frame: stream reset",
@@ -816,9 +998,7 @@ impl<C: StreamCallback> RecvStreamInner<C> {
         }
 
         //if chunk with offset zero is received, we can emit
-        if offset == 0 {
-            self.start_recv = true;
-        }
+        self.start_recv = (offset == 0 && !self.start_recv) || (offset != 0 && self.start_recv);
 
         if let Some(fsize) = self.final_size {
             if offset > fsize {
@@ -829,7 +1009,10 @@ impl<C: StreamCallback> RecvStreamInner<C> {
             }
         }
 
-        //check if offset and length match to any known gaps and insert chunk
+        // flow control validation, can return QuicTransportError
+        self.flow_control.validate(offset, length)?;
+
+        // check if offset and length match to any known gaps and insert chunk
         if let Some(i) = self.match_offset_to_gap(offset) {
             let gap = self.gaps.remove(i);
 
@@ -844,12 +1027,12 @@ impl<C: StreamCallback> RecvStreamInner<C> {
             let upper = offset + length..gap.end;
 
             if !lower.is_empty() {
-                //insert lower gap as new range
+                // insert lower gap as new range
                 self.insert_gap(lower);
             }
 
             if !upper.is_empty() {
-                //inser upper gap
+                // insert upper gap
                 self.insert_gap(upper);
             }
         } else {
@@ -862,11 +1045,9 @@ impl<C: StreamCallback> RecvStreamInner<C> {
             }
         }
 
-        //insert chunk into sorted list
+        // insert chunk into sorted list
         self.data
             .insert_sorted(offset, Chunk::new(data, offset, fin));
-
-        self.max_off = std::cmp::max(self.max_off, offset);
 
         if fin {
             self.final_size = Some(offset + length);
@@ -877,7 +1058,12 @@ impl<C: StreamCallback> RecvStreamInner<C> {
             c.invoke();
         }
 
-        Ok(())
+        Ok(self.flow_control.nearly_full())
+    }
+
+    fn upgrade_max_data(&mut self) -> u64 {
+        self.flow_control.adjust_window_size(false);
+        self.flow_control.poll_max_data()
     }
 
     fn reset(&mut self, apec: u64, final_size: u64) -> Result<(), terror::Error> {
@@ -893,7 +1079,7 @@ impl<C: StreamCallback> RecvStreamInner<C> {
             }
         }
 
-        if final_size < (self.max_off + self.data.get(&self.max_off).unwrap().len as u64) {
+        if final_size < self.flow_control.len() {
             return Err(terror::Error::quic_transport_error(
                 "final size is smaller than already received stream length",
                 terror::QuicTransportError::FinalSizeError,
@@ -1091,6 +1277,8 @@ impl std::ops::Deref for Chunk {
 
 #[cfg(test)]
 mod tests {
+    use fc::InitialStreamDataLimits;
+
     use super::*;
 
     impl<C: StreamCallback> RecvStreamInner<C> {
@@ -1114,17 +1302,19 @@ mod tests {
                 final_size = Some(data.len() as u64);
             }
 
+            let mut flow_control = fc::FlowControl::with_max_data(1024, fc::MAX_WINDOW_CONNECTION);
+            flow_control.validate(off, data.len() as u64).unwrap();
+
             Self {
                 data: map,
                 gaps,
-                max_off: off,
                 max_read: 0,
                 bytes_read: 0,
                 start_recv,
                 final_size,
                 apec: None,
                 prio: u8::MAX,
-                flow_control: fc::FlowControl::default(),
+                flow_control,
                 callback: None,
             }
         }
@@ -1148,7 +1338,8 @@ mod tests {
 
     #[test]
     fn stream_manager_create_as_server() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
         sm.set_max_streams_bidi(2);
         sm.set_max_streams_uni(2);
 
@@ -1166,31 +1357,28 @@ mod tests {
 
     #[test]
     fn stream_manager_create_stream_without_limit() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
         sm.set_max_streams_bidi(1);
         sm.set_max_streams_uni(1);
 
-        assert!(!sm.bidi_streams_blocked());
-        assert!(!sm.uni_streams_blocked());
-
         let bidi1 = sm.initiate(true, None).unwrap();
-        let bidi2 = sm.initiate(true, None).unwrap();
+        let bidi2 = sm.initiate(true, None);
 
         let uni1 = sm.initiate(false, None).unwrap();
-        let uni2 = sm.initiate(false, None).unwrap();
+        let uni2 = sm.initiate(false, None);
 
         assert_eq!(bidi1.unwrap(), 0x01);
-        assert_eq!(bidi2, None);
-        assert_eq!(uni1.unwrap(), 0x03);
-        assert_eq!(uni2, None);
+        assert!(bidi2.unwrap().is_none());
 
-        assert!(sm.bidi_streams_blocked());
-        assert!(sm.uni_streams_blocked());
+        assert_eq!(uni1.unwrap(), 0x03);
+        assert!(uni2.unwrap().is_none());
     }
 
     #[test]
     fn stream_manager_create_as_client() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Client as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Client as u8);
         sm.set_max_streams_bidi(2);
         sm.set_max_streams_uni(2);
 
@@ -1208,7 +1396,18 @@ mod tests {
 
     #[test]
     fn stream_manager_incoming_as_server() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig {
+            initial_inbound_limits: InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 8,
+                max_stream_data_uni: 8,
+                ..InitialStreamDataLimits::default()
+            },
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 3,
+            initial_max_uni_streams: 1,
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
 
         let bidi1 = 0x00;
         let bidi2 = 0x04;
@@ -1218,7 +1417,7 @@ mod tests {
 
         sm.incoming(bidi3, 0, 8, true, &[1u8; 8]).unwrap();
 
-        assert_eq!(sm.counts[0], 3);
+        assert_eq!(sm.counts[0x00], 3);
         assert!(sm.inbound.get(&bidi3).is_some());
         assert!(sm.outbound.get(&bidi3).is_some());
 
@@ -1234,14 +1433,15 @@ mod tests {
 
         sm.incoming(uni1, 0, 8, true, &[1u8; 8]).unwrap();
 
-        assert_eq!(sm.counts[2], 1);
+        assert_eq!(sm.counts[0x02], 1);
         assert!(sm.inbound.get(&uni1).is_some());
         assert!(sm.outbound.get(&uni1).is_none());
     }
 
     #[test]
     fn stream_manager_wrong_id_type_as_server() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
 
         // server init bidi recv as server should fail
         let bidi = 0x05;
@@ -1251,10 +1451,13 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_single() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
         sm.set_max_streams_uni(1);
         sm.set_max_data(8);
         sm.set_initial_data_limits(0, 0, 8);
+
         let mut result = [0u8; 10];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -1265,7 +1468,7 @@ mod tests {
             (u8::MAX, send_stream.unwrap())
         );
 
-        assert!(!sm.data_blocked());
+        assert!(sm.max_data >= sm.sent);
 
         let written = sm.emit_single(&mut result, 0x00).unwrap();
 
@@ -1276,12 +1479,22 @@ mod tests {
         assert_eq!(written, 10);
         assert!(sm.outbound_ready.is_empty());
         assert_eq!(sm.sent, 8);
-        assert!(sm.data_blocked());
+        assert!(sm.max_data <= sm.sent);
     }
 
     #[test]
     fn stream_manager_incoming_stream_id_gap() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig {
+            initial_inbound_limits: InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 8,
+                ..InitialStreamDataLimits::default()
+            },
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 3,
+            initial_max_uni_streams: 0,
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
 
         let bidi1 = 0x04;
         sm.incoming(bidi1, 0, 8, false, &[1u8; 8]).unwrap();
@@ -1303,7 +1516,17 @@ mod tests {
 
     #[test]
     fn stream_manager_poll_ready() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig {
+            initial_inbound_limits: InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 8,
+                ..InitialStreamDataLimits::default()
+            },
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 1,
+            initial_max_uni_streams: 0,
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
 
         let bidi1 = 0x00;
         sm.incoming(bidi1, 0, 8, true, &[1u8; 8]).unwrap();
@@ -1318,7 +1541,17 @@ mod tests {
 
     #[test]
     fn stream_manager_poll_ready_multiple() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig {
+            initial_inbound_limits: InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 8,
+                ..InitialStreamDataLimits::default()
+            },
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 2,
+            initial_max_uni_streams: 0,
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
 
         let bidi1 = 0x00;
         sm.incoming(bidi1, 0, 8, true, &[1u8; 8]).unwrap();
@@ -1338,7 +1571,17 @@ mod tests {
 
     #[test]
     fn stream_manager_incoming_invokes_callback() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig {
+            initial_inbound_limits: InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 8,
+                ..InitialStreamDataLimits::default()
+            },
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 1,
+            initial_max_uni_streams: 0,
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
 
         let id = sm.poll_ready(0x00, false);
 
@@ -1354,10 +1597,13 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_single_with_len() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
         sm.set_max_streams_uni(1);
         sm.set_max_data(16);
         sm.set_initial_data_limits(0, 0, 16);
+
         let mut result = [0u8; 16];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -1381,11 +1627,79 @@ mod tests {
     }
 
     #[test]
+    fn stream_manager_emit_data_blocked() {
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
+        sm.set_max_streams_uni(1);
+        sm.set_max_data(0);
+        sm.set_initial_data_limits(0, 0, 0);
+
+        let mut result = [0u8; 16];
+
+        let send_stream = sm.initiate(false, None).unwrap();
+        sm.append(send_stream.unwrap(), &[4u8; 8], true).unwrap();
+
+        assert_eq!(
+            *sm.outbound_ready.first().unwrap(),
+            (u8::MAX, send_stream.unwrap())
+        );
+
+        let written = sm.emit_fill(&mut result, 0x00).unwrap();
+
+        //DATA_BLOCKED frame
+        assert_eq!(result[0], 0x14);
+        assert_eq!(result[1], 0x00);
+
+        assert_eq!(written, 2);
+        assert_eq!(sm.sent, 0);
+    }
+
+    #[test]
+    fn stream_manager_emit_data_blocked_while_emitting() {
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
+        sm.set_max_streams_uni(1);
+        sm.set_max_data(4);
+        sm.set_initial_data_limits(0, 0, 8);
+
+        let mut result = [0u8; 16];
+
+        let send_stream = sm.initiate(false, None).unwrap();
+        sm.append(send_stream.unwrap(), &[2u8; 8], true).unwrap();
+
+        assert_eq!(
+            *sm.outbound_ready.first().unwrap(),
+            (u8::MAX, send_stream.unwrap())
+        );
+
+        let written = sm.emit_fill(&mut result, 0x00).unwrap();
+
+        //STREAM frame
+        assert_eq!(result[0], 0x0a);
+        assert_eq!(result[1] as u64, send_stream.unwrap());
+        assert_eq!(result[2], 4); //LEN
+        assert_eq!(result[3], 2); //DATA BEGIN
+        assert_eq!(result[6], 2); //DATA END
+
+        //DATA_BLOCKED frame
+        assert_eq!(result[7], 0x14);
+        assert_eq!(result[8], 0x04);
+
+        assert_eq!(written, 9);
+        assert_eq!(sm.sent, 4);
+    }
+
+    #[test]
     fn stream_manager_emit_stream_data_blocked() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
         sm.set_max_streams_uni(1);
         sm.set_max_data(16);
         sm.set_initial_data_limits(0, 0, 0);
+
         let mut result = [0u8; 16];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -1407,10 +1721,13 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_single_multiple() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
         sm.set_max_streams_uni(1);
         sm.set_max_data(32);
         sm.set_initial_data_limits(0, 0, 20);
+
         let mut result = [0u8; 32];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -1447,10 +1764,13 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_with_prio() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
         sm.set_max_streams_uni(2);
         sm.set_max_data(32);
         sm.set_initial_data_limits(0, 0, 48);
+
         let mut result = [0u8; 32];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -1490,10 +1810,13 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_and_modifiy_stream_prio() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
         sm.set_max_streams_uni(3);
         sm.set_max_data(32);
         sm.set_initial_data_limits(0, 0, 64);
+
         let mut result = [0u8; 32];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -1542,10 +1865,13 @@ mod tests {
 
     #[test]
     fn stream_manager_emit_fill() {
-        let mut sm = StreamManager::<TestStreamWaker>::new(rustls::Side::Server as u8);
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
         sm.set_max_data(48);
         sm.set_max_streams_uni(3);
         sm.set_initial_data_limits(0, 0, 64);
+
         let mut result = [0u8; 48];
 
         let send_stream = sm.initiate(false, None).unwrap();
@@ -1599,12 +1925,76 @@ mod tests {
     }
 
     #[test]
+    fn stream_manager_poll_max_data() {
+        let config = StreamManagerConfig {
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 1,
+            initial_inbound_limits: fc::InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 1024,
+                ..InitialStreamDataLimits::default()
+            },
+            ..StreamManagerConfig::default()
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
+        let bidi1 = 0x00;
+        sm.incoming(bidi1, 0, 800, true, &[1u8; 800]).unwrap();
+
+        assert_eq!(sm.flow_control.len(), 800);
+
+        let n_md = sm.upgrade_max_data();
+
+        assert_eq!(n_md, 1024 + 2048);
+    }
+
+    #[test]
+    fn stream_manager_upgrade_peer_stream_limits() {
+        let config = StreamManagerConfig {
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 2,
+            initial_max_uni_streams: 2,
+            initial_inbound_limits: fc::InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 1024,
+                ..InitialStreamDataLimits::default()
+            },
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
+        let bidi1 = 0x00;
+        sm.incoming(bidi1, 0, 800, true, &[1u8; 800]).unwrap();
+
+        let mut buf_r = [0u8; 10];
+        let mut buf = octets::OctetsMut::with_slice(&mut buf_r);
+
+        sm.upgrade_peer_stream_limits(&mut buf).unwrap();
+
+        assert_eq!(buf_r[0], 0x12);
+        assert_eq!(buf_r[1], 0x07);
+        assert_eq!(buf_r[2], 0x00);
+
+        assert_eq!(sm.limits[(sm.local ^ 0x01) as usize], 0x07);
+    }
+
+    #[test]
+    fn recv_stream_poll_max_stream_data() {
+        let data = vec![1u8; 800];
+
+        let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&data, 0, false);
+
+        let n_msd = recv_stream.upgrade_max_data();
+
+        assert_eq!(n_msd, 1024 + 2048);
+    }
+
+    #[test]
     fn recv_stream_creation() {
         let data = vec![1u8; 8];
 
         let recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&data, 0, true);
 
-        assert_eq!(recv_stream.max_off, 0);
+        assert_eq!(recv_stream.flow_control.len(), 8);
         assert_eq!(recv_stream.final_size.unwrap(), 8);
     }
 
@@ -1618,7 +2008,7 @@ mod tests {
         assert!(recv_stream.process(16, 8, true, &frame3).is_ok());
 
         assert_eq!(recv_stream.gaps[0], 8..16);
-        assert_eq!(recv_stream.max_off, 16);
+        assert_eq!(recv_stream.flow_control.len(), 24);
         assert_eq!(recv_stream.final_size.unwrap(), 24);
 
         assert!(recv_stream.process(8, 8, false, &frame2).is_ok());
@@ -1636,7 +2026,7 @@ mod tests {
         assert!(recv_stream.process(32, 8, true, &frame5).is_ok());
 
         assert_eq!(recv_stream.gaps[0], 8..32);
-        assert_eq!(recv_stream.max_off, 32);
+        assert_eq!(recv_stream.flow_control.len(), 40);
         assert_eq!(recv_stream.final_size.unwrap(), 40);
 
         assert!(recv_stream.process(16, 8, false, &frame3).is_ok());

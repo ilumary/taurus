@@ -18,8 +18,10 @@ use rustls::{
     },
     Side,
 };
-use std::{collections::VecDeque, fmt, future, net::SocketAddr, sync::Arc, task::Poll};
-use stream::StreamManager;
+use std::{
+    collections::VecDeque, fmt, future, net::SocketAddr, sync::Arc, task::Poll, time::Instant,
+};
+use stream::{StreamManager, StreamManagerConfig};
 use token::StatelessResetToken;
 use tokio::sync::mpsc;
 use tracing::{debug, error, event, span, warn, Level};
@@ -289,28 +291,28 @@ trait ConnectionApi: Send + Sync {
 }
 
 struct Inner {
-    //side
+    // side
     side: Side,
 
-    //quic version
+    // quic version
     version: u32,
 
-    //pollable events
+    // pollable events
     events: Vec<InnerEvent>,
 
-    //tls13 session via rustls and keying material
+    // tls13 session via rustls and keying material
     tls_session: RustlsConnection,
     next_secrets: Option<rustls::quic::Secrets>,
     next_1rtt_packet_keys: Option<PacketKeySet>,
     zero_rtt_keyset: Option<DirectionalKeys>,
 
-    //connection state
+    // connection state
     state: ConnectionState,
 
-    //connection id manager
+    // connection id manager
     cidm: ConnectionIdManager,
 
-    //stream manager, does all stream logic
+    // stream manager, does all stream logic
     sm: StreamManager<stream::StreamWaker>,
 
     // Packet number spaces, inital, handshake, 1-RTT
@@ -323,7 +325,7 @@ struct Inner {
     // TransportConfig of remote
     remote_tpc: TransportConfig,
 
-    //0-Rtt enabled
+    // 0-Rtt enabled
     zero_rtt_enabled: bool,
 }
 
@@ -370,6 +372,8 @@ impl Inner {
         server_config: Arc<rustls::ServerConfig>,
         hmac_reset_key: &ring::hmac::Key,
     ) -> Result<(Self, ConnectionId), terror::Error> {
+        let start = Instant::now();
+
         let mut head = packet::Header::from_bytes(buffer, 8).map_err(|e| {
             terror::Error::buffer_size_error(format!(
                 "error decoding header from initial packet: {}",
@@ -443,8 +447,10 @@ impl Inner {
             ..TransportConfig::default()
         };
 
-        let mut sm = StreamManager::new(Side::Server as u8);
-        sm.fill_initial_local_tpc(&mut tpc, 1, 0)?;
+        let smc = StreamManagerConfig::new(1, 0);
+
+        let mut sm = StreamManager::new(smc, Side::Server as u8);
+        sm.fill_initial_local_tpc(&mut tpc)?;
 
         let data = tpc.encode(Side::Server)?;
 
@@ -488,8 +494,11 @@ impl Inner {
             zero_rtt_enabled: false,
         };
 
-        //process inital packet inside connection, all subsequent packets are sent through channel
+        // process inital packet inside connection, all subsequent packets are sent through channel
         inner.process_initial_packet(&head, buffer)?;
+
+        // initial packet processing time
+        let _m = start.elapsed().as_millis() as f64;
 
         Ok((inner, initial_local_scid))
     }
@@ -558,6 +567,7 @@ impl Inner {
         packet: &mut [u8],
         header: &mut Header,
     ) -> Result<usize, terror::Error> {
+        let start = Instant::now();
         debug!("H: {}", header);
 
         //zero rtt
@@ -643,6 +653,9 @@ impl Inner {
         let (mut payload, _) = payload_cipher.split_at(dec_len)?;
 
         self.process_payload(header, &mut payload)?;
+
+        // calucate ema
+        let _ppt = start.elapsed().as_nanos() as f64;
 
         Ok(raw_packet_length)
     }
@@ -793,17 +806,33 @@ impl Inner {
                         .incoming(stream_id, offset, length, fin_bit_set, stream_data.buf())?;
                 } //STREAM
                 0x10 => {
-                    let _max_data = payload.get_varint()?;
+                    let max_data = payload.get_varint()?;
+
+                    self.sm.set_max_data(max_data);
+
+                    debug!("set max_data to {max_data}");
                 } //MAX_DATA
                 0x11 => {
-                    let _stream_id = payload.get_varint()?;
-                    let _max_data = payload.get_varint()?;
+                    let stream_id = payload.get_varint()?;
+                    let max_data = payload.get_varint()?;
+
+                    self.sm.set_max_stream_data(max_data, stream_id)?;
+
+                    debug!("set max_stream_data of {stream_id} to {max_data}");
                 } //MAX_STREAM_DATA
                 0x12 => {
-                    let _maximum_streams = payload.get_varint()?;
+                    let max_streams = payload.get_varint()?;
+
+                    self.sm.set_max_streams_bidi(max_streams);
+
+                    debug!("set max bidi streams to {max_streams}");
                 } //MAX_STREAMS (bidirectional)
                 0x13 => {
-                    let _maximum_streams = payload.get_varint()?;
+                    let max_streams = payload.get_varint()?;
+
+                    self.sm.set_max_streams_uni(max_streams);
+
+                    debug!("set max uni streams to {max_streams}");
                 } //MAX_STREAMS (unidirectional)
                 0x14 => {
                     let _maximum_data = payload.get_varint()?;
@@ -1141,12 +1170,40 @@ impl Inner {
 
             //stream frames
             if packet_type == packet::PacketType::Short {
-                let sframe_len = self.sm.emit_fill(buf.as_mut(), pn)?;
-                buf.skip(sframe_len)?;
+                // create STREAMS_BLOCKED if bidi streams are blocked
+                if let Some(seq) = self.sm.bidi_streams_blocked() {
+                    debug!("bidi streams blocked at {}", seq);
+                    buf.put_varint(0x16)?;
+                    buf.put_varint(seq)?;
+                }
 
-                // poll for [sending] DATA_BLOCKED, STREAMS_BLOCKED, STREAM_DATA_BLOCKED
+                // create STREAMS_BLOCKED if uni streams are blocked
+                if let Some(seq) = self.sm.uni_streams_blocked() {
+                    debug!("uni streams blocked at {}", seq);
+                    buf.put_varint(0x17)?;
+                    buf.put_varint(seq)?;
+                }
 
-                // poll for [receiving] for MAX_DATA, MAX_STREAMS, MAX_STREAM_DATA
+                // create MAX_STREAM_DATA frames for connection
+                self.sm.upgrade_max_stream_data(&mut buf)?;
+
+                // create MAX_STREAMS to increase our recv stream limit
+                self.sm.upgrade_peer_stream_limits(&mut buf)?;
+
+                // create MAX_DATA for connection
+                if self.sm.nearly_full() && buf.cap() >= 0x0d {
+                    let n_md = self.sm.upgrade_max_data();
+
+                    if buf.cap() >= varint_len(0x10) + varint_len(n_md) {
+                        buf.put_varint(0x10)?;
+                        buf.put_varint(n_md)?;
+                    }
+                }
+
+                // encode stream frame last to ensure enough room for flow control frames.
+                // implicitly encodes DATA_BLOCKED, STREAM_DATA_BLOCKED
+                let bytes = self.sm.emit_fill(buf.as_mut(), pn)?;
+                buf.skip(bytes)?;
             }
 
             //if is last packet, pad to min size of 1200
