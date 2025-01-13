@@ -18,6 +18,7 @@ The QUIC library is still in a very early development stage and a majority of th
 
 * QUIC 1-RTT handshake
 * QUIC stream implementation
+* Flow control
 * Async socket io
 * Full TLS 1.3 integration using <a href="https://github.com/rustls/rustls">rustls</a>
 * Server API for easy integration with HTTP/3 or other application protocols
@@ -28,7 +29,6 @@ Though it may seem to work fine, the core library and its async wrapper lack man
 
 * Async wrapper for core quic library
 * Congestion control with loss detection and retransmissions
-* Flow control
 * Client API implementation
   
 The top level server API design (Client API coming sometime in the future) is heavily inspired by <a href="https://github.com/aws/s2n-quic">Amazons QUIC API design</a>.

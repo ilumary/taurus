@@ -36,6 +36,35 @@ const SPACE_ID_INITIAL: usize = 0x00;
 const SPACE_ID_HANDSHAKE: usize = 0x01;
 const SPACE_ID_DATA: usize = 0x02;
 
+// client impl
+
+pub struct Connector {
+    rx: mpsc::Receiver<Connection>,
+}
+
+impl Connector {
+    async fn connect(&mut self) -> Option<Connection> {
+        self.rx.recv().await
+    }
+}
+
+pub struct Client {
+    connector: Connector,
+}
+
+impl Client {
+    pub async fn connect(&mut self, to: SocketAddr) -> Option<Connection> {
+        // let _ = Inner::connect(to);
+        self.connector.connect().await
+    }
+}
+
+pub struct ClientConfig {
+    client_config: Option<rustls::ClientConfig>,
+}
+
+// server impl
+
 pub struct Acceptor {
     rx: mpsc::Receiver<Connection>,
 }

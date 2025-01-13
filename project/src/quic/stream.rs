@@ -230,6 +230,7 @@ impl<C: StreamCallback> StreamManager<C> {
         self.flow_control.nearly_full()
     }
 
+    // fills flow control values into local transport_parameters config
     pub fn fill_initial_local_tpc(
         &mut self,
         tpc: &mut TransportConfig,
@@ -476,6 +477,7 @@ impl<C: StreamCallback> StreamManager<C> {
         )))
     }
 
+    // handles any incoming stream frame
     pub fn incoming(
         &mut self,
         stream_id: u64,
@@ -2023,6 +2025,80 @@ mod tests {
         assert_eq!(buf_r[2], 0x00);
 
         assert_eq!(sm.limits[(sm.local ^ 0x01) as usize], 0x07);
+    }
+
+    #[test]
+    fn stream_manager_stream_data_limits_as_server() {
+        let config = StreamManagerConfig {
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 2,
+            initial_max_uni_streams: 2,
+            initial_inbound_limits: fc::InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 1024,
+                max_stream_data_bidi_local: 256,
+                max_stream_data_uni: 512,
+            },
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+        sm.set_initial_data_limits(300, 310, 320);
+        sm.set_max_streams_bidi(1);
+
+        // incoming bidi stream
+        let r_bidi = 0x00;
+        sm.incoming(r_bidi, 0, 128, true, &[1u8; 128]).unwrap();
+
+        let ss_r_bidi = sm.outbound.get(&r_bidi).unwrap();
+        let rs_r_bidi = sm.inbound.get(&r_bidi).unwrap();
+
+        assert_eq!(ss_r_bidi.max_data, 300);
+        assert_eq!(rs_r_bidi.flow_control.max_data(), 1024);
+
+        // outgoing bidi stream
+        let s_bidi = sm.initiate(true, None).unwrap().unwrap();
+
+        let ss_s_bidi = sm.outbound.get(&s_bidi).unwrap();
+        let rs_s_bidi = sm.inbound.get(&s_bidi).unwrap();
+
+        assert_eq!(ss_s_bidi.max_data, 310);
+        assert_eq!(rs_s_bidi.flow_control.max_data(), 256);
+    }
+
+    #[test]
+    fn stream_manager_stream_data_limits_as_client() {
+        let config = StreamManagerConfig {
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 2,
+            initial_max_uni_streams: 2,
+            initial_inbound_limits: fc::InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 1024,
+                max_stream_data_bidi_local: 256,
+                max_stream_data_uni: 512,
+            },
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Client as u8);
+        sm.set_initial_data_limits(300, 310, 320);
+        sm.set_max_streams_bidi(1);
+
+        // incoming bidi stream
+        let r_bidi = 0x01;
+        sm.incoming(r_bidi, 0, 128, true, &[1u8; 128]).unwrap();
+
+        let ss_r_bidi = sm.outbound.get(&r_bidi).unwrap();
+        let rs_r_bidi = sm.inbound.get(&r_bidi).unwrap();
+
+        assert_eq!(ss_r_bidi.max_data, 300);
+        assert_eq!(rs_r_bidi.flow_control.max_data(), 1024);
+
+        // outgoing bidi stream
+        let s_bidi = sm.initiate(true, None).unwrap().unwrap();
+
+        let ss_s_bidi = sm.outbound.get(&s_bidi).unwrap();
+        let rs_s_bidi = sm.inbound.get(&s_bidi).unwrap();
+
+        assert_eq!(ss_s_bidi.max_data, 310);
+        assert_eq!(rs_s_bidi.flow_control.max_data(), 256);
     }
 
     #[test]
