@@ -60,6 +60,10 @@ impl FlowControl {
         self.window_size
     }
 
+    pub fn max_data(&self) -> u64 {
+        self.max_data
+    }
+
     // validates an incoming packets len against the current window
     pub fn validate(&mut self, off: u64, len: u64) -> Result<(), terror::Error> {
         if self.max_data < off + len {

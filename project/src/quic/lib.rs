@@ -1190,14 +1190,15 @@ impl Inner {
                 // create MAX_STREAMS to increase our recv stream limit
                 self.sm.upgrade_peer_stream_limits(&mut buf)?;
 
-                // create MAX_DATA for connection
-                if self.sm.nearly_full() && buf.cap() >= 0x0d {
+                // create MAX_DATA for connection, buffer req: frame code (1) + max max_data (8)
+                if self.sm.nearly_full()
+                    && buf.cap()
+                        >= 0x01 + varint_len(self.sm.max_data() + fc::MAX_WINDOW_CONNECTION)
+                {
                     let n_md = self.sm.upgrade_max_data();
 
-                    if buf.cap() >= varint_len(0x10) + varint_len(n_md) {
-                        buf.put_varint(0x10)?;
-                        buf.put_varint(n_md)?;
-                    }
+                    buf.put_varint(0x10)?;
+                    buf.put_varint(n_md)?;
                 }
 
                 // encode stream frame last to ensure enough room for flow control frames.

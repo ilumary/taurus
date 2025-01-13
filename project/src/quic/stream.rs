@@ -222,7 +222,14 @@ impl<C: StreamCallback> StreamManager<C> {
         }
     }
 
-    // TODO test
+    pub fn max_data(&self) -> u64 {
+        self.flow_control.max_data()
+    }
+
+    pub fn nearly_full(&self) -> bool {
+        self.flow_control.nearly_full()
+    }
+
     pub fn fill_initial_local_tpc(
         &mut self,
         tpc: &mut TransportConfig,
@@ -313,10 +320,6 @@ impl<C: StreamCallback> StreamManager<C> {
         self.initial_outbound_limits.max_stream_data_uni = initial_max_stream_data_uni;
     }
 
-    pub fn nearly_full(&self) -> bool {
-        self.flow_control.nearly_full()
-    }
-
     pub fn upgrade_max_data(&mut self) -> u64 {
         // adjust window size without throttling for connection
         self.flow_control.adjust_window_size(false);
@@ -324,6 +327,7 @@ impl<C: StreamCallback> StreamManager<C> {
         self.flow_control.poll_max_data()
     }
 
+    // upgrade max stream data per stream
     pub fn upgrade_max_stream_data(
         &mut self,
         buf: &mut octets::OctetsMut,
@@ -331,13 +335,17 @@ impl<C: StreamCallback> StreamManager<C> {
         while let Some(rs_id) = self.pending_max_stream_data.front() {
             if let Some(rs) = self.inbound.get_mut(rs_id) {
                 // only upgrade max data if enough space is left in buffer, i.e.
-                // 8 (max id) + 4 (max max_data) + 1 (frame code)
-                if buf.cap() >= 0x0d {
+                // id len + max max_data + 1 (frame code)
+                if buf.cap()
+                    >= 0x01 + varint_len(rs.max_data() + fc::MAX_WINDOW_STREAM) + varint_len(*rs_id)
+                {
                     let n_md = rs.upgrade_max_data();
 
                     buf.put_varint(0x11)?;
                     buf.put_varint(*rs_id)?;
                     buf.put_varint(n_md)?;
+
+                    let _ = self.pending_max_stream_data.pop_front();
                 } else {
                     break;
                 }
@@ -357,7 +365,9 @@ impl<C: StreamCallback> StreamManager<C> {
         let crnt_bidi_seq = self.counts[(self.local ^ 0x01) as usize];
 
         // MAYBE change to something more sophisticated
-        if crnt_bidi_limit - crnt_bidi_seq < MAX_STREAMS_TRIGGER && buf.cap() >= 0x02 {
+        if crnt_bidi_limit - crnt_bidi_seq < MAX_STREAMS_TRIGGER
+            && buf.cap() >= 0x01 + varint_len(crnt_bidi_limit + MAX_STREAMS_UPGRADE)
+        {
             buf.put_varint(0x12)?;
             buf.put_varint(crnt_bidi_limit + MAX_STREAMS_UPGRADE)?;
             self.limits[(self.local ^ 0x01) as usize] += MAX_STREAMS_UPGRADE;
@@ -366,7 +376,9 @@ impl<C: StreamCallback> StreamManager<C> {
         let crnt_uni_limit = self.limits[(self.local ^ 0x01 | 0x02) as usize];
         let crnt_uni_seq = self.counts[(self.local ^ 0x01 | 0x02) as usize];
 
-        if crnt_uni_limit - crnt_uni_seq < MAX_STREAMS_TRIGGER && buf.cap() >= 0x02 {
+        if crnt_uni_limit - crnt_uni_seq < MAX_STREAMS_TRIGGER
+            && buf.cap() >= 0x01 + varint_len(crnt_uni_limit + MAX_STREAMS_UPGRADE)
+        {
             buf.put_varint(0x13)?;
             buf.put_varint(crnt_uni_limit + MAX_STREAMS_UPGRADE)?;
             self.limits[(self.local ^ 0x01 | 0x02) as usize] += MAX_STREAMS_UPGRADE;
@@ -967,6 +979,10 @@ impl<C: StreamCallback> RecvStreamInner<C> {
             flow_control: fc::FlowControl::with_max_data(max_data, fc::MAX_WINDOW_STREAM),
             callback: None,
         }
+    }
+
+    fn max_data(&self) -> u64 {
+        self.flow_control.max_data()
     }
 
     // processes a single stream frame on the receiving end. should a gap emerge, incoming frames
@@ -1925,7 +1941,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_manager_poll_max_data() {
+    fn stream_manager_upgrade_max_data() {
         let config = StreamManagerConfig {
             initial_max_data: 1024,
             initial_max_bidi_streams: 1,
@@ -1946,6 +1962,38 @@ mod tests {
         let n_md = sm.upgrade_max_data();
 
         assert_eq!(n_md, 1024 + 2048);
+    }
+
+    #[test]
+    fn stream_manager_upgrade_max_stream_data() {
+        let config = StreamManagerConfig {
+            initial_max_data: 1024,
+            initial_max_bidi_streams: 2,
+            initial_max_uni_streams: 2,
+            initial_inbound_limits: fc::InitialStreamDataLimits {
+                max_stream_data_bidi_remote: 1024,
+                ..InitialStreamDataLimits::default()
+            },
+        };
+
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
+        let bidi1 = 0x00;
+        sm.incoming(bidi1, 0, 800, true, &[1u8; 800]).unwrap();
+
+        let mut buf_r = [0u8; 10];
+        let mut buf = octets::OctetsMut::with_slice(&mut buf_r);
+
+        assert_eq!(*sm.pending_max_stream_data.front().unwrap(), bidi1);
+
+        sm.upgrade_max_stream_data(&mut buf).unwrap();
+
+        assert_eq!(buf_r[0], 0x11);
+        assert_eq!(buf_r[1] as u64, bidi1);
+        assert_eq!(buf_r[2], 0x4c); // varint 3072
+        assert_eq!(buf_r[3], 0x00);
+
+        assert!(sm.pending_max_stream_data.is_empty());
     }
 
     #[test]
@@ -1978,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn recv_stream_poll_max_stream_data() {
+    fn recv_stream_upgrade_max_stream_data() {
         let data = vec![1u8; 800];
 
         let mut recv_stream = RecvStreamInner::<TestStreamWaker>::with_data(&data, 0, false);
