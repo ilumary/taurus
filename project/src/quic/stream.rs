@@ -1,11 +1,9 @@
 use crate::{
-    fc, terror,
-    transport_parameters::{
+    connection::Connection, fc, terror, transport_parameters::{
         InitialMaxData, InitialMaxStreamDataBidiLocal, InitialMaxStreamDataBidiRemote,
         InitialMaxStreamDataUni, InitialMaxStreamsBidi, InitialMaxStreamsUni, TransportConfig,
         VarInt,
-    },
-    Connection,
+    }
 };
 
 use std::{

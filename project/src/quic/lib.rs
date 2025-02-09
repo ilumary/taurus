@@ -1,3 +1,4 @@
+pub mod connection;
 mod fc;
 mod io;
 mod packet;
@@ -6,24 +7,18 @@ pub mod terror;
 mod token;
 mod transport_parameters;
 
-use indexmap::IndexMap;
 use octets::{varint_len, OctetsMut};
 use packet::{AckFrame, ConnectionCloseFrame, Frame, Header};
-use parking_lot::Mutex;
 use rand::RngCore;
 use rustls::{
-    pki_types::{CertificateDer, PrivateKeyDer},
     quic::{
         Connection as RustlsConnection, DirectionalKeys, KeyChange, Keys, PacketKeySet, Version,
     },
     Side,
 };
-use std::{
-    collections::VecDeque, fmt, future, net::SocketAddr, sync::Arc, task::Poll, time::Instant,
-};
+use std::{collections::VecDeque, fmt, net::SocketAddr, sync::Arc, time::Instant};
 use stream::{StreamManager, StreamManagerConfig};
 use token::StatelessResetToken;
-use tokio::sync::mpsc;
 use tracing::{debug, error, event, span, warn, Level};
 use transport_parameters::{
     InitialSourceConnectionId, MaxUdpPayloadSize, OriginalDestinationConnectionId,
@@ -35,289 +30,6 @@ const MAX_CID_SIZE: usize = 20;
 const SPACE_ID_INITIAL: usize = 0x00;
 const SPACE_ID_HANDSHAKE: usize = 0x01;
 const SPACE_ID_DATA: usize = 0x02;
-
-// client impl
-
-pub struct Connector {
-    rx: mpsc::Receiver<Connection>,
-}
-
-impl Connector {
-    async fn connect(&mut self) -> Option<Connection> {
-        self.rx.recv().await
-    }
-}
-
-pub struct Client {
-    connector: Connector,
-}
-
-impl Client {
-    pub async fn connect(&mut self, to: SocketAddr) -> Option<Connection> {
-        // let _ = Inner::connect(to);
-        self.connector.connect().await
-    }
-}
-
-pub struct ClientConfig {
-    client_config: Option<rustls::ClientConfig>,
-}
-
-// server impl
-
-pub struct Acceptor {
-    rx: mpsc::Receiver<Connection>,
-}
-
-impl Acceptor {
-    async fn accept(&mut self) -> Option<Connection> {
-        self.rx.recv().await
-    }
-}
-
-pub struct Server {
-    acceptor: Acceptor,
-    pub address: SocketAddr,
-}
-
-impl Server {
-    pub async fn accept(&mut self) -> Option<Connection> {
-        self.acceptor.accept().await
-    }
-}
-
-pub struct ServerConfig {
-    server_config: Option<rustls::ServerConfig>,
-    address: String,
-}
-
-impl ServerConfig {
-    pub fn new(addr: &str, cert_path: &str, key_path: &str) -> Self {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-
-        let (cert, key) =
-            match std::fs::read(cert_path).and_then(|x| Ok((x, std::fs::read(key_path)?))) {
-                Ok((cert, key)) => (
-                    CertificateDer::from(cert),
-                    PrivateKeyDer::try_from(key).unwrap(),
-                ),
-                Err(e) => {
-                    panic!("failed to read certificate: {}", e);
-                }
-            };
-
-        debug!("loaded cert from {} and key from {}", cert_path, key_path);
-
-        let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.clone()], key)
-            .unwrap();
-
-        ServerConfig {
-            server_config: Some(server_cfg),
-            address: addr.to_string(),
-        }
-    }
-
-    pub fn with_supported_protocols(mut self, protocols: Vec<String>) -> Self {
-        if let Some(ref mut sc) = &mut self.server_config {
-            sc.alpn_protocols = protocols.into_iter().map(|p| p.into_bytes()).collect();
-        }
-        self
-    }
-
-    pub async fn build(self) -> Result<Server, terror::Error> {
-        let (new_connection_tx, new_connection_rx) = mpsc::channel::<Connection>(64);
-        let hmac_reset_key = [0u8; 64];
-        let address = self.address.parse().unwrap();
-
-        let endpoint = Endpoint {
-            connections: IndexMap::<ConnectionId, Arc<LockedInner>>::new(),
-            server_config: Some(Arc::new(
-                self.server_config
-                    .expect("server config should contain valid config"),
-            )),
-            hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
-            new_connection_tx,
-        };
-
-        io::start(endpoint, address).await?;
-
-        Ok(Server {
-            address,
-            acceptor: Acceptor {
-                rx: new_connection_rx,
-            },
-        })
-    }
-}
-
-pub struct Endpoint {
-    //owns the actual connection objects
-    connections: IndexMap<ConnectionId, Arc<LockedInner>>,
-
-    //server config for rustls. Will have to be updated to allow client side endpoint
-    server_config: Option<Arc<rustls::ServerConfig>>,
-
-    //RFC 2104, used to generate reset tokens from connection ids
-    hmac_reset_key: ring::hmac::Key,
-
-    //channels for initial and zero-rtt packets
-    new_connection_tx: mpsc::Sender<Connection>,
-}
-
-pub struct LockedInner(Mutex<Inner>);
-
-impl ConnectionApi for LockedInner {
-    fn poll_recv(
-        &self,
-        cx: &mut std::task::Context,
-        s_id: &u64,
-        buf: &mut [u8],
-    ) -> Poll<Result<Option<usize>, terror::Error>> {
-        let mut conn = self.0.lock();
-        let bytes_read = conn.stream_read(s_id, buf, cx.waker().clone())?;
-
-        match bytes_read {
-            Some(0) => Poll::Pending,
-            _ => Poll::Ready(Ok(bytes_read)),
-        }
-    }
-
-    fn poll_send(
-        &self,
-        _cx: &mut std::task::Context,
-        s_id: &u64,
-        buf: &[u8],
-        fin: bool,
-    ) -> Poll<Result<usize, terror::Error>> {
-        let mut conn = self.0.lock();
-        Poll::Ready(conn.stream_write(*s_id, buf, fin))
-    }
-
-    fn poll_accept(
-        &self,
-        cx: &mut std::task::Context,
-        stream_t: u64,
-        arc: Connection,
-    ) -> Poll<Result<(Option<stream::RecvStream>, Option<stream::SendStream>), terror::Error>> {
-        let mut conn = self.0.lock();
-
-        if let Some(id) = conn.stream_accept(stream_t, cx.waker().clone()) {
-            let mut ss: Option<stream::SendStream> = None;
-            let rs: Option<stream::RecvStream> = Some(stream::RecvStream::new(id, arc.clone()));
-
-            if stream_t == 0x00 {
-                ss = Some(stream::SendStream::new(id, arc.clone()))
-            }
-
-            return Poll::Ready(Ok((rs, ss)));
-        }
-
-        Poll::Pending
-    }
-
-    fn close(
-        &self,
-        _cx: &mut std::task::Context,
-        _reason: &str,
-    ) -> Poll<Result<(), terror::Error>> {
-        Poll::Pending
-    }
-
-    fn application_protocol(&self) -> Option<String> {
-        if let Some(alp) = self.0.lock().tls_session.alpn_protocol() {
-            return Some(String::from_utf8(alp.to_vec()).unwrap());
-        }
-        None
-    }
-
-    fn keep_alive(&self, _enable: bool) {
-        todo!("Connection keep alive has not yet been implemented");
-    }
-
-    fn zero_rtt(&self, _enable: bool) {
-        todo!("zero_rtt enabling/disabling has not yet been implemented");
-    }
-}
-
-pub struct Connection {
-    api: Arc<dyn ConnectionApi>,
-}
-
-impl Connection {
-    pub async fn accept_bidirectional_stream(
-        &self,
-    ) -> Result<(stream::RecvStream, stream::SendStream), terror::Error> {
-        let s = future::poll_fn(|cx| self.api.poll_accept(cx, 0x00, self.clone())).await?;
-        Ok((s.0.unwrap(), s.1.unwrap()))
-    }
-
-    pub async fn accept_unidirectional_stream(&self) -> Result<stream::RecvStream, terror::Error> {
-        let s = future::poll_fn(|cx| self.api.poll_accept(cx, 0x02, self.clone())).await?;
-        Ok(s.0.unwrap())
-    }
-
-    pub async fn open_bidirectional_stream(
-        &self,
-    ) -> Result<(stream::RecvStream, stream::SendStream), terror::Error> {
-        todo!()
-    }
-
-    pub async fn open_unidirectional_stream(&self) -> Result<stream::RecvStream, terror::Error> {
-        todo!()
-    }
-
-    pub async fn close(&self, reason: &str) -> Result<(), terror::Error> {
-        future::poll_fn(|cx| self.api.close(cx, reason)).await
-    }
-
-    pub fn application_protocol(&self) -> Option<String> {
-        self.api.application_protocol()
-    }
-}
-
-impl Clone for Connection {
-    fn clone(&self) -> Self {
-        Self {
-            api: self.api.clone(),
-        }
-    }
-}
-
-trait ConnectionApi: Send + Sync {
-    fn poll_recv(
-        &self,
-        cx: &mut std::task::Context,
-        id: &u64,
-        buf: &mut [u8],
-    ) -> Poll<Result<Option<usize>, terror::Error>>;
-
-    fn poll_send(
-        &self,
-        cx: &mut std::task::Context,
-        id: &u64,
-        buf: &[u8],
-        fin: bool,
-    ) -> Poll<Result<usize, terror::Error>>;
-
-    fn poll_accept(
-        &self,
-        cx: &mut std::task::Context,
-        _stream_t: u64,
-        _arc: Connection,
-    ) -> Poll<Result<(Option<stream::RecvStream>, Option<stream::SendStream>), terror::Error>>;
-
-    fn close(&self, cx: &mut std::task::Context, reason: &str) -> Poll<Result<(), terror::Error>>;
-
-    fn application_protocol(&self) -> Option<String>;
-
-    fn keep_alive(&self, enable: bool);
-
-    fn zero_rtt(&self, enable: bool);
-}
 
 struct Inner {
     // side
@@ -455,8 +167,8 @@ impl Inner {
             decrypted_payload_raw.len()
         };
 
-        //truncate payload is possible because as a server the initial packet from a client cant be
-        //coalesced
+        // truncate payload is possible because as a server the initial packet from a client cant be
+        // coalesced
         buffer.truncate(dec_len);
 
         let initial_local_scid = ConnectionId::generate_with_length(8);
@@ -525,6 +237,8 @@ impl Inner {
 
         // process inital packet inside connection, all subsequent packets are sent through channel
         inner.process_initial_packet(&head, buffer)?;
+
+        inner.state = ConnectionState::Handshake;
 
         // initial packet processing time
         let _m = start.elapsed().as_millis() as f64;
@@ -643,11 +357,11 @@ impl Inner {
         let (header_raw, mut rest) = payload.split_at(header_length)?;
         let mut payload_cipher: OctetsMut;
 
-        //rfc 9000 sec 12.2: Retry packets, Version Negotiation packets, and packets with a
-        //short header do not contain a Length field and so cannot be followed by other
-        //packets in the same UDP datagram
-        //Therefore we only need to trim payload_cipher if we have an initial, handshake or
-        //zero rtt packet
+        // rfc 9000 sec 12.2: Retry packets, Version Negotiation packets, and packets with a
+        // short header do not contain a Length field and so cannot be followed by other
+        // packets in the same UDP datagram
+        // Therefore we only need to trim payload_cipher if we have an initial, handshake or
+        // zero rtt packet
         if header.space() == SPACE_ID_INITIAL
             || header.space() == SPACE_ID_HANDSHAKE
             || ((header.hf & packet::LS_TYPE_BIT) >> 7) == 0x01
@@ -689,7 +403,7 @@ impl Inner {
         Ok(raw_packet_length)
     }
 
-    //accepts new connection
+    // accepts new connection
     fn process_initial_packet(
         &mut self,
         header: &Header,
@@ -697,7 +411,7 @@ impl Inner {
     ) -> Result<(), terror::Error> {
         let mut payload = octets::OctetsMut::with_slice(packet_raw);
 
-        //skip forth to packet payload
+        // skip forth to packet payload
         payload.skip(header.raw_length + header.packet_num_length as usize + 1)?;
 
         self.process_payload(header, &mut payload)?;
@@ -706,7 +420,7 @@ impl Inner {
             self.remote_tpc.update(tpc)?;
         }
 
-        //register stream limits in stream manager
+        // register stream limits in stream manager
         let (imd, imsdbl, imsdbr, imsdu, imsb, imsu) = self.remote_tpc.get_initial_limits();
 
         self.sm.set_initial_data_limits(imsdbl, imsdbr, imsdu);
@@ -726,7 +440,7 @@ impl Inner {
         self.generate_crypto_data(SPACE_ID_INITIAL);
         self.generate_crypto_data(SPACE_ID_HANDSHAKE);
 
-        //init zero rtt if enabled
+        // init zero rtt if enabled
         if self.zero_rtt_enabled {
             if let Some(zero_rtt_keyset) = self.tls_session.zero_rtt_keys() {
                 self.zero_rtt_keyset = Some(zero_rtt_keyset);
@@ -738,9 +452,9 @@ impl Inner {
         Ok(())
     }
 
-    //processes a packets payload. Takes the header of the packet and an OctetsMut object of the
-    //payload starting after the packet number and ending with the last byte of this packets
-    //payload. It must not include another packets header or payload.
+    // processes a packets payload. Takes the header of the packet and an OctetsMut object of the
+    // payload starting after the packet number and ending with the last byte of this packets
+    // payload. It must not include another packets header or payload.
     #[tracing::instrument(skip_all, fields(pn = header.packet_num))]
     fn process_payload(
         &mut self,

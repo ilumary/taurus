@@ -1,4 +1,4 @@
-use quic::{terror, ServerConfig};
+use quic::terror;
 
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
@@ -23,7 +23,7 @@ async fn run() -> Result<(), terror::Error> {
     key_path.push("cert");
     key_path.push("key.der");
 
-    let mut server = ServerConfig::new(
+    let mut server = quic::connection::ServerConfig::new(
         "[::1]:4433",
         "/Users/christophbritsch/Library/Application Support/org.quinn.quinn-examples/cert.der",
         "/Users/christophbritsch/Library/Application Support/org.quinn.quinn-examples/key.der",
