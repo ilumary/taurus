@@ -14,27 +14,33 @@ This repository contains my bachelor thesis from Heinrich-Heine Universität Dü
 
 ## Key Features
 
-The QUIC library is still in a very early development stage and a majority of the features required for any kind of meaningful use are not yet implemented. As I lack the resources of the likes of Amazon, Cloudflare and co, development may only progress slowly. The following features are implemented:
+The QUIC library is still in a early development stage and a majority of the features required for any kind of meaningful use are not yet implemented. As I lack the resources of the likes of Amazon, Cloudflare and co, development may only progress slowly. The following features are implemented:
 
 * QUIC 1-RTT handshake
 * QUIC stream implementation
-* Flow control
-* Async socket io
+* QUIC Flow control
+* Basic async socket io wrapper
 * Full TLS 1.3 integration using <a href="https://github.com/rustls/rustls">rustls</a>
 * Server API for easy integration with HTTP/3 or other application protocols
 
-The current implementation works with <a href="https://github.com/quinn-rs/quinn">quinn's</a> example client implementation as described in the `Run` section. The handshake is completed successfully and the client-initiated bidirectional stream is successfully proccessed on my side. An answer is successfully sent. The required certificate to accept a connection from quinn's client can be found in their repo.
+However, some fundamental features are still incomplete. Therefore, currently in development are:
 
-Though it may seem to work fine, the core library and its async wrapper lack many of the features required for any kind of robust communication. Currently in development are:
-
-* Async wrapper for core quic library
+* Client API
+* Sophisticated and performant async socket io wrapper
 * Congestion control with loss detection and retransmissions
-* Client API implementation
+
+## Extensions
+
+Once the basic QUIC spec is implemented and taurus fully complies with [RFC 9000](https://datatracker.ietf.org/doc/rfc9000), [RFC 9001](https://datatracker.ietf.org/doc/rfc9001), [RFC 9002](https://datatracker.ietf.org/doc/rfc9002), and [RFC 8999](https://datatracker.ietf.org/doc/rfc8999), the following extensions are planned:
+
+* QUIC datagrams, [RFC 9221](https://datatracker.ietf.org/doc/rfc9221)
+* QUIC version negotiation, [RFC 9368](https://www.rfc-editor.org/info/rfc9368)
+* QUIC Version 2, [RFC 3969](https://datatracker.ietf.org/doc/rfc9369/)
+* QUIC Grease bit, [RFC 9287](https://datatracker.ietf.org/doc/rfc9287/)
+* QUIC ACK Frequency, [draft](https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/)
+* QUIC multipath [draft](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/)
+* QUIC BDP frames [draft](https://datatracker.ietf.org/doc/draft-kuhn-quic-bdpframe-extension/)
   
-The top level server API design (Client API coming sometime in the future) is heavily inspired by <a href="https://github.com/aws/s2n-quic">Amazons QUIC API design</a>.
-
-I am also only learning the deep ends of Rust through this project so dont expect top-notch Rust code.
-
 ## Contributing
 
 Feel free to open a <a href="https://github.com/ilumary/taurus/pulls">pull request</a> or report an <a href="https://github.com/ilumary/taurus/issues">issue</a>. All contributions are welcome!
@@ -50,11 +56,11 @@ $ cd taurus/project/ && cargo build
 ```
 
 > **Note**
-> Windows can't be officially supported. Rust should work cross platform though.
+> Windows is not supported, because I want to keep my sanity. Also it does not deserve to be called an operating system.
 
 ## Run
 
-Currently the Client API is not yet implemented. Therefore one has to use an external QUIC implementation to act as Client. I recommend [quinn](https://github.com/quinn-rs/quinn). The local server implementation can be found in [`main.rs`](./project/src/main.rs).
+Until the Client API is implemented, one has to use an external QUIC implementation as Client. I recommend [quinn](https://github.com/quinn-rs/quinn). An example local server implementation can be found in [`main.rs`](./project/src/main.rs).
 
 ```bash
 # Start the server
@@ -65,14 +71,6 @@ Currently the Client API is not yet implemented. Therefore one has to use an ext
 # Start client
 ~/quinn/ $ cargo run --example client https://localhost:4433/Cargo.toml
 ```
-
-## Credits
-
-Taurus uses the following open source packages:
-
-- [rustls](https://github.com/rustls/rustls/)
-- [octets](https://docs.rs/octets/latest/octets/)
-- [ring](https://github.com/briansmith/ring/)
 
 ## Collaborators
 
