@@ -271,72 +271,26 @@ impl Frame for AckFrame {
     }
 }
 
-pub struct ConnectionCloseFrame {
-    error_code: u64,
-    frame_type: Option<u64>,
-    reason_phrase_length: u64,
-    reason_phrase: Vec<u8>,
-    len: usize,
-}
-
-impl Frame for ConnectionCloseFrame {
-    fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self {
-        let begin = bytes.off() - 1;
-        let error_code = bytes.get_varint().unwrap();
-        let mut frame_type: Option<u64> = None;
-
-        if *frame_code == 0x1c {
-            frame_type = Some(bytes.get_varint().unwrap());
-        }
-
-        let reason_phrase_length = bytes.get_varint().unwrap();
-        let reason_phrase = bytes
-            .get_bytes(reason_phrase_length as usize)
-            .unwrap()
-            .to_vec();
-
-        ConnectionCloseFrame {
-            error_code,
-            frame_type,
-            reason_phrase_length,
-            reason_phrase,
-            len: bytes.off() - begin,
-        }
-    }
-
-    fn to_bytes(
-        &self,
-        _bytes: &mut octets::OctetsMut<'_>,
-    ) -> Result<(), octets::BufferTooShortError> {
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
-//TODO add retry token and long header type
 #[derive(Default)]
 pub struct Header {
-    //header form and version specific bits
+    // header form and version specific bits
     pub hf: u8,
     pub version: u32,
     pub dcid: ConnectionId,
     pub scid: Option<ConnectionId>,
     pub token: Option<Vec<u8>>,
 
-    //The following fields are under header protection
+    // the following fields are under header protection
     pub packet_num: u64,
     pub packet_num_length: u8,
 
-    //packet length including packet_num
+    // packet length including packet_num
     pub length: usize,
 
-    //header length excluding packet num
+    // header length excluding packet num
     pub raw_length: usize,
 
-    //packet number space for key retrieval, either 0, 1 or 2
+    // packet number space for key retrieval, either 0, 1 or 2
     space: usize,
 }
 
@@ -619,27 +573,6 @@ impl Header {
         })
     }
 
-    pub fn get_dcid(
-        buffer: &[u8],
-        dcid_len: usize,
-    ) -> Result<ConnectionId, octets::BufferTooShortError> {
-        let mut b = Octets::with_slice(buffer);
-        let hf = b.get_u8()?;
-
-        if ((hf & LS_TYPE_BIT) >> 7) == 0 {
-            //short packet
-            let dcid = b.get_bytes(dcid_len)?;
-            return Ok(<Vec<u8> as Into<ConnectionId>>::into(dcid.to_vec()));
-        }
-
-        let _ = b.get_u32()?;
-
-        let dcid_length = b.get_u8()?;
-        Ok(<Vec<u8> as Into<ConnectionId>>::into(
-            b.get_bytes(dcid_length as usize)?.to_vec(),
-        ))
-    }
-
     pub fn space(&self) -> usize {
         self.space
     }
@@ -656,17 +589,30 @@ impl Header {
 
 impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:#b} version: {:#06x?} pn: {:#010x?} dcid: {} scid: 0x{} token:{:x?} length:{:?} raw_length:{:?}",
-            self.hf,
-            self.version,
-            self.packet_num,
-            self.dcid,
-            self.scid
-                .clone()
-                .unwrap_or(ConnectionId::from_vec(Vec::new())),
-            self.token.as_ref().unwrap_or(&vec![0u8; 0]),
-            self.length,
-            self.raw_length)
+        match (self.hf & 0b1000_0000) >> 7 {
+            0 => {
+                write!(
+                    f,
+                    "SH {:#b} version: {:#06x?} pn: {:#010x?} dcid: {} raw_length:{:?}",
+                    self.hf, self.version, self.packet_num, self.dcid, self.raw_length
+                )
+            }
+            1 => {
+                write!(
+                    f,
+                    "[LH] {:#b} version: {:#06x?} pn: {:#010x?} dcid: {} scid: 0x{} token:{:x?} length:{:?} raw_length:{:?}",
+                    self.hf,
+                    self.version,
+                    self.packet_num,
+                    self.dcid,
+                    self.scid.as_ref().unwrap(),
+                    self.token.as_ref().unwrap_or(&vec![0u8; 0]),
+                    self.length,
+                    self.raw_length
+                )
+            }
+            _ => unreachable!("you just broke the laws of physics"),
+        }
     }
 }
 

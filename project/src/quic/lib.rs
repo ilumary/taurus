@@ -1,14 +1,15 @@
 pub mod connection;
+pub mod terror;
+
 mod fc;
 mod io;
 mod packet;
 mod stream;
-pub mod terror;
 mod token;
 mod transport_parameters;
 
 use octets::{varint_len, OctetsMut};
-use packet::{AckFrame, ConnectionCloseFrame, Frame, Header};
+use packet::{AckFrame, Frame, Header};
 use rand::RngCore;
 use rustls::{
     quic::{
@@ -66,11 +67,24 @@ struct Inner {
     // TransportConfig of remote
     remote_tpc: TransportConfig,
 
+    // application error code
+    apec: Option<u64>,
+
+    // protocol error code, possible frame type
+    pec: Option<(u64, u64)>,
+
+    // tracks the last processed frame type in case of a protocol error
+    lft: u64,
+
     // 0-Rtt enabled
     zero_rtt_enabled: bool,
 }
 
 impl Inner {
+    fn get_current_path(&self) -> SocketAddr {
+        self.remote
+    }
+
     fn stream_accept(
         &mut self,
         stream_t: u64,
@@ -103,10 +117,10 @@ impl Inner {
         self.sm.append(stream_id, buf, fin)
     }
 
-    //creates a connection from an initial packet as a server. Takes the buffer, source address,
-    //server config, hmac reset key and a oneshot channel which gets triggered as soon as the
-    //connection is established. Returns the Connection itself and the initial source connection id which
-    //is now used by the peer as dcid and from which the connection can now be identified.
+    // creates a connection from an initial packet as a server. Takes the buffer, source address,
+    // server config, hmac reset key and a oneshot channel which gets triggered as soon as the
+    // connection is established. Returns the Connection itself and the initial source connection
+    // id which is now used by the peer as dcid and from which the connection can now be identified.
     fn accept(
         buffer: &mut Vec<u8>,
         src_addr: String,
@@ -122,7 +136,7 @@ impl Inner {
             ))
         })?;
 
-        //get initial keys, use default crypto provider by ring with all suites for now
+        // get initial keys, use default crypto provider by ring with all suites for now
         let ikp = Inner::derive_initial_keyset(
             server_config.clone(),
             Version::V1,
@@ -143,13 +157,13 @@ impl Inner {
         let mut b = OctetsMut::with_slice(buffer);
         let (header_raw, mut payload_cipher) = b.split_at(header_length).unwrap();
 
-        //cut off trailing 0s from buffer, substract 1 extra beacuse packet num length of 1 is
-        //encoded as 0...
+        // cut off trailing 0s from buffer, substract 1 extra beacuse packet num length of 1 is
+        // encoded as 0...
         let (mut payload_cipher, _) = payload_cipher
             .split_at(head.length - head.packet_num_length as usize - 1)
             .unwrap();
 
-        //payload cipher must be exact size without zeros from the buffer beeing to big!
+        // payload cipher must be exact size without zeros from the buffer beeing to big!
         let dec_len = {
             let decrypted_payload_raw = match ikp.remote.packet.decrypt_in_place(
                 head.packet_num,
@@ -232,16 +246,18 @@ impl Inner {
             current_space: SPACE_ID_INITIAL,
             remote: src_addr.parse().unwrap(),
             remote_tpc: TransportConfig::default(),
+            apec: None,
+            pec: None,
+            lft: 0x00,
             zero_rtt_enabled: false,
         };
 
-        // process inital packet inside connection, all subsequent packets are sent through channel
+        // process inital packet explicitly to reduce state keeping
+        // no need to check the error type, as the connection is discarded in case of an error
         inner.process_initial_packet(&head, buffer)?;
 
-        inner.state = ConnectionState::Handshake;
-
         // initial packet processing time
-        let _m = start.elapsed().as_millis() as f64;
+        let _m = start.elapsed().as_millis();
 
         Ok((inner, initial_local_scid))
     }
@@ -272,36 +288,57 @@ impl Inner {
             .keys(&dcid.id, side, version)
     }
 
-    fn recv(&mut self, buffer: &mut [u8], _origin: SocketAddr) -> Result<(), terror::Error> {
-        let mut offset: usize = 0;
-        let mut remaining: usize = buffer.len();
+    fn recv(
+        &mut self,
+        buffer: &mut [u8],
+        partial_decode: &mut Header,
+        _origin: SocketAddr,
+    ) -> Result<(), terror::Error> {
+        // in theory that should no happen
+        if self.state == ConnectionState::Closing || self.state == ConnectionState::Closed {
+            return Err(terror::Error::fatal(
+                "cannot recv packet on closed or closing connection",
+            ));
+        }
 
-        loop {
-            let mut partial_decode = match packet::Header::from_bytes(&buffer[offset..], 8) {
-                Ok(h) => h,
-                Err(e) => {
-                    if remaining == 0 {
-                        return Ok(());
+        // process the first packet
+        let mut offset = self.recv_single(buffer, partial_decode).inspect_err(|e| {
+            // Check if we encountered a quic protocol error
+            if (0x01..=0x10).contains(&e.kind()) {
+                self.pec = Some((e.kind(), self.lft));
+                self.state = ConnectionState::Closing;
+            }
+        })?;
+        let mut remaining: usize = buffer.len() - offset;
+
+        debug!("processed packet with {} bytes", offset);
+
+        let mut packet_type = partial_decode.hf >> 7;
+
+        // while the last decoded packet is not a short packet, try and decode coalesced packets
+        while packet_type != 0 && remaining > 0 {
+            let mut partial_decode = packet::Header::from_bytes(&buffer[offset..], 8)?;
+
+            debug!("I {}", &partial_decode);
+
+            packet_type = partial_decode.hf >> 7;
+            let processed_bytes = self
+                .recv_single(&mut buffer[offset..], &mut partial_decode)
+                .inspect_err(|e| {
+                    // Check if we encountered a quic protocol error
+                    if (0x01..=0x10).contains(&e.kind()) {
+                        self.pec = Some((e.kind(), self.lft));
+                        self.state = ConnectionState::Closing;
                     }
+                })?;
 
-                    return Err(terror::Error::buffer_size_error(format!(
-                        "error decoding packet header: {}",
-                        e
-                    )));
-                }
-            };
-
-            let processed_bytes = self.recv_single(&mut buffer[offset..], &mut partial_decode)?;
-
-            debug!(
-                "processed packet with {} bytes. remaining: {}",
-                processed_bytes,
-                remaining - processed_bytes
-            );
+            debug!("processed packet with {} bytes", processed_bytes);
 
             offset += processed_bytes;
             remaining -= processed_bytes;
         }
+
+        Ok(())
     }
 
     #[tracing::instrument(skip_all, fields(space = header.space()))]
@@ -398,7 +435,7 @@ impl Inner {
         self.process_payload(header, &mut payload)?;
 
         // calucate ema
-        let _ppt = start.elapsed().as_nanos() as f64;
+        let _ppt = start.elapsed().as_nanos();
 
         Ok(raw_packet_length)
     }
@@ -449,6 +486,8 @@ impl Inner {
             }
         }
 
+        self.state = ConnectionState::Handshake;
+
         Ok(())
     }
 
@@ -465,6 +504,7 @@ impl Inner {
 
         while payload.peek_u8().is_ok() {
             let frame_code = payload.get_u8().unwrap();
+            self.lft = frame_code as u64;
 
             //check if frame is ack eliciting
             match frame_code {
@@ -625,12 +665,29 @@ impl Inner {
                     let _path_response_data = payload.get_u64()?;
                 } //PATH_RESPONSE
                 0x1c | 0x1d => {
-                    let _connection_close = ConnectionCloseFrame::from_bytes(&frame_code, payload);
-                } //CONNECTION_CLOSE_FRAME
+                    let ec = payload.get_varint()?;
+                    let efc = if frame_code == 0x1c {
+                        payload.get_varint()?
+                    } else {
+                        0
+                    };
+
+                    let rp = std::str::from_utf8(payload.get_bytes_with_varint_length()?.buf())
+                        .unwrap_or("");
+
+                    self.events.push(InnerEvent::ClosedByPeer);
+                    self.state = ConnectionState::Closed;
+
+                    error!("connection closed by peer. error code {ec}, error frame {efc}, reason: {rp}");
+
+                    // TODO reset all streams
+                } // CONNECTION_CLOSE_FRAME
                 0x1e => {
                     if self.side == Side::Server {
-                        error!("Received HANDSHAKE_DONE frame as server");
-                        continue;
+                        return Err(terror::Error::quic_transport_error(
+                            "received HANDSHAKE_DONE frame as server",
+                            terror::QuicTransportError::ProtocolViolation,
+                        ));
                     }
                 } // HANDSHAKE_DONE
                 _ => warn!(
@@ -646,6 +703,10 @@ impl Inner {
                 .outgoing_acks
                 .push(header.packet_num);
         }
+
+        // if we get to here, no error occured and if a protocol error occurs, no frame is the
+        // culprit
+        self.lft = 0x00;
 
         Ok(())
     }
@@ -748,8 +809,13 @@ impl Inner {
         self.packet_spaces[space_id].outgoing_crypto_offset += length;
     }
 
-    //TODO check errors on return: either no error, no_data error or other fatal error
     fn fetch_dgram(&mut self, buffer: &mut [u8]) -> Result<usize, terror::Error> {
+        if self.state == ConnectionState::Closed {
+            return Err(terror::Error::fatal(
+                "cannot fetch packet from closed connection",
+            ));
+        }
+
         let availible = buffer.len();
         let max_payload_size = self.remote_tpc.max_udp_payload_size.get().unwrap().get();
 
@@ -771,7 +837,7 @@ impl Inner {
             .entered();
 
             if packet_type == packet::PacketType::None {
-                //either we're done or we need to throw an error
+                // either we're done or we need to throw an error
                 if encoded_packets == 0 {
                     return Err(terror::Error::no_data("no data to send"));
                 } else {
@@ -825,14 +891,16 @@ impl Inner {
                 )));
             };
 
+            let aead_tag_len = keys.packet.tag_len();
+
             let packet_size_overhead =
-                header.raw_length + header.packet_num_length as usize + 1 + keys.packet.tag_len();
+                header.raw_length + header.packet_num_length as usize + 1 + aead_tag_len;
 
             debug!("packet_size_overhead: {}", packet_size_overhead);
 
-            //check if size overhead for packet fits in rest
+            // check if size overhead for packet fits in rest
             if packet_size_overhead > remaining {
-                //either we're done or we need to throw an error
+                // either we're done or we need to throw an error
                 if encoded_packets == 0 {
                     return Err(terror::Error::buffer_size_error(format!(
                         "insufficient sized buffer for first packet: {}",
@@ -845,7 +913,7 @@ impl Inner {
 
             let mut buf = octets::OctetsMut::with_slice(&mut buffer[written..remaining]);
 
-            //encode header and keep track of where the length field has been encoded
+            // encode header and keep track of where the length field has been encoded
             let mut header_length_offset: usize = 0;
             header.to_bytes(&mut buf, &mut header_length_offset)?;
 
@@ -860,23 +928,66 @@ impl Inner {
                 "header end offset does not match"
             );
 
-            //fill that packet with data
-            //ack frames
-            if !self.packet_spaces[space_id].outgoing_acks.is_empty() {
-                //sort outgoing acks in reverse to ease range building
+            // handle possible error
+            let is_closing = if self.state == ConnectionState::Closing {
+                match packet_type {
+                    packet::PacketType::None | packet::PacketType::Retry => false,
+                    _ => {
+                        if let Some((ec, ef)) = self.pec {
+                            buf.put_varint(0x1c)?;
+                            buf.put_varint(ec)?;
+                            buf.put_varint(ef)?;
+                            buf.put_varint(0x00)?;
+
+                            warn!("encoded error 0x1c {ec} {ef}");
+                        } else if let Some(ec) = self.apec {
+                            match packet_type {
+                                packet::PacketType::Short | packet::PacketType::ZeroRtt => {
+                                    buf.put_varint(0x1d)?;
+                                    buf.put_varint(ec)?;
+                                    buf.put_varint(0x00)?;
+
+                                    warn!("encoded error 0x1d {ec}");
+                                }
+                                packet::PacketType::Initial | packet::PacketType::Handshake => {
+                                    // in case an application error is being raised while still
+                                    // handshaking, encode as quic application error. should not happen
+                                    buf.put_varint(0x1c)?;
+                                    buf.put_varint(
+                                        terror::QuicTransportError::ApplicationError as u64,
+                                    )?;
+                                    buf.put_varint(0x00)?;
+                                    buf.put_varint(0x00)?;
+
+                                    warn!("encoded error 0x1c (app) {ec} 0x00");
+                                }
+                                _ => {}
+                            }
+                        }
+                        true
+                    }
+                }
+            } else {
+                false
+            };
+
+            // fill that packet with data
+            // ack frames
+            if !self.packet_spaces[space_id].outgoing_acks.is_empty() && !is_closing {
+                // sort outgoing acks in reverse to ease range building
                 self.packet_spaces[space_id]
                     .outgoing_acks
                     .sort_by(|a, b| b.cmp(a));
 
                 debug!(
-                    "ACK frame: {:?}",
-                    self.packet_spaces[space_id].outgoing_acks,
+                    "ACK frame: s[{}] {:?}",
+                    space_id, self.packet_spaces[space_id].outgoing_acks,
                 );
 
-                //TODO figure out delay
+                // TODO figure out delay
                 let ack_delay = 64 * (2 ^ self.remote_tpc.ack_delay_exponent.get().unwrap().get());
 
-                //directly generate ack frame from packet number vector
+                // directly generate ack frame from packet number vector
                 let ack_frame = AckFrame::from_packet_number_vec(
                     &self.packet_spaces[space_id].outgoing_acks,
                     ack_delay,
@@ -893,7 +1004,12 @@ impl Inner {
                 self.packet_spaces[space_id].outgoing_acks.clear();
             };
 
-            //crypto frames
+            // clear queued crypto frames in case the connection is beeing closed
+            if is_closing {
+                self.packet_spaces[space_id].outgoing_crypto.clear();
+            }
+
+            // crypto frames
             while let Some((off, data)) = self.packet_spaces[space_id].outgoing_crypto.front() {
                 let enc_len = 1 + varint_len(*off) + varint_len(data.len() as u64) + data.len();
 
@@ -911,8 +1027,8 @@ impl Inner {
                 }
             }
 
-            //stream frames
-            if packet_type == packet::PacketType::Short {
+            // stream frames
+            if packet_type == packet::PacketType::Short && !is_closing {
                 // create STREAMS_BLOCKED if bidi streams are blocked
                 if let Some(seq) = self.sm.bidi_streams_blocked() {
                     debug!("bidi streams blocked at {}", seq);
@@ -950,14 +1066,14 @@ impl Inner {
                 buf.skip(bytes)?;
             }
 
-            //if is last packet, pad to min size of 1200
+            // if is last packet, pad to min size of 1200
             if contains_initial
                 && !self.packet_spaces[std::cmp::min(space_id + 1, SPACE_ID_DATA)].wants_write()
             {
-                //if packet header is long, add padding length to length field, if it is short skip
-                //padding length
-                if (buf.off() + written) < 1200 {
-                    let skip = std::cmp::max(1200 - buf.off() - written, 0);
+                // if packet header is long, add padding length to length field, if it is short skip
+                // padding length
+                if (buf.off() + written + aead_tag_len) < 1200 {
+                    let skip = std::cmp::max(1200 - buf.off() - written - aead_tag_len, 0);
                     debug!(
                         "datagram contains initial frame and this last packet is padded by: {}",
                         skip
@@ -969,10 +1085,9 @@ impl Inner {
             let payload_length = buf.off() - payload_offset;
             debug!("payload length: {}", payload_length);
 
-            let length =
-                payload_length + keys.packet.tag_len() + (header.packet_num_length as usize + 1);
+            let length = payload_length + aead_tag_len + (header.packet_num_length as usize + 1);
 
-            //determine length of packet and encode it
+            // determine length of packet and encode it
             if packet_type != packet::PacketType::Short {
                 debug!("encoded length in header: {}", length);
 
@@ -980,7 +1095,7 @@ impl Inner {
                 l.put_varint_with_len(length as u64, packet::PACKET_LENGTH_ENCODING_LENGTH)?;
             }
 
-            //encrypt the packet
+            // encrypt the packet
             let packet_length = packet::encrypt(&mut buf, keys, pn, payload_offset)?;
 
             debug!("packet_length: {}", packet_length);
@@ -989,8 +1104,8 @@ impl Inner {
             remaining -= packet_length;
             written += packet_length;
 
-            //short packets cannot be coalesced
-            if packet_type == packet::PacketType::Short {
+            // short packets cannot be coalesced
+            if packet_type == packet::PacketType::Short || is_closing {
                 break;
             }
         }
@@ -1016,6 +1131,8 @@ impl Inner {
 enum InnerEvent {
     ConnectionEstablished,
     NewConnectionId(ConnectionId),
+    RetireConnectionId(ConnectionId),
+    ClosedByPeer,
 }
 
 #[derive(PartialEq)]
@@ -1023,8 +1140,8 @@ enum ConnectionState {
     Initial,
     Handshake,
     Connected,
-    Emtpying,
-    Terminated,
+    Closing,
+    Closed,
 }
 
 //RFC 9000 section 12.3. we have 3 packet number spaces: initial, handshake & 1-RTT
@@ -1173,7 +1290,7 @@ impl ConnectionIdManager {
     }
 }
 
-#[derive(Eq, Hash, PartialEq, Clone)]
+#[derive(Eq, Hash, PartialEq, Clone, PartialOrd, Ord)]
 pub struct ConnectionId {
     id: Vec<u8>,
 }

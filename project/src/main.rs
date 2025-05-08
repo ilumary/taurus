@@ -10,11 +10,11 @@ fn main() {
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
-    let _ = run();
+    let _ = run_server();
 }
 
 #[tokio::main]
-async fn run() -> Result<(), terror::Error> {
+async fn run_server() -> Result<(), terror::Error> {
     let mut cert_path = std::env::current_dir().unwrap();
     cert_path.push("cert");
     cert_path.push("cert.der");
@@ -32,8 +32,6 @@ async fn run() -> Result<(), terror::Error> {
     .build()
     .await?;
 
-    println!("{}", server.address);
-
     let mut data = [0u8; 1024];
 
     while let Some(connection) = server.accept().await {
@@ -46,6 +44,34 @@ async fn run() -> Result<(), terror::Error> {
 
                     while let Ok(Some(read)) = recv.read(&mut data).await {
                         println!("read stream data: {:?}", std::str::from_utf8(&data[..read]));
+                    }
+                });
+            }
+        });
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn run_client() -> Result<(), terror::Error> {
+    let mut client = quic::connection::ClientConfig::new(
+        "/Users/christophbritsch/Library/Application Support/org.quinn.quinn-examples/cert.der",
+    )
+    .with_supported_protocols(vec!["hq-29".to_owned()])
+    .listen_on("[::1]:4433")
+    .build()
+    .await?;
+
+    if let Some(connection) = client.connect("[::1]:4444".parse().unwrap()).await {
+        println!("NEW CONNECTION ESTABLISHED");
+        tokio::spawn(async move {
+            if let Ok((_recv, send)) = connection.open_bidirectional_stream().await {
+                tokio::spawn(async move {
+                    println!("OPENED BIDI STREAM");
+
+                    if let Ok(written) = send.write(&[0x12, 0x34, 0x56], false).await {
+                        println!("WROTE {written} BYTES TO STREAM");
                     }
                 });
             }

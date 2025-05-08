@@ -1,43 +1,57 @@
-use nix::sys::socket::{setsockopt, sockopt};
-use parking_lot::Mutex;
-use std::net::UdpSocket as StdUdpSocket;
+use std::net::{SocketAddr, UdpSocket as StdUdpSocket};
 use std::ops::DerefMut;
-use std::{net::SocketAddr, sync::Arc};
-use thingbuf::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use thingbuf::{mpsc, recycling};
 use tokio::net::UdpSocket;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
-use crate::connection::{Endpoint, LockedInner};
-use crate::{packet, terror, ConnectionId, Inner, InnerEvent};
+use crate::connection::Endpoint;
 
-type Packet = (Vec<u8>, SocketAddr);
+pub type Packet = (Vec<u8>, SocketAddr);
+
+pub type SendQueue = thingbuf::mpsc::Sender<Packet, CustomRecycler>;
+type RecvQueue = thingbuf::mpsc::Receiver<Packet, CustomRecycler>;
+
+// Reset a vector to all zeros using write_bytes (unsafe but fast). Also no size checking because
+// size is not changeable during runtime
+fn reset_vec_write_bytes<T: Default>(vec: &mut Vec<T>, size: usize) {
+    unsafe {
+        std::ptr::write_bytes(vec.as_mut_ptr(), 0, size);
+        vec.set_len(size);
+    }
+}
 
 #[derive(Clone, Debug)]
-struct CustomRecycler {
+pub struct CustomRecycler {
     buf_size: usize,
 }
 
 impl recycling::Recycle<Packet> for CustomRecycler {
     fn new_element(&self) -> Packet {
-        (
-            Vec::with_capacity(self.buf_size),
-            "[::1]:8080".parse().unwrap(),
-        )
+        let v = vec![0u8; self.buf_size];
+        (v, "[::1]:8080".parse().unwrap())
     }
 
     fn recycle(&self, element: &mut Packet) {
-        element.0.clear();
-        element.0.shrink_to(self.buf_size);
+        reset_vec_write_bytes(&mut element.0, self.buf_size);
     }
 }
 
-pub async fn start_sockets(
-    addr: &str,
+// unix allows for binding multiple sockets to the same port. In normal scenarios a single socket
+// is sufficient but in high throughput scenarios, i.e. a proxy, a multi-socket architechture
+// benefits from the increased number of packet queues in the kernel. taurus uses the ringbuffer
+// thingbuf to continously write into pre-allocated storage space. Every socket gets a ringbuffer.
+// The vec of senders and receivers can then be polled in parrallel.
+fn start_sockets(
+    addr: SocketAddr,
     max_udp_payload_size: usize,
     rx_socket_queue_size: usize,
     tx_socket_queue_size: usize,
-) {
+) -> (Vec<RecvQueue>, Arc<[SendQueue]>) {
+    let std_socket = StdUdpSocket::bind(addr).unwrap();
+    std_socket.set_nonblocking(true).unwrap();
+    let norm_socket = Arc::new(UdpSocket::from_std(std_socket).expect("L"));
+
     // receiving sockets
     let mut consumers = vec![];
     let rx_socket_count: usize = std::env::var("TAURUS_RX_SOCKET_COUNT")
@@ -56,15 +70,13 @@ pub async fn start_sockets(
         consumers.push(rx);
 
         // create socket with reused port, unix only
-        let socket = StdUdpSocket::bind(addr).expect("fatal error: socket bind failed");
-        setsockopt(&socket, sockopt::ReusePort, &true);
-        socket.set_nonblocking(true);
-        let async_socket =
-            UdpSocket::from_std(socket).expect("fatal error: async socket create failed");
+        //let async_socket = create_udp_socket(addr, false, x);
+        let async_socket = norm_socket.clone();
 
         tokio::spawn(async move {
             while let Ok(mut entry) = tx.send_ref().await {
-                match async_socket.recv_from(&mut entry.0).await {
+                let test = &mut entry.0;
+                match async_socket.recv_from(test).await {
                     Ok((size, src_addr)) => {
                         entry.0.truncate(size);
                         entry.1 = src_addr;
@@ -77,7 +89,7 @@ pub async fn start_sockets(
             }
         });
 
-        info!("socket {x}: listening on {addr}");
+        info!("rx socket {x}: listening on {addr}");
     }
 
     // transmittting sockets
@@ -98,38 +110,34 @@ pub async fn start_sockets(
         transmitters.push(tx);
 
         // create socket with reused port, unix only
-        let socket = StdUdpSocket::bind(addr).expect("fatal error: socket bind failed");
-        setsockopt(&socket, sockopt::ReusePort, &true);
-        socket.set_nonblocking(true);
-        let async_socket =
-            UdpSocket::from_std(socket).expect("fatal error: async socket create failed");
+        //let async_socket = create_udp_socket(addr, false, x);
+        let async_socket = norm_socket.clone();
 
         tokio::spawn(async move {
-            while let Some(mut entry) = rx.recv_ref().await {
-                let addr = entry.1.clone();
-                match async_socket.send_to(&mut entry.0, addr).await {
+            while let Some(entry) = rx.recv_ref().await {
+                match async_socket.send_to(&entry.0, entry.1).await {
                     Ok(x) => {
                         info!("sent {} bytes to {}", x, entry.1);
                     }
                     Err(error) => {
-                        error!("Error while receiving datagram: {:?}", error);
+                        error!("Error while sending datagram: {:?}", error);
                         continue;
                     }
                 };
             }
         });
 
-        info!("socket {x}: sending from {addr}");
+        info!("tx socket {x}: sending from {addr}");
     }
 
-    let jh = io_event_loop(consumers, transmitters);
+    (consumers, Arc::from(transmitters))
 }
 
 // my implmentation of a future over a Vec of receivers. Can be called in std::future::poll_fn.
 // loops over all receivers and polls for readiness.
 fn poll_socket_receivers<'a, T>(
     cx: &mut std::task::Context<'_>,
-    rx: &'a [Receiver<T, CustomRecycler>],
+    rx: &'a [thingbuf::mpsc::Receiver<T, CustomRecycler>],
 ) -> std::task::Poll<Option<thingbuf::mpsc::RecvRef<'a, T>>> {
     for rx_ch in rx {
         match rx_ch.poll_recv_ref(cx) {
@@ -147,195 +155,60 @@ fn poll_socket_receivers<'a, T>(
     std::task::Poll::Pending
 }
 
-fn get_available_sender<'a>(
-    senders: &'a [Sender<Packet, CustomRecycler>],
-) -> Option<&'a Sender<Packet, CustomRecycler>> {
-    senders.iter().find(|s| s.remaining() > 0)
-}
-
-pub async fn io_event_loop(
-    rx: Vec<Receiver<Packet, CustomRecycler>>,
-    tx: Vec<Sender<Packet, CustomRecycler>>,
+// main event loop. it reacts to three possible scenarios that require a reaction:
+//  1. a packet has arrived
+//  2. a timeout has occured
+//  3. the application wants to send data
+pub fn event_loop(
+    addr: SocketAddr,
+    max_udp_payload_size: usize,
+    rx_socket_queue_size: usize,
+    tx_socket_queue_size: usize,
+    mut ep: Endpoint,
 ) -> tokio::task::JoinHandle<usize> {
+    let (rx, tx) = start_sockets(
+        addr,
+        max_udp_payload_size,
+        rx_socket_queue_size,
+        tx_socket_queue_size,
+    );
+
     tokio::spawn(async move {
         loop {
-            let rr = std::future::poll_fn(|cx| poll_socket_receivers(cx, &rx)).await;
+            let recv = std::future::poll_fn(|cx| poll_socket_receivers(cx, &rx));
 
-            if let Some(mut packet) = rr {
-                let data = packet.deref_mut();
-            } else {
-                error!("failed to aquire recv ref inside io event loop");
-                return 0usize;
+            let wakeup = std::future::poll_fn(|cx| ep.poll_wakeups(cx));
+
+            tokio::select! {
+                incoming = recv => {
+                    if let Some(recv_buf) = incoming{
+                        ep.recv(recv_buf);
+                    }
+                }
+                _ = wakeup => {}
             }
 
-            if let Some(s) = get_available_sender(&tx) {
-                if let Ok(mut sender) = s.send_ref().await {
+            ep.iterate_transmission_pending(tx.clone(), |inner, sq| async move {
+                if let Ok(mut sender) = sq.send_ref().await {
                     let data = sender.deref_mut();
+                    let mut conn = inner.lock();
+
+                    match conn.fetch_dgram(&mut data.0) {
+                        Ok(len) => data.0.truncate(len),
+                        Err(err) => error!("error while fetching datagram: {err}"),
+                    }
+
+                    data.1 = conn.get_current_path();
+
+                    drop(conn);
+
+                    return true;
                 } else {
                     error!("failed to aquire sender ref inside io event loop");
-                    return 0usize;
                 }
-            }
+                false
+            })
+            .await;
         }
     })
-}
-
-//starts the main event loop over a socket. Receive new packet, decode dcid, match to connnection,
-//if no connnection was found initialize a new one
-/*pub async fn start(mut endpoint: Endpoint, address: SocketAddr) -> Result<(), terror::Error> {
-    let socket = UdpSocket::bind(address)
-        .await
-        .expect("fatal error: socket bind failed");
-
-    info!("listening on {}", address);
-
-    tokio::spawn(async move {
-        loop {
-            let mut buffer: Vec<u8> = vec![0u8; u16::MAX as usize];
-
-            let (size, src_addr) = match socket.recv_from(&mut buffer).await {
-                Ok((size, src_addr)) => (size, src_addr),
-                Err(error) => {
-                    println!("Error while receiving datagram: {:?}", error);
-                    continue;
-                }
-            };
-
-            let head = match &buffer[0] >> 7 {
-                0x01 => "LH",
-                0x00 => "SH",
-                _ => "NOT RECOGNISED",
-            };
-
-            info!("Received {:?} bytes from {:?} ({})", size, src_addr, head);
-
-            let dcid = match packet::Header::get_dcid(&buffer, 8) {
-                Ok(h) => h,
-                Err(error) => {
-                    error!("error while retrieving dcid from packet: {}", error);
-                    continue;
-                }
-            };
-
-            debug!("searching for {}", &dcid);
-            let mut answer = [0u8; 65536];
-            let answer_size: usize;
-            let mut dst_addr: SocketAddr = src_addr;
-
-            //match incoming packet to connection
-            if let Some(handle) = endpoint.connections.get(&dcid) {
-                debug!("found existing connection");
-                let mut transmit_ready: Option<Arc<LockedInner>> = None;
-
-                {
-                    let mut c = handle.0.lock();
-                    if let Err(error) = c.recv(&mut buffer[..size], src_addr) {
-                        //TODO match error.kind() for transport error
-                        error!("error processing datagram: {}", error);
-                        match error.kind() {
-                            0x00 => (),
-                            0x01..=0x10 => {
-                                todo!("send connection close frame");
-                            }
-                            _ => {
-                                todo!("probably nothing idk i'll have to find out at some point");
-                            }
-                        }
-                    }
-
-                    //poll for events in connection with outside effect
-                    while let Some(event) = c.poll_event() {
-                        match event {
-                            InnerEvent::ConnectionEstablished => {
-                                transmit_ready = Some(handle.clone())
-                            }
-                            InnerEvent::NewConnectionId(_ncid) => {
-                                todo!("new cid insertion not yet implemented");
-                            }
-                        }
-                    }
-
-                    //prepare answer
-                    answer_size = match c.fetch_dgram(&mut answer) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            error!("failed to fetch datagram: {}", err);
-                            continue;
-                        }
-                    };
-
-                    dst_addr = c.remote;
-                }
-
-                //transmit ready after guard is dropped
-                if let Some(c) = transmit_ready {
-                    if let Err(error) = endpoint
-                        .new_connection_tx
-                        .send(crate::Connection { api: c })
-                        .await
-                    {
-                        error!("error while providing new connection: {}", error);
-                    }
-                }
-            } else if ((buffer[0] & packet::LS_TYPE_BIT) >> 7) == 1
-                && ((buffer[0] & packet::LONG_PACKET_TYPE) >> 4) == 0
-            {
-                let (inner, cid, asize) = match handle_new_connection(
-                    &mut buffer,
-                    &mut answer,
-                    src_addr,
-                    endpoint.server_config.clone(),
-                    &endpoint.hmac_reset_key,
-                ) {
-                    Ok((i, c, s)) => (i, c, s),
-                    Err(e) => {
-                        // if we encounter an error within the initial packet, the connection is
-                        // immediately abandoned
-                        error!("encountered error while accepting new connection: {}", e);
-                        todo!("handle error in case initial packet fails");
-                    }
-                };
-
-                answer_size = asize;
-
-                //push connection into lookupmap using the provided cid
-                endpoint
-                    .connections
-                    .insert(cid, Arc::new(LockedInner(Mutex::new(inner))));
-            } else {
-                warn!("received unknown packet");
-                continue;
-            }
-
-            //send data back
-            let size = match socket.send_to(&answer[..answer_size], dst_addr).await {
-                Ok(size) => size,
-                Err(error) => {
-                    error!("{}", terror::Error::socket_error(format!("{}", error)));
-                    continue;
-                }
-            };
-
-            info!("sent {} bytes to {}", size, dst_addr);
-        }
-    });
-
-    Ok(())
-}*/
-
-fn handle_new_connection(
-    buffer: &mut Vec<u8>,
-    answer: &mut [u8],
-    src_addr: SocketAddr,
-    server_config: Option<Arc<rustls::ServerConfig>>,
-    hmac_reset_key: &ring::hmac::Key,
-) -> Result<(Inner, ConnectionId, usize), terror::Error> {
-    let server_config = server_config.unwrap();
-
-    let (mut inner, cid) =
-        Inner::accept(buffer, src_addr.to_string(), server_config, hmac_reset_key)?;
-
-    let size = inner.fetch_dgram(answer)?;
-
-    Ok((inner, cid, size))
 }

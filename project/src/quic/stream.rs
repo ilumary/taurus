@@ -1,9 +1,11 @@
 use crate::{
-    connection::Connection, fc, terror, transport_parameters::{
+    connection::Connection,
+    fc, terror,
+    transport_parameters::{
         InitialMaxData, InitialMaxStreamDataBidiLocal, InitialMaxStreamDataBidiRemote,
         InitialMaxStreamDataUni, InitialMaxStreamsBidi, InitialMaxStreamsUni, TransportConfig,
         VarInt,
-    }
+    },
 };
 
 use std::{
@@ -32,8 +34,7 @@ const MAX_STREAMS_TRIGGER: u64 = 0x02;
 type StreamId = u64;
 type StreamPriority = u8;
 
-// public struct for the RecvStream, maybe also add reference to actual stream object to save on
-// search in indexmap
+/// public struct for the RecvStream
 pub struct RecvStream {
     pub id: StreamId,
     inner: Connection,
@@ -44,15 +45,15 @@ impl RecvStream {
         Self { id, inner }
     }
 
-    // Reads data from a stream into the provided buffer. If successfull, returns number of bytes
-    // read. Existing data in the buffer is overwritten. Returns [`None`] if the stream is finished
-    // or has been reset.
+    /// Reads data from a stream into the provided buffer. If successfull, returns number of bytes
+    /// read. Existing data in the buffer is overwritten. Returns [`None`] if the stream is finished
+    /// or has been reset.
     pub async fn read(&self, buf: &mut [u8]) -> Result<Option<usize>, terror::Error> {
         future::poll_fn(|cx| self.inner.api.poll_recv(cx, &self.id, buf)).await
     }
 }
 
-// public struct for the SendStream
+/// public struct for the SendStream
 pub struct SendStream {
     pub id: StreamId,
     inner: Connection,
@@ -63,9 +64,9 @@ impl SendStream {
         Self { id, inner }
     }
 
-    // Writes data to a send stream. Returns the number of bytes written. Due to flow control
-    // limits it is not guaranteed that all data will be appended. Writing to a finished or reset
-    // stream returns an error.
+    /// Writes data to a send stream. Returns the number of bytes written. Due to flow control
+    /// limits it is not guaranteed that all data will be appended. Writing to a finished or reset
+    /// stream returns an error.
     pub async fn write(&self, buf: &[u8], fin: bool) -> Result<usize, terror::Error> {
         future::poll_fn(|cx| self.inner.api.poll_send(cx, &self.id, buf, fin)).await
     }
@@ -235,8 +236,9 @@ impl<C: StreamCallback> StreamManager<C> {
     ) -> Result<(), terror::Error> {
         tpc.initial_max_data = InitialMaxData::try_from(VarInt::from(fc::INITIAL_MAX_DATA))?;
 
-        tpc.initial_max_streams_bidi =
-            InitialMaxStreamsBidi::try_from(VarInt::from(self.limits[!self.local as usize]))?;
+        tpc.initial_max_streams_bidi = InitialMaxStreamsBidi::try_from(VarInt::from(
+            self.limits[(self.local ^ 0x01) as usize],
+        ))?;
         tpc.initial_max_streams_uni = InitialMaxStreamsUni::try_from(VarInt::from(
             self.limits[(!self.local as usize) & 0x02],
         ))?;
