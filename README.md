@@ -19,14 +19,13 @@ The QUIC library is still in a early development stage and a majority of the fea
 * QUIC 1-RTT handshake
 * QUIC stream implementation
 * QUIC Flow control
-* Basic async socket io wrapper
+* Performant async socket io wrapper
 * Full TLS 1.3 integration using <a href="https://github.com/rustls/rustls">rustls</a>
 * Server API for easy integration with HTTP/3 or other application protocols
+* Client API
 
 However, some fundamental features are still incomplete. Therefore, currently in development are:
 
-* Client API
-* Sophisticated and performant async socket io wrapper
 * Congestion control with loss detection and retransmissions
 
 ## Extensions

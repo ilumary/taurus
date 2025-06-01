@@ -32,6 +32,20 @@ const SPACE_ID_INITIAL: usize = 0x00;
 const SPACE_ID_HANDSHAKE: usize = 0x01;
 const SPACE_ID_DATA: usize = 0x02;
 
+enum QuicConfig {
+    Server(Arc<rustls::ServerConfig>),
+    Client(Arc<rustls::ClientConfig>),
+}
+
+impl QuicConfig {
+    fn crypto_provider(&self) -> &rustls::crypto::CryptoProvider {
+        match self {
+            QuicConfig::Server(cfg) => cfg.crypto_provider(),
+            QuicConfig::Client(cfg) => cfg.crypto_provider(),
+        }
+    }
+}
+
 struct Inner {
     // side
     side: Side,
@@ -137,8 +151,8 @@ impl Inner {
         })?;
 
         // get initial keys, use default crypto provider by ring with all suites for now
-        let ikp = Inner::derive_initial_keyset(
-            server_config.clone(),
+        let ikp = Self::derive_initial_keyset(
+            QuicConfig::Server(server_config.clone()),
             Version::V1,
             Side::Server,
             &head.dcid,
@@ -262,18 +276,99 @@ impl Inner {
         Ok((inner, initial_local_scid))
     }
 
-    /*fn _connect(&mut self, buffer: &mut [u8], dst_addr: String) -> Result<Self, terror::Error> {
-        Ok(())
-    }*/
+    pub fn connect(
+        addr: SocketAddr,
+        server_name: rustls::pki_types::ServerName<'static>,
+        client_config: Arc<rustls::ClientConfig>,
+        hmac_reset_key: &ring::hmac::Key,
+    ) -> Result<(Self, ConnectionId), terror::Error> {
+        let dcid = ConnectionId::generate_with_length(8);
+        let scid = ConnectionId::generate_with_length(8);
+
+        let mut tpc = TransportConfig {
+            original_destination_connection_id: OriginalDestinationConnectionId::try_from(
+                dcid.clone(),
+            )?,
+            initial_source_connection_id: InitialSourceConnectionId::try_from(scid.clone())?,
+            stateless_reset_token: StatelessResetTokenTP::try_from(
+                token::StatelessResetToken::new(hmac_reset_key, &scid),
+            )?,
+            max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
+            ..TransportConfig::default()
+        };
+
+        let smc = StreamManagerConfig::new(1, 0);
+
+        let mut sm = StreamManager::new(smc, Side::Client as u8);
+        sm.fill_initial_local_tpc(&mut tpc)?;
+
+        let data = tpc.encode(Side::Server)?;
+
+        let conn = RustlsConnection::Client(
+            rustls::quic::ClientConnection::new(
+                client_config.clone(),
+                rustls::quic::Version::V1,
+                server_name,
+                data,
+            )
+            .map_err(|e| {
+                terror::Error::fatal(format!("failed to create client connection: {}", e))
+            })?,
+        );
+
+        let cim = ConnectionIdManager::with_initial_cids(dcid.clone(), scid.clone(), None, None);
+
+        let ikp = Self::derive_initial_keyset(
+            QuicConfig::Client(client_config),
+            Version::V1,
+            Side::Client,
+            &dcid,
+        );
+
+        let initial_space: PacketNumberSpace = PacketNumberSpace {
+            keys: Some(ikp),
+            active: true,
+            ..PacketNumberSpace::new()
+        };
+
+        let mut inner = Self {
+            side: Side::Client,
+            version: 1u32,
+            events: Vec::new(),
+            tls_session: conn,
+            next_secrets: None,
+            next_1rtt_packet_keys: None,
+            zero_rtt_keyset: None,
+            state: ConnectionState::Initial,
+            cidm: cim,
+            sm,
+            packet_spaces: [
+                initial_space,
+                PacketNumberSpace::new(),
+                PacketNumberSpace::new(),
+            ],
+            current_space: SPACE_ID_INITIAL,
+            remote: addr,
+            remote_tpc: TransportConfig::default(),
+            apec: None,
+            pec: None,
+            lft: 0x00,
+            zero_rtt_enabled: false,
+        };
+
+        inner.generate_crypto_data();
+
+        Ok((inner, scid))
+    }
 
     fn derive_initial_keyset(
-        server_cfg: Arc<rustls::ServerConfig>,
+        config: QuicConfig,
         version: Version,
         side: Side,
         dcid: &ConnectionId,
     ) -> Keys {
         /* for now only the rustls ring provider is used, so we may omit numerous checks */
-        server_cfg
+        config
             .crypto_provider()
             .cipher_suites
             .iter()
@@ -474,8 +569,7 @@ impl Inner {
             ));
         }
 
-        self.generate_crypto_data(SPACE_ID_INITIAL);
-        self.generate_crypto_data(SPACE_ID_HANDSHAKE);
+        //self.generate_crypto_data();
 
         // init zero rtt if enabled
         if self.zero_rtt_enabled {
@@ -514,8 +608,8 @@ impl Inner {
 
             match frame_code {
                 0x00 => {
-                    //the first received padding indicates that the rest of the packet is also
-                    //padded and can therefore be skipped
+                    // the first received padding indicates that the rest of the packet is also
+                    // padded and can therefore be skipped
                     payload.skip(payload.cap())?;
                     break;
                 } //PADDING
@@ -541,8 +635,8 @@ impl Inner {
 
                     self.process_crypto_data(&crypto_data);
 
-                    //test if all required crypto data has been exchanged for the connection to be
-                    //considered established
+                    // test if all required crypto data has been exchanged for the connection to be
+                    // considered established
                     if self.tls_session.alpn_protocol().is_some()
                         && self.tls_session.negotiated_cipher_suite().is_some()
                         && !self.tls_session.is_handshaking()
@@ -557,6 +651,8 @@ impl Inner {
                         self.state = ConnectionState::Connected;
                         self.events.push(InnerEvent::ConnectionEstablished);
                     }
+
+                    self.generate_crypto_data();
                 } //CRYPTO
                 0x07 => {
                     if self.side != Side::Server {
@@ -653,7 +749,6 @@ impl Inner {
 
                     self.cidm
                         .register_new_cid(retire_prior_to, sqn, n_cid.clone())?;
-                    self.events.push(InnerEvent::NewConnectionId(n_cid));
                 } //NEW_CONNECTION_ID
                 0x19 => {
                     let _sequence_number = payload.get_varint()?;
@@ -719,8 +814,8 @@ impl Inner {
             acknowledged
         );
 
-        //both vecs are guaranteed to be sorted with no duplicate values
-        //remove acknowledged pns from cached pns awaiting acknowledgement
+        // both vecs are guaranteed to be sorted with no duplicate values
+        // remove acknowledged pns from cached pns awaiting acknowledgement
         let to_remove = std::collections::BTreeSet::from_iter(acknowledged);
         self.packet_spaces[space]
             .awaiting_acknowledgement
@@ -756,57 +851,59 @@ impl Inner {
         }
     }
 
-    fn generate_crypto_data(&mut self, space_id: usize) {
-        let mut buf: Vec<u8> = Vec::new();
+    fn generate_crypto_data(&mut self) {
+        loop {
+            let mut buf: Vec<u8> = Vec::new();
 
-        //writing handshake data prompts a keychange because the packet number space is promoted
-        if let Some(kc) = self.tls_session.write_hs(&mut buf) {
-            debug!("generated {} bytes of crypto data", buf.len());
-            //get keys from keychange
-            let keys = match kc {
-                KeyChange::Handshake { keys } => {
-                    debug!("handshake keyset ready");
-                    self.packet_spaces[SPACE_ID_HANDSHAKE].active = true;
-                    keys
-                }
-                KeyChange::OneRtt { keys, next } => {
-                    debug!("data (1-rtt) keyset ready");
-                    self.next_secrets = Some(next);
-                    self.packet_spaces[SPACE_ID_DATA].active = true;
-                    keys
-                }
-            };
+            if let Some(kc) = self.tls_session.write_hs(&mut buf) {
+                let (keys, next_space) = match kc {
+                    KeyChange::Handshake { keys } => {
+                        debug!("handshake keyset ready");
+                        self.packet_spaces[SPACE_ID_HANDSHAKE].active = true;
+                        (keys, SPACE_ID_HANDSHAKE)
+                    }
+                    KeyChange::OneRtt { keys, next } => {
+                        debug!("data (1-rtt) keyset ready");
+                        self.next_secrets = Some(next);
+                        self.packet_spaces[SPACE_ID_DATA].active = true;
 
-            // if space id is DATA, only the packet payload keys update, not the header keys
-            if (space_id + 1) == SPACE_ID_DATA {
-                self.next_1rtt_packet_keys = Some(
-                    self.next_secrets
-                        .as_mut()
-                        .expect("handshake should be completed and next secrets availible")
-                        .next_packet_keys(),
-                )
+                        if (self.current_space + 1) == SPACE_ID_DATA {
+                            self.next_1rtt_packet_keys = Some(
+                                self.next_secrets
+                                    .as_mut()
+                                    .expect("hs should be completed and next secrets available")
+                                    .next_packet_keys(),
+                            );
+                        }
+
+                        (keys, SPACE_ID_DATA)
+                    }
+                };
+
+                self.packet_spaces[next_space].keys = Some(keys);
+                self.current_space = next_space;
             }
 
-            //"upgrade" to next packet number space with new keying material
-            self.packet_spaces[space_id + 1].keys = Some(keys);
+            if !buf.is_empty() {
+                debug!(
+                    "generated {} bytes of crypto data in space {}",
+                    buf.len(),
+                    self.current_space
+                );
 
-            //advance space
-            self.current_space = space_id + 1;
-        };
+                let offset = self.packet_spaces[self.current_space].outgoing_crypto_offset;
+                let length = buf.len() as u64;
 
-        if buf.is_empty() && space_id == self.current_space {
-            return;
+                self.packet_spaces[self.current_space]
+                    .outgoing_crypto
+                    .push_back((offset, buf));
+                self.packet_spaces[self.current_space].outgoing_crypto_offset += length;
+
+                continue;
+            }
+
+            break;
         }
-
-        println!("crypto data: {:x?}", buf);
-
-        //create outgoing crypto frame
-        let offset = self.packet_spaces[space_id].outgoing_crypto_offset;
-        let length = buf.len() as u64;
-        self.packet_spaces[space_id]
-            .outgoing_crypto
-            .push_back((offset, buf));
-        self.packet_spaces[space_id].outgoing_crypto_offset += length;
     }
 
     fn fetch_dgram(&mut self, buffer: &mut [u8]) -> Result<usize, terror::Error> {
@@ -1015,6 +1112,7 @@ impl Inner {
 
                 if buf.cap() >= enc_len {
                     debug!("CRYPTO frame: off {} len {}", off, data.len());
+                    println!("CRYPTO frame: off {} len {}", off, data.len());
 
                     buf.put_u8(0x06)?;
                     buf.put_varint(*off)?;
@@ -1095,6 +1193,8 @@ impl Inner {
                 l.put_varint_with_len(length as u64, packet::PACKET_LENGTH_ENCODING_LENGTH)?;
             }
 
+            println!("PRE ENCRYPT: {:x?}", buf);
+
             // encrypt the packet
             let packet_length = packet::encrypt(&mut buf, keys, pn, payload_offset)?;
 
@@ -1128,10 +1228,19 @@ impl Inner {
     }
 }
 
+/// emitted after a packet is received. can be polled via [`Inner::poll_event(&mut self)`].
 enum InnerEvent {
+    // emitted once per connection once it is established and becomes available to the application
     ConnectionEstablished,
+
+    // emitted only when we (our side) issue a new connection id to out peer so that the io
+    // implementation knows which connection ids to match to which connection
     NewConnectionId(ConnectionId),
+
+    // emitted only by us when a connection id that we issued is retired
     RetireConnectionId(ConnectionId),
+
+    // emitted when the connection has been closed by the peer
     ClosedByPeer,
 }
 
@@ -1363,5 +1472,93 @@ impl From<Vec<u8>> for ConnectionId {
     #[inline]
     fn from(v: Vec<u8>) -> Self {
         Self::from_vec(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+    use std::net::SocketAddr;
+
+    #[test]
+    fn lib_connect() {
+        let addr: SocketAddr = "[::1]:8080".parse().unwrap();
+        let hostname = match addr.ip() {
+            std::net::IpAddr::V4(ipv4) if ipv4.is_loopback() => "localhost".to_string(),
+            std::net::IpAddr::V6(ipv6) if ipv6.is_loopback() => "localhost".to_string(),
+            ip => ip.to_string(),
+        };
+
+        let server_name = ServerName::try_from(hostname.to_owned()).unwrap();
+
+        let hmac_reset_key = [0u8; 64];
+        let hrk = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key);
+
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+
+        let mut roots = rustls::RootCertStore::empty();
+
+        let cert_path =
+            "/Users/christophbritsch/Library/Application Support/org.quinn.quinn-examples/cert.der";
+        let cert = match std::fs::read(cert_path) {
+            Ok(c) => CertificateDer::from(c),
+            Err(e) => {
+                panic!("failed to read client certificate: {}", e);
+            }
+        };
+
+        if let Err(e) = roots.add(cert) {
+            panic!("fatal error adding certificate to root store: {}", e);
+        }
+
+        let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let (mut conn, id) =
+            crate::Inner::connect(addr, server_name, std::sync::Arc::new(client_cfg), &hrk)
+                .unwrap();
+
+        let mut buf = [0u8; 1450];
+        let size = conn.fetch_dgram(&mut buf).unwrap();
+
+        println!("{:x?}", &buf[..size]);
+
+        println!("\n==============\n");
+
+        let key_path =
+            "/Users/christophbritsch/Library/Application Support/org.quinn.quinn-examples/key.der";
+
+        let (cert, key) =
+            match std::fs::read(cert_path).and_then(|x| Ok((x, std::fs::read(key_path)?))) {
+                Ok((cert, key)) => (
+                    CertificateDer::from(cert),
+                    PrivateKeyDer::try_from(key).unwrap(),
+                ),
+                Err(e) => {
+                    panic!("failed to read server certificate: {}", e);
+                }
+            };
+
+        let sprovider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+
+        let server_cfg = rustls::ServerConfig::builder_with_provider(sprovider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key)
+            .unwrap();
+
+        let (s_conn, _) = crate::Inner::accept(
+            &mut buf.to_vec(),
+            "127.0.0.1:4433".to_string(),
+            std::sync::Arc::new(server_cfg),
+            &hrk,
+        )
+        .unwrap();
+
+        assert_eq!(id, s_conn.cidm.get_dcid().unwrap().clone());
     }
 }

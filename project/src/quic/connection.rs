@@ -4,8 +4,12 @@ use intrusive_collections::{
     RBTreeAtomicLink,
 };
 use parking_lot::Mutex;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::sync::{mpsc, oneshot};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use tokio::{
+    net::lookup_host,
+    sync::{mpsc, oneshot},
+    time::{timeout, Duration},
+};
 use tracing::{debug, error, info, warn};
 
 use std::{
@@ -38,11 +42,11 @@ impl Future for Connecting {
 
 // holds single channel handle to send a client connect to the endpoint
 pub struct Client {
-    connector: mpsc::Sender<(SocketAddr, oneshot::Sender<Connection>)>,
+    connector: mpsc::Sender<(SocketAddr, ServerName<'static>, oneshot::Sender<Connection>)>,
 }
 
 impl Client {
-    /// used to connect to an address. yields a connecting future which in turn yields
+    /// used to connect to an ip address. yields a connecting future which in turn yields
     /// [`Option<Connection>`]
     ///
     /// # Example
@@ -66,8 +70,89 @@ impl Client {
     /// ```
     pub fn connect(&mut self, to: SocketAddr) -> Connecting {
         let (conn_ready_tx, conn_ready_rx) = oneshot::channel();
-        self.connector.try_send((to, conn_ready_tx)).unwrap();
+        let hostname = match to.ip() {
+            std::net::IpAddr::V4(ipv4) if ipv4.is_loopback() => "localhost".to_string(),
+            std::net::IpAddr::V6(ipv6) if ipv6.is_loopback() => "localhost".to_string(),
+            ip => ip.to_string(),
+        };
+
+        let server_name = ServerName::try_from(hostname.to_owned()).unwrap();
+
+        self.connector
+            .try_send((to, server_name, conn_ready_tx))
+            .unwrap();
         Connecting { rx: conn_ready_rx }
+    }
+
+    /// used to connect to an actual hostname and port. convenience implementation
+    /// to wrap dns hostname lookup, therefore async. May take on the order of around
+    /// 100ms on slos networks. custom timeout may be specified in seconds via the
+    /// `dns_timeout` param. yields a connecting future which in turn yields
+    /// [`Option<Connection>`]
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use quic::connection::ClientConfig;
+    ///
+    /// async fn run_client() {
+    ///     let mut client = quic::connection::ClientConfig::new("/path/to/cert.der")
+    ///         .with_supported_protocols(vec!["hq-29".to_owned()])
+    ///         .listen_on("[::1]:4433")
+    ///         .build()
+    ///         .await
+    ///         .unwrap();
+    ///     
+    ///     if let Ok(connecting) = client.connect_to_hostname("www.google.com", 8080, 1).await {
+    ///         if let Some(connection) = connecting.await {
+    ///             println!("connected!");
+    ///         }
+    ///     }
+    ///     
+    ///     // OR
+    ///
+    ///     if let Ok(connecting) = client.connect_to_hostname("localhost", 8080, 1).await {
+    ///         if let Some(connection) = connecting.await {
+    ///             println!("connected!");
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// ```
+    pub async fn connect_to_hostname(
+        &mut self,
+        hostname: &str,
+        port: u16,
+        dns_timeout: u64,
+    ) -> Result<Connecting, terror::Error> {
+        let addr = timeout(
+            Duration::from_secs(dns_timeout),
+            lookup_host((hostname, port)),
+        )
+        .await
+        .map_err(|_| {
+            terror::Error::dns_timeout(format!(
+                "timout during dns resolution for {hostname}:{port}"
+            ))
+        })?
+        .map_err(|e| {
+            terror::Error::dns_lookup_error(format!(
+                "dns resolution failed for {hostname}:{port}: {e}"
+            ))
+        })?
+        .next()
+        .ok_or_else(|| {
+            terror::Error::dns_lookup_error(format!("no addresses found for {hostname}:{port}"))
+        })?;
+
+        let (conn_ready_tx, conn_ready_rx) = oneshot::channel();
+        let server_name = ServerName::try_from(hostname.to_owned()).map_err(|e| {
+            terror::Error::taurus_misc_error(format!("failed to parse {hostname}: {e}"))
+        })?;
+        self.connector
+            .try_send((addr, server_name, conn_ready_tx))
+            .unwrap();
+        Ok(Connecting { rx: conn_ready_rx })
     }
 }
 
@@ -124,7 +209,8 @@ impl ClientConfig {
 
     pub async fn build(self) -> Result<Client, terror::Error> {
         let (server_tx, _) = mpsc::channel::<Connection>(1);
-        let (ncc_tx, ncc_rx) = mpsc::channel::<(SocketAddr, oneshot::Sender<Connection>)>(64);
+        let (ncc_tx, ncc_rx) =
+            mpsc::channel::<(SocketAddr, ServerName<'static>, oneshot::Sender<Connection>)>(64);
         let hmac_reset_key = [0u8; 64];
 
         let endpoint = Endpoint {
@@ -135,6 +221,7 @@ impl ClientConfig {
             hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
             nc_tx: server_tx,
             ncc_rx,
+            ncc_tx: IndexMap::new(),
         };
 
         io::event_loop(self.listen_on, 1500, 8, 8, endpoint);
@@ -232,7 +319,7 @@ impl ServerConfig {
 
     pub async fn build(self) -> Result<Server, terror::Error> {
         let (new_connection_tx, new_connection_rx) = mpsc::channel::<Connection>(64);
-        let (_, ncc_rx) = mpsc::channel::<(SocketAddr, oneshot::Sender<Connection>)>(1);
+        let (_, ncc_rx) = mpsc::channel::<(SocketAddr, ServerName, oneshot::Sender<Connection>)>(1);
         let hmac_reset_key = [0u8; 64];
 
         let endpoint = Endpoint {
@@ -243,6 +330,7 @@ impl ServerConfig {
             hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
             nc_tx: new_connection_tx,
             ncc_rx,
+            ncc_tx: IndexMap::new(),
         };
 
         io::event_loop(self.address, 1500, 8, 8, endpoint);
@@ -324,7 +412,10 @@ pub(crate) struct Endpoint {
     nc_tx: mpsc::Sender<Connection>,
 
     // channel for receiving new connecting attempts. client only
-    ncc_rx: mpsc::Receiver<(SocketAddr, oneshot::Sender<Connection>)>,
+    ncc_rx: mpsc::Receiver<(SocketAddr, ServerName<'static>, oneshot::Sender<Connection>)>,
+
+    // channels for sending new connections once ready. client only. uses internal id as key.
+    ncc_tx: IndexMap<ConnectionId, oneshot::Sender<Connection>>,
 }
 
 impl Endpoint {
@@ -393,15 +484,31 @@ impl Endpoint {
             for event in events {
                 match event {
                     InnerEvent::ConnectionEstablished => {
-                        let api = c_ptr.clone();
+                        let sapi = c_ptr.clone();
                         let sender = self.nc_tx.clone();
 
-                        // TODO client
-                        tokio::spawn(async move {
-                            if let Err(e) = sender.send(Connection { api }).await {
-                                error!("error sending new connection: {}", e);
+                        if self.server_config.is_some() {
+                            tokio::spawn(async move {
+                                if let Err(e) = sender.send(Connection { api: sapi }).await {
+                                    error!("error sending new connection: {}", e);
+                                }
+                            });
+                        }
+
+                        let capi = c_ptr.clone();
+                        let id = capi.internal_id.clone();
+
+                        if self.client_config.is_some() {
+                            if let Some(sender) = self.ncc_tx.swap_remove(&capi.internal_id) {
+                                tokio::spawn(async move {
+                                    if sender.send(Connection { api: capi }).is_err() {
+                                        error!("error sending new connection with id: {}", id);
+                                    }
+                                });
+                            } else {
+                                error!("missing connection channel for client connection for original dcid {}", id);
                             }
-                        });
+                        }
                     }
                     InnerEvent::NewConnectionId(ncid) => {
                         self.connection_ids.insert(ncid, c_ptr.internal_id.clone());
@@ -487,11 +594,21 @@ impl Endpoint {
         // includes connection attempts from client
         if self.client_config.is_some() {
             match self.ncc_rx.poll_recv(cx) {
-                Poll::Ready(Some((dest_addr, ready_sender))) => {
-                    let _cc = self.client_config.clone().unwrap();
-                    // create new connection
-                    // insert into core, transmission_pending
-                    // return
+                Poll::Ready(Some((dest_addr, server_name, ready_sender))) => {
+                    let cc = self.client_config.clone().unwrap();
+                    match Inner::connect(dest_addr, server_name, cc, &self.hmac_reset_key) {
+                        Ok((inner, cid)) => {
+                            // cid is here the scid which will be reused as dcid for at least
+                            // the first packet from the peer. it is also used as our internal id
+                            let a_inner = Arc::new(LockedInner::from_inner(inner, cid.clone()));
+                            self.connections.core.insert(a_inner.clone());
+                            self.connection_ids.insert(cid.clone(), cid.clone());
+                            self.ncc_tx.insert(cid, ready_sender);
+                        }
+                        Err(err) => {
+                            error!("failed to setup connection to {dest_addr}: {err}");
+                        }
+                    }
                 }
                 Poll::Ready(None) => error!("fatal error receiving connection attempt"),
                 Poll::Pending => (),
