@@ -12,6 +12,11 @@ impl StatelessResetToken {
         result.copy_from_slice(&signature[..0x10]);
         Self { token: result }
     }
+
+    pub fn verify(&self, key: &ring::hmac::Key, id: &ConnectionId) -> bool {
+        let expected = StatelessResetToken::new(key, id);
+        self == &expected
+    }
 }
 
 impl From<Vec<u8>> for StatelessResetToken {
@@ -24,5 +29,36 @@ impl From<Vec<u8>> for StatelessResetToken {
                 )
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // a helper to make deterministic test keys
+    fn test_key() -> ring::hmac::Key {
+        let bytes = [0xAB; 32];
+        ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &bytes)
+    }
+
+    #[test]
+    fn stateless_reset_token_generation() {
+        let key = test_key();
+        let id = ConnectionId::from(vec![0x01, 0x02, 0x03, 0x04]);
+
+        // simulate server generating a reset token for a connection
+        let token = StatelessResetToken::new(&key, &id);
+
+        // simulate client verifying that token against the original cid
+        assert!(token.verify(&key, &id));
+
+        // wrong id should not verify
+        let other_id = ConnectionId::from(vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        assert!(!token.verify(&key, &other_id));
+
+        // wrong key should not verify
+        let bad_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[0xFF; 32]);
+        assert!(!token.verify(&bad_key, &id));
     }
 }

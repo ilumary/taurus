@@ -1,6 +1,7 @@
 pub mod connection;
 pub mod terror;
 
+mod cid;
 mod fc;
 mod io;
 mod packet;
@@ -22,8 +23,8 @@ use stream::{StreamManager, StreamManagerConfig};
 use token::StatelessResetToken;
 use tracing::{debug, error, event, span, warn, Level};
 use transport_parameters::{
-    InitialSourceConnectionId, MaxUdpPayloadSize, OriginalDestinationConnectionId,
-    StatelessResetTokenTP, TransportConfig, VarInt,
+    ActiveConnectionIdLimit, InitialSourceConnectionId, MaxUdpPayloadSize,
+    OriginalDestinationConnectionId, StatelessResetTokenTP, TransportConfig, VarInt,
 };
 
 const MAX_CID_SIZE: usize = 20;
@@ -213,6 +214,7 @@ impl Inner {
                 token::StatelessResetToken::new(hmac_reset_key, &initial_local_scid),
             )?,
             max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
+            active_connection_id_limit: ActiveConnectionIdLimit::try_from(VarInt::from(4))?,
             ..TransportConfig::default()
         };
 
@@ -294,6 +296,7 @@ impl Inner {
                 token::StatelessResetToken::new(hmac_reset_key, &scid),
             )?,
             max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
+            active_connection_id_limit: ActiveConnectionIdLimit::try_from(VarInt::from(4))?,
             ..TransportConfig::default()
         };
 
@@ -467,6 +470,8 @@ impl Inner {
         {
             todo!("retry packet handling is not yet implemented")
         }
+
+        // TODO if client and packet is initial from server, update cid
 
         //decrypt packet
         let keys: &DirectionalKeys = &self.packet_spaces[header.space()]
@@ -730,6 +735,14 @@ impl Inner {
                     let sqn = payload.get_varint().unwrap();
                     let retire_prior_to = payload.get_varint()?;
                     let l = payload.get_u8().unwrap();
+
+                    if (l as usize > MAX_CID_SIZE) || ((l as usize) < 1usize) {
+                        return Err(terror::Error::quic_transport_error(
+                            "received cid exceeds maximum cid size",
+                            terror::QuicTransportError::ProtocolViolation,
+                        ));
+                    }
+
                     let n_cid = ConnectionId::from(payload.get_bytes(l as usize)?.to_vec());
 
                     if retire_prior_to > sqn {
@@ -1309,23 +1322,23 @@ impl PacketNumberSpace {
 }
 
 struct ConnectionIdManager {
-    //index represents sequence number
-    //set of cids maintained by peer via NEW_CONNECTION_ID frames. we retire them with
-    //RETIRE_CONNECTION_ID frames
+    // index represents sequence number
+    // set of cids maintained by peer via NEW_CONNECTION_ID frames. we retire them with
+    // RETIRE_CONNECTION_ID frames
     dcids: Vec<ConnectionId>,
 
-    //index represents sequence number
-    //set of cids maintained by us which identify the connection on our side. we send
-    //NEW_CONNECTION_ID frames to add cids. the peer retires them with RETIRE_CONNECTION_ID frames
+    // index represents sequence number
+    // set of cids maintained by us which identify the connection on our side. we send
+    // NEW_CONNECTION_ID frames to add cids. the peer retires them with RETIRE_CONNECTION_ID frames
     scids: Vec<ConnectionId>,
 
-    //highest received "retire prior to"
+    // highest received "retire prior to"
     rpt_r: u64,
 
-    //highest sent retire_prior_to
+    // highest sent retire_prior_to
     rpt_s: u64,
 
-    //sent by client
+    // set by client
     retry_source_connection_id: Option<ConnectionId>,
 
     original_destination_connection_id: Option<ConnectionId>,
@@ -1348,7 +1361,7 @@ impl ConnectionIdManager {
         }
     }
 
-    //registeres a new cid from a NEW_CONNECTION_ID frame
+    // registeres a new cid from a NEW_CONNECTION_ID frame
     fn register_new_cid(
         &mut self,
         retire_prior_to: u64,
@@ -1356,7 +1369,7 @@ impl ConnectionIdManager {
         cid: ConnectionId,
     ) -> Result<(), terror::Error> {
         if sqn < self.rpt_r {
-            //cid is immediately retired
+            // cid is immediately retired
             return Ok(());
         }
 
@@ -1472,93 +1485,5 @@ impl From<Vec<u8>> for ConnectionId {
     #[inline]
     fn from(v: Vec<u8>) -> Self {
         Self::from_vec(v)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-    use std::net::SocketAddr;
-
-    #[test]
-    fn lib_connect() {
-        let addr: SocketAddr = "[::1]:8080".parse().unwrap();
-        let hostname = match addr.ip() {
-            std::net::IpAddr::V4(ipv4) if ipv4.is_loopback() => "localhost".to_string(),
-            std::net::IpAddr::V6(ipv6) if ipv6.is_loopback() => "localhost".to_string(),
-            ip => ip.to_string(),
-        };
-
-        let server_name = ServerName::try_from(hostname.to_owned()).unwrap();
-
-        let hmac_reset_key = [0u8; 64];
-        let hrk = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key);
-
-        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-
-        let mut roots = rustls::RootCertStore::empty();
-
-        let cert_path =
-            "/Users/christophbritsch/Library/Application Support/org.quinn.quinn-examples/cert.der";
-        let cert = match std::fs::read(cert_path) {
-            Ok(c) => CertificateDer::from(c),
-            Err(e) => {
-                panic!("failed to read client certificate: {}", e);
-            }
-        };
-
-        if let Err(e) = roots.add(cert) {
-            panic!("fatal error adding certificate to root store: {}", e);
-        }
-
-        let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-
-        let (mut conn, id) =
-            crate::Inner::connect(addr, server_name, std::sync::Arc::new(client_cfg), &hrk)
-                .unwrap();
-
-        let mut buf = [0u8; 1450];
-        let size = conn.fetch_dgram(&mut buf).unwrap();
-
-        println!("{:x?}", &buf[..size]);
-
-        println!("\n==============\n");
-
-        let key_path =
-            "/Users/christophbritsch/Library/Application Support/org.quinn.quinn-examples/key.der";
-
-        let (cert, key) =
-            match std::fs::read(cert_path).and_then(|x| Ok((x, std::fs::read(key_path)?))) {
-                Ok((cert, key)) => (
-                    CertificateDer::from(cert),
-                    PrivateKeyDer::try_from(key).unwrap(),
-                ),
-                Err(e) => {
-                    panic!("failed to read server certificate: {}", e);
-                }
-            };
-
-        let sprovider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-
-        let server_cfg = rustls::ServerConfig::builder_with_provider(sprovider)
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert.clone()], key)
-            .unwrap();
-
-        let (s_conn, _) = crate::Inner::accept(
-            &mut buf.to_vec(),
-            "127.0.0.1:4433".to_string(),
-            std::sync::Arc::new(server_cfg),
-            &hrk,
-        )
-        .unwrap();
-
-        assert_eq!(id, s_conn.cidm.get_dcid().unwrap().clone());
     }
 }

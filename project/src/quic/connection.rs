@@ -569,6 +569,9 @@ impl Endpoint {
 
                 fut.push(f(node, send_queue.clone()));
 
+                // TODO lock node, fetch new id if possible, get original_dcid (our inner id) also
+                // and enter into map. then we dont need to fetch a new id in the incoming path.
+
                 current.move_next();
             }
         }
