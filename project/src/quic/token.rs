@@ -1,19 +1,19 @@
-use crate::ConnectionId;
+use crate::cid;
 
-#[derive(PartialEq, Default)]
+#[derive(PartialEq, Default, Clone, Copy)]
 pub struct StatelessResetToken {
     pub token: [u8; 0x10],
 }
 
 impl StatelessResetToken {
-    pub fn new(key: &ring::hmac::Key, id: &ConnectionId) -> Self {
+    pub fn new(key: &ring::hmac::Key, id: &cid::Id) -> Self {
         let signature = ring::hmac::sign(key, id.as_slice()).as_ref().to_vec();
         let mut result = [0u8; 0x10];
         result.copy_from_slice(&signature[..0x10]);
         Self { token: result }
     }
 
-    pub fn verify(&self, key: &ring::hmac::Key, id: &ConnectionId) -> bool {
+    pub fn verify(&self, key: &ring::hmac::Key, id: &cid::Id) -> bool {
         let expected = StatelessResetToken::new(key, id);
         self == &expected
     }
@@ -45,7 +45,7 @@ mod tests {
     #[test]
     fn stateless_reset_token_generation() {
         let key = test_key();
-        let id = ConnectionId::from(vec![0x01, 0x02, 0x03, 0x04]);
+        let id = cid::Id::from(vec![0x01, 0x02, 0x03, 0x04]);
 
         // simulate server generating a reset token for a connection
         let token = StatelessResetToken::new(&key, &id);
@@ -54,7 +54,7 @@ mod tests {
         assert!(token.verify(&key, &id));
 
         // wrong id should not verify
-        let other_id = ConnectionId::from(vec![0xAA, 0xBB, 0xCC, 0xDD]);
+        let other_id = cid::Id::from(vec![0xAA, 0xBB, 0xCC, 0xDD]);
         assert!(!token.verify(&key, &other_id));
 
         // wrong key should not verify

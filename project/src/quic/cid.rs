@@ -2,7 +2,11 @@ use crate::{terror, token::StatelessResetToken};
 use smallvec::SmallVec;
 
 use rand::RngCore;
-use std::fmt;
+use std::{
+    collections::VecDeque,
+    fmt,
+    hash::{Hash, Hasher},
+};
 use tracing::warn;
 
 pub const MAX_CID_SIZE: usize = 0x14;
@@ -10,86 +14,103 @@ pub const MAX_CID_SIZE: usize = 0x14;
 const MAX_CID_RETIREMENTS_IN_FLIGHT: usize = 0x04;
 const MAX_NEW_CIDS_IN_FLIGHT: usize = 0x04;
 
-#[derive(Eq, Hash, PartialEq, Clone, PartialOrd, Ord)]
+#[derive(Copy, Clone, Default)]
 pub struct Id {
-    id: Vec<u8>,
+    len: u8,
+    bytes: [u8; MAX_CID_SIZE],
 }
 
 impl Id {
     #[inline]
-    pub const fn from_vec(cid: Vec<u8>) -> Self {
-        Self { id: cid }
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.id.len()
+    pub fn from_slice(data: &[u8]) -> Self {
+        assert!(data.len() <= MAX_CID_SIZE, "cid length exceeds 20 bytes");
+        let mut bytes = [0u8; MAX_CID_SIZE];
+        bytes[..data.len()].copy_from_slice(data);
+        Self {
+            len: data.len() as u8,
+            bytes,
+        }
     }
 
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        &self.id
+        &self.bytes[..self.len as usize]
     }
 
     #[inline]
-    pub fn id(&self) -> &Vec<u8> {
-        &self.id
+    pub fn len(&self) -> usize {
+        self.len as usize
     }
 
-    pub fn generate_with_length(length: usize) -> Self {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn generate_with_length(length: usize) -> Self {
         assert!(length <= MAX_CID_SIZE);
         let mut b = [0u8; MAX_CID_SIZE];
         rand::thread_rng().fill_bytes(&mut b[..length]);
-        Id::from_vec(b[..length].into())
+        Id::from_slice(b[..length].into())
+    }
+}
+
+impl PartialEq for Id {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len && self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for Id {}
+
+impl PartialOrd for Id {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Id {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl Hash for Id {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u8(self.len);
+        state.write(&self.bytes[..self.len as usize]);
     }
 }
 
 impl fmt::Display for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "0x{}",
-            self.id
-                .iter()
-                .map(|val| format!("{:x}", val))
-                .collect::<Vec<String>>()
-                .join("")
-        )
+        write!(f, "0x")?;
+        for b in self.as_slice() {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "")
     }
 }
 
 impl fmt::Debug for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "0x{}",
-            self.id
-                .iter()
-                .map(|val| format!("{:x}", val))
-                .collect::<Vec<String>>()
-                .join("")
-        )
-    }
-}
-
-impl Default for Id {
-    #[inline]
-    fn default() -> Self {
-        Self::from_vec(Vec::new())
+        write!(f, "0x")?;
+        for b in self.as_slice() {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "")
     }
 }
 
 impl From<Vec<u8>> for Id {
     #[inline]
     fn from(v: Vec<u8>) -> Self {
-        Self::from_vec(v)
+        Self::from_slice(&v)
     }
-}
-
-#[derive(Debug, Clone)]
-struct ConnectionIdEntry {
-    id: Id,
-    stateless_reset_token: Option<[u8; 16]>,
 }
 
 pub struct ConnectionIdManager {
@@ -97,6 +118,10 @@ pub struct ConnectionIdManager {
     // index is sequence number, active cids start at retire_prior_to
     dcids: Vec<Id>,
     scids: Vec<Id>,
+
+    // keep stateless reset tokens seperate from ids as they are rarely needed
+    dcid_srt: Vec<StatelessResetToken>,
+    scid_srt: Vec<StatelessResetToken>,
 
     // active connection id limit (from our peer), i.e. how many they are willing to maintain, we
     // must not issue more active ids than this limit
@@ -121,7 +146,7 @@ pub struct ConnectionIdManager {
     immediate: bool,
 
     // retired connection ids awaiting RETIRE_CONNECTION_ID frame transmission
-    pending_cid_retirements: Vec<u64>,
+    pending_cid_retirements: VecDeque<u64>,
 
     // in-flight retirements. we limit ourselves to a maximum of one retired cid per packet.
     // vec contains tuple of packet number and the retired cids sqn.
@@ -130,10 +155,6 @@ pub struct ConnectionIdManager {
     // in-flight NEW_CONNECTION_ID frames. we limit ourselves to a max of one new cid per packet.
     // vec contains tuple of (pn, sqn, rpt) so we can trivially reconstruct it in case of loss.
     new_cid_if: SmallVec<[(u64, u64, u64); MAX_NEW_CIDS_IN_FLIGHT]>,
-
-    // track RETIRE_CONNECTION_ID frames that we expect to receive after we issued a
-    // NEW_CONNECTION_ID frame with an increased rpt field. vec of sqns of cids
-    awaiting_retire_cid_frames: Vec<u64>,
 }
 
 impl ConnectionIdManager {
@@ -148,6 +169,8 @@ impl ConnectionIdManager {
         Self {
             dcids,
             scids,
+            dcid_srt: Vec::new(),
+            scid_srt: Vec::new(),
             peer_cid_limit: 0,
             local_cid_limit,
             dcid_rpt_sqn: 0,
@@ -158,10 +181,9 @@ impl ConnectionIdManager {
             last_issued: std::time::Instant::now(),
             recv_byte_counter: 0,
             immediate: false,
-            pending_cid_retirements: Vec::new(),
+            pending_cid_retirements: VecDeque::new(),
             cid_retirements_if: SmallVec::new(),
             new_cid_if: SmallVec::new(),
-            awaiting_retire_cid_frames: Vec::new(),
         }
     }
 
@@ -169,55 +191,71 @@ impl ConnectionIdManager {
     // provided by a retry packet are not assigned sequence numbers.
     // the first dcid is entered into the dcid vector, despite it having no formal sqn. as soon as
     // the servers initial packet with its choice arrives, it is replaced
-    pub fn as_client(initial_dcid: Id, initial_scid: Id, local_cid_limit: u64) -> Self {
-        Self::new(
-            vec![initial_dcid.clone()],
-            vec![initial_scid.clone()],
+    // returns (self, dcid, scid)
+    pub fn as_client(local_cid_limit: u64) -> (Self, Id, Id) {
+        let dcid = Id::generate_with_length(8);
+        let scid = Id::generate_with_length(8);
+
+        let cidm = Self::new(
+            vec![dcid],
+            vec![scid],
             None,
-            Some(initial_dcid),
-            Some(initial_scid),
+            Some(dcid),
+            Some(scid),
             local_cid_limit,
-        )
+        );
+
+        (cidm, dcid, scid)
     }
 
     pub fn as_server(
         initial_dcid: Id,
-        initial_scid: Id,
         original_dcid: Id,
         local_cid_limit: u64,
-    ) -> Self {
-        Self::new(
+        hmac_reset_token_key: &ring::hmac::Key,
+    ) -> (Self, Id, StatelessResetToken) {
+        let i_scid = Id::generate_with_length(8);
+        let srt = crate::token::StatelessResetToken::new(hmac_reset_token_key, &i_scid);
+
+        let cidm = Self::new(
             vec![initial_dcid],
-            vec![initial_scid.clone()],
+            vec![i_scid],
             None,
             Some(original_dcid),
-            Some(initial_scid),
+            Some(i_scid),
             local_cid_limit,
-        )
+        );
+
+        (cidm, i_scid, srt)
     }
 
-    // client only, used to replace dcid (sqn=0) for server after its initial packet arrives
+    pub fn get_initial_scid_unchecked(&self) -> Id {
+        self.initial_scid.unwrap()
+    }
+
+    /// client only, used to replace dcid (sqn=0) for server after its initial packet arrives
     pub fn replace_initial_dcid(&mut self, connection_id: Id) {
         assert_eq!(*self.original_dcid.as_ref().unwrap(), self.dcids[0]);
         self.dcids[0] = connection_id;
     }
 
-    // returns a valid scid
+    /// returns a valid scid
     pub fn get_scid(&self) -> &Id {
         &self.scids[self.scid_rpt_sqn as usize]
     }
 
-    // returns a valid dcid
+    /// returns a valid dcid
     pub fn get_dcid(&self) -> &Id {
         &self.dcids[self.dcid_rpt_sqn as usize]
     }
 
+    /// handles an incoming NEW_CONNECTION_ID frame
     pub fn handle_new_cid(
         &mut self,
         sqn: u64,
         rpt: u64,
         cid: Id,
-        _srt: StatelessResetToken,
+        srt: StatelessResetToken,
     ) -> Result<(), terror::Error> {
         if rpt > sqn {
             return Err(terror::Error::quic_transport_error(
@@ -230,7 +268,7 @@ impl ConnectionIdManager {
         // retransmission and already retired or must be immediately retired
         if sqn < self.dcid_rpt_sqn {
             if !self.pending_cid_retirements.contains(&sqn) {
-                self.pending_cid_retirements.push(sqn);
+                self.pending_cid_retirements.push_back(sqn);
             }
             return Ok(());
         }
@@ -253,6 +291,7 @@ impl ConnectionIdManager {
         // match
         if self.dcids.len() == sqn as usize {
             self.dcids.push(cid);
+            self.dcid_srt.push(srt);
         }
 
         // check active_connection_id_limit
@@ -266,7 +305,7 @@ impl ConnectionIdManager {
         Ok(())
     }
 
-    pub fn handle_retire_cid(&mut self, sqn: u64) -> Result<(), terror::Error> {
+    pub fn handle_retire_cid(&mut self, sqn: u64) -> Result<Id, terror::Error> {
         // we havent even issued that cid or its our last
         if sqn as usize >= self.scids.len() - 1 {
             return Err(terror::Error::quic_transport_error(
@@ -277,7 +316,7 @@ impl ConnectionIdManager {
 
         self.scid_rpt_sqn = std::cmp::max(self.scid_rpt_sqn, sqn + 1);
 
-        Ok(())
+        Ok(self.scids[sqn as usize])
     }
 
     /// returns true if one of three triggers turn true. first is that the number of active cids is
@@ -288,6 +327,9 @@ impl ConnectionIdManager {
         let under_limit = ((self.scids.len() as u64) - self.scid_rpt_sqn) < self.peer_cid_limit;
         let time_elapsed =
             std::time::Instant::now() - self.last_issued >= std::time::Duration::new(5 * 60, 0);
+
+        //TODO maybe change so that bytes come from outside and we only calc a module and save a
+        //bool if we already triggered this "windows" for new cid
         let bytes_threshold = self.recv_byte_counter >= (1024 * 1024 * 16);
 
         under_limit | time_elapsed | bytes_threshold | self.immediate
@@ -313,22 +355,18 @@ impl ConnectionIdManager {
         let id = Id::generate_with_length(8);
         let sqn = self.scids.len() as u64;
 
+        // generate stateless reset token
+        let srt = StatelessResetToken::new(hmac_key, &id);
+
         // save id
-        self.scids.push(id.clone());
+        self.scids.push(id);
+        self.scid_srt.push(srt);
 
         // figure out if we need to increase retire prior to
         let under_limit = ((self.scids.len() as u64) - self.scid_rpt_sqn) <= self.peer_cid_limit;
         if !under_limit {
-            self.awaiting_retire_cid_frames.push(self.scid_rpt_sqn);
             self.scid_rpt_sqn += 1;
         }
-
-        // generate stateless reset token, TODO use module as soon as new Cid is in Programm
-        let signature = ring::hmac::sign(hmac_key, id.as_slice()).as_ref().to_vec();
-        let mut result = [0u8; 0x10];
-        result.copy_from_slice(&signature[..0x10]);
-        let result_vec = result.to_vec();
-        let srt = StatelessResetToken::from(result_vec);
 
         // save issued time for time-based trigger
         self.last_issued = std::time::Instant::now();
@@ -341,10 +379,31 @@ impl ConnectionIdManager {
     }
 
     /// removes incoming acked frames from in-flight tracking structures
-    pub fn ack_in_flight(&mut self, pns: Vec<u64>) {
+    pub fn ack(&mut self, pns: &[u64]) {
         self.cid_retirements_if
             .retain(|(pn, _sqn)| !pns.contains(pn));
         self.new_cid_if.retain(|(pn, _sqn, _rpt)| !pns.contains(pn));
+    }
+
+    /// returns the next sequence number for our cids
+    pub fn peek_next_sqn(&self) -> usize {
+        self.scids.len()
+    }
+
+    /// returns the next sqn to be retired varint size, if no cid is to be retired, returns 0
+    pub fn peek_next_pending_cid_retirement(&self) -> usize {
+        if let Some(pending) = self.pending_cid_retirements.front() {
+            return octets::varint_len(*pending);
+        }
+        0
+    }
+
+    /// pops next sqn to be retired out of queue and enters it into in-flight tracking. should only
+    /// be called after [`ConnectionIdManager::peek_next_pending_cid_retirement()`].
+    pub fn pop_next_pending_cid_retirement(&mut self, pn: u64) -> u64 {
+        let sqn = self.pending_cid_retirements.pop_front().unwrap();
+        self.cid_retirements_if.push((pn, sqn));
+        sqn
     }
 }
 
@@ -370,6 +429,8 @@ mod tests {
         ConnectionIdManager {
             dcids,
             scids,
+            dcid_srt: Vec::new(),
+            scid_srt: Vec::new(),
             peer_cid_limit: 4,
             local_cid_limit: 4,
             dcid_rpt_sqn: 0,
@@ -380,10 +441,9 @@ mod tests {
             last_issued: std::time::Instant::now(),
             recv_byte_counter: 0,
             immediate: false,
-            pending_cid_retirements: Vec::new(),
+            pending_cid_retirements: VecDeque::new(),
             cid_retirements_if: SmallVec::new(),
             new_cid_if: SmallVec::new(),
-            awaiting_retire_cid_frames: Vec::new(),
         }
     }
 
@@ -405,11 +465,7 @@ mod tests {
     // helper
     fn get_srt(id: &Id) -> StatelessResetToken {
         let key = init_hmac_reset_key();
-        let signature = ring::hmac::sign(key, id.as_slice()).as_ref().to_vec();
-        let mut result = [0u8; 0x10];
-        result.copy_from_slice(&signature[..0x10]);
-        let result_vec = result.to_vec();
-        StatelessResetToken::from(result_vec)
+        StatelessResetToken::new(key, id)
     }
 
     // a helper to make deterministic test keys
@@ -420,29 +476,19 @@ mod tests {
 
     #[test]
     fn connection_establishment_client_to_server() {
-        let c_initial_dcid = Id::generate_with_length(8);
-        let c_initial_scid = Id::generate_with_length(8);
-
         // client MAYBE make id generation only possible in manager so ids are directly stored
-        let mut c_cid_manager =
-            ConnectionIdManager::as_client(c_initial_dcid.clone(), c_initial_scid.clone(), 4);
+        let (mut c_cid_manager, c_initial_dcid, c_initial_scid) = ConnectionIdManager::as_client(4);
 
         // server get initialized with inital packet
-        let s_initial_scid = Id::generate_with_length(8);
-
-        let s_cid_manager = ConnectionIdManager::as_server(
-            c_initial_scid.clone(),
-            s_initial_scid.clone(),
-            c_initial_dcid,
-            4,
-        );
+        let (s_cid_manager, s_initial_scid, _) =
+            ConnectionIdManager::as_server(c_initial_scid, c_initial_dcid, 4, &test_key());
 
         // server should answer with correct dcid and scid in initial packet
         assert_eq!(c_initial_scid, s_cid_manager.get_dcid().clone());
         assert_eq!(s_initial_scid, s_cid_manager.get_scid().clone());
 
         // client must then update the servers scid (for client dcid), which is seq = 0
-        c_cid_manager.replace_initial_dcid(s_initial_scid.clone());
+        c_cid_manager.replace_initial_dcid(s_initial_scid);
 
         // client should then use its own chosen scid and server chose dcid until a
         // NEW_CONNECTION_ID is issued
@@ -457,7 +503,7 @@ mod tests {
 
         let ncid = Id::generate_with_length(8);
         let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(1, 0, ncid.clone(), token);
+        let result = idm.handle_new_cid(1, 0, ncid, token);
 
         assert!(result.is_ok());
         assert_eq!(idm.dcids[1], ncid);
@@ -470,7 +516,7 @@ mod tests {
 
         let ncid = Id::generate_with_length(8);
         let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(4, 0, ncid.clone(), token);
+        let result = idm.handle_new_cid(4, 0, ncid, token);
 
         assert!(result.is_err());
         assert_eq!(
@@ -486,7 +532,7 @@ mod tests {
 
         let ncid = Id::generate_with_length(8);
         let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(4, 1, ncid.clone(), token);
+        let result = idm.handle_new_cid(4, 1, ncid, token);
 
         assert!(result.is_ok());
         assert_eq!(idm.dcids[4], ncid);
@@ -501,7 +547,7 @@ mod tests {
 
         let ncid = Id::generate_with_length(8);
         let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(4, 4, ncid.clone(), token);
+        let result = idm.handle_new_cid(4, 4, ncid, token);
 
         assert!(result.is_ok());
         assert_eq!(idm.dcids[4], ncid);
@@ -517,7 +563,7 @@ mod tests {
 
         let ncid = Id::generate_with_length(8);
         let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(4, 5, ncid.clone(), token);
+        let result = idm.handle_new_cid(4, 5, ncid, token);
 
         assert!(result.is_err());
         assert_eq!(idm.dcids.len(), 4);
@@ -581,9 +627,10 @@ mod tests {
 
         assert!(result.is_some());
 
-        let (sqn, rpt, id, _) = result.unwrap(); //TODO verify srt
+        let (sqn, rpt, id, srt) = result.unwrap();
         assert_eq!(sqn, 0);
         assert_eq!(rpt, 0);
+        assert!(srt.verify(&tk, &id));
         assert!(idm.scids.ends_with(&[id]));
         assert!(idm.new_cid_if.ends_with(&[(1, 0, 0)]));
 
@@ -592,9 +639,10 @@ mod tests {
 
         assert!(result.is_some());
 
-        let (sqn, rpt, id, _) = result.unwrap(); //TODO verify srt
+        let (sqn, rpt, id, srt) = result.unwrap();
         assert_eq!(sqn, 1);
         assert_eq!(rpt, 0);
+        assert!(srt.verify(&tk, &id));
         assert!(idm.scids.ends_with(&[id]));
         assert!(idm.new_cid_if.ends_with(&[(2, 1, 0)]));
 
@@ -623,9 +671,10 @@ mod tests {
 
         assert!(result.is_some());
 
-        let (sqn, rpt, id, _) = result.unwrap(); //TODO verify srt
+        let (sqn, rpt, id, srt) = result.unwrap();
         assert_eq!(sqn, 4);
         assert_eq!(rpt, 0);
+        assert!(srt.verify(&tk, &id));
         assert!(idm.scids.ends_with(&[id]));
         assert!(idm.new_cid_if.ends_with(&[(6, 4, 0)]));
 
@@ -646,12 +695,12 @@ mod tests {
 
         assert!(result.is_some());
 
-        let (sqn, rpt, id, _) = result.unwrap(); //TODO verify srt
+        let (sqn, rpt, id, srt) = result.unwrap();
         assert_eq!(sqn, 4);
         assert_eq!(rpt, 1);
+        assert!(srt.verify(&tk, &id));
         assert!(idm.scids.ends_with(&[id]));
         assert!(idm.new_cid_if.ends_with(&[(10, 4, 1)]));
-        assert!(idm.awaiting_retire_cid_frames.ends_with(&[0]));
     }
 
     #[test]
@@ -667,12 +716,12 @@ mod tests {
 
         assert!(result.is_some());
 
-        let (sqn, rpt, id, _) = result.unwrap(); //TODO verify srt
+        let (sqn, rpt, id, srt) = result.unwrap();
         assert_eq!(sqn, 4);
         assert_eq!(rpt, 1);
+        assert!(srt.verify(&tk, &id));
         assert!(idm.scids.ends_with(&[id]));
         assert!(idm.new_cid_if.ends_with(&[(10, 4, 1)]));
-        assert!(idm.awaiting_retire_cid_frames.ends_with(&[0]));
     }
 
     #[test]
@@ -686,7 +735,7 @@ mod tests {
         idm.cid_retirements_if.push((4, 0));
         idm.cid_retirements_if.push((5, 1));
 
-        idm.ack_in_flight(vec![0, 1, 2, 3, 4]);
+        idm.ack(&[0, 1, 2, 3, 4]);
 
         assert_eq!(idm.new_cid_if.len(), 1);
         assert_eq!(idm.cid_retirements_if.len(), 1);

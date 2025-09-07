@@ -21,7 +21,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{io, packet::Header, stream, terror, ConnectionId, ConnectionState, Inner, InnerEvent};
+use crate::{cid, io, packet::Header, stream, terror, ConnectionState, Inner, InnerEvent};
 
 // received from a call to Client::connect(). resolves to the connection if successful
 pub struct Connecting {
@@ -348,9 +348,9 @@ impl ServerConfig {
 
 intrusive_adapter!(ConnectionAdapter = Arc<LockedInner>: LockedInner { direct_link: RBTreeAtomicLink });
 impl<'a> KeyAdapter<'a> for ConnectionAdapter {
-    type Key = ConnectionId;
-    fn get_key(&self, x: &'a LockedInner) -> ConnectionId {
-        x.internal_id.clone()
+    type Key = cid::Id;
+    fn get_key(&self, x: &'a LockedInner) -> cid::Id {
+        x.internal_id
     }
 }
 
@@ -380,7 +380,7 @@ impl ConnectionMap {
         }
     }
 
-    pub fn find_existing(&mut self, id: &ConnectionId) -> Option<Cursor<'_, ConnectionAdapter>> {
+    pub fn find_existing(&mut self, id: &cid::Id) -> Option<Cursor<'_, ConnectionAdapter>> {
         let c = self.core.find(id);
 
         if c.is_null() {
@@ -397,7 +397,7 @@ pub(crate) struct Endpoint {
 
     // internal connection id map, maps from external to internal id to support multiple external
     // ids to avoid reinserting and/or cloning the connection inside intrusive collections
-    connection_ids: IndexMap<ConnectionId, ConnectionId>,
+    connection_ids: IndexMap<cid::Id, cid::Id>,
 
     // server config for rustls
     server_config: Option<Arc<rustls::ServerConfig>>,
@@ -415,7 +415,7 @@ pub(crate) struct Endpoint {
     ncc_rx: mpsc::Receiver<(SocketAddr, ServerName<'static>, oneshot::Sender<Connection>)>,
 
     // channels for sending new connections once ready. client only. uses internal id as key.
-    ncc_tx: IndexMap<ConnectionId, oneshot::Sender<Connection>>,
+    ncc_tx: IndexMap<cid::Id, oneshot::Sender<Connection>>,
 }
 
 impl Endpoint {
@@ -454,9 +454,7 @@ impl Endpoint {
                     error!("error processing datagram: {}", error);
                 }
 
-                while let Some(event) = conn.poll_event() {
-                    events.push(event);
-                }
+                events = conn.poll_events();
             }
         } else {
             // if we dont recgnise the dcid, assume its an inital packet
@@ -469,10 +467,10 @@ impl Endpoint {
             ) {
                 Ok((inner, cid)) => {
                     debug!("accepted new connection");
-                    let a_inner = Arc::new(LockedInner::from_inner(inner, cid.clone()));
+                    let a_inner = Arc::new(LockedInner::from_inner(inner, cid));
                     conn_ptr = Some(a_inner.clone());
                     self.connections.core.insert(a_inner.clone());
-                    self.connection_ids.insert(cid.clone(), cid);
+                    self.connection_ids.insert(cid, cid);
                 }
                 Err(err) => {
                     error!("error processing initial packet: {}", err);
@@ -496,7 +494,7 @@ impl Endpoint {
                         }
 
                         let capi = c_ptr.clone();
-                        let id = capi.internal_id.clone();
+                        let id = capi.internal_id;
 
                         if self.client_config.is_some() {
                             if let Some(sender) = self.ncc_tx.swap_remove(&capi.internal_id) {
@@ -511,10 +509,10 @@ impl Endpoint {
                         }
                     }
                     InnerEvent::NewConnectionId(ncid) => {
-                        self.connection_ids.insert(ncid, c_ptr.internal_id.clone());
+                        self.connection_ids.insert(ncid, c_ptr.internal_id);
                     }
-                    InnerEvent::RetireConnectionId(ocid) => {
-                        self.connection_ids.swap_remove(&ocid);
+                    InnerEvent::RetireConnectionId(cid) => {
+                        self.connection_ids.swap_remove(&cid);
                     }
                     InnerEvent::ClosedByPeer => {
                         if c_ptr.direct_link.is_linked() {
@@ -567,10 +565,20 @@ impl Endpoint {
                     None => break,
                 };
 
-                fut.push(f(node, send_queue.clone()));
+                fut.push(f(node.clone(), send_queue.clone()));
 
-                // TODO lock node, fetch new id if possible, get original_dcid (our inner id) also
-                // and enter into map. then we dont need to fetch a new id in the incoming path.
+                // fetch events that may occur during packet fetching
+                let mut inner = node.lock();
+                let post_fetch_events = inner.poll_events();
+
+                for event in post_fetch_events {
+                    if let InnerEvent::NewConnectionId(id) = event {
+                        self.connection_ids
+                            .insert(inner.cidm.get_initial_scid_unchecked(), id);
+                    }
+                }
+
+                drop(inner);
 
                 current.move_next();
             }
@@ -603,9 +611,9 @@ impl Endpoint {
                         Ok((inner, cid)) => {
                             // cid is here the scid which will be reused as dcid for at least
                             // the first packet from the peer. it is also used as our internal id
-                            let a_inner = Arc::new(LockedInner::from_inner(inner, cid.clone()));
-                            self.connections.core.insert(a_inner.clone());
-                            self.connection_ids.insert(cid.clone(), cid.clone());
+                            let a_inner = Arc::new(LockedInner::from_inner(inner, cid));
+                            self.connections.core.insert(a_inner);
+                            self.connection_ids.insert(cid, cid);
                             self.ncc_tx.insert(cid, ready_sender);
                         }
                         Err(err) => {
@@ -628,7 +636,7 @@ pub(crate) struct LockedInner {
     inner: Mutex<Inner>,
 
     // internal connection id used for lookup
-    internal_id: ConnectionId,
+    internal_id: cid::Id,
 
     // rbtree link to main connection container
     direct_link: RBTreeAtomicLink,
@@ -641,7 +649,7 @@ pub(crate) struct LockedInner {
 }
 
 impl LockedInner {
-    pub fn from_inner(inner: Inner, id: ConnectionId) -> Self {
+    pub fn from_inner(inner: Inner, id: cid::Id) -> Self {
         Self {
             inner: Mutex::new(inner),
             internal_id: id,

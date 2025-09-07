@@ -11,14 +11,13 @@ mod transport_parameters;
 
 use octets::{varint_len, OctetsMut};
 use packet::{AckFrame, Frame, Header};
-use rand::RngCore;
 use rustls::{
     quic::{
         Connection as RustlsConnection, DirectionalKeys, KeyChange, Keys, PacketKeySet, Version,
     },
     Side,
 };
-use std::{collections::VecDeque, fmt, net::SocketAddr, sync::Arc, time::Instant};
+use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Instant};
 use stream::{StreamManager, StreamManagerConfig};
 use token::StatelessResetToken;
 use tracing::{debug, error, event, span, warn, Level};
@@ -26,8 +25,6 @@ use transport_parameters::{
     ActiveConnectionIdLimit, InitialSourceConnectionId, MaxUdpPayloadSize,
     OriginalDestinationConnectionId, StatelessResetTokenTP, TransportConfig, VarInt,
 };
-
-const MAX_CID_SIZE: usize = 20;
 
 const SPACE_ID_INITIAL: usize = 0x00;
 const SPACE_ID_HANDSHAKE: usize = 0x01;
@@ -57,6 +54,9 @@ struct Inner {
     // pollable events
     events: Vec<InnerEvent>,
 
+    // hmac key as input to stateless_reset_token generation
+    hmac_reset_token_key: ring::hmac::Key,
+
     // tls13 session via rustls and keying material
     tls_session: RustlsConnection,
     next_secrets: Option<rustls::quic::Secrets>,
@@ -67,7 +67,7 @@ struct Inner {
     state: ConnectionState,
 
     // connection id manager
-    cidm: ConnectionIdManager,
+    cidm: cid::ConnectionIdManager,
 
     // stream manager, does all stream logic
     sm: StreamManager<stream::StreamWaker>,
@@ -141,7 +141,7 @@ impl Inner {
         src_addr: String,
         server_config: Arc<rustls::ServerConfig>,
         hmac_reset_key: &ring::hmac::Key,
-    ) -> Result<(Self, ConnectionId), terror::Error> {
+    ) -> Result<(Self, cid::Id), terror::Error> {
         let start = Instant::now();
 
         let mut head = packet::Header::from_bytes(buffer, 8).map_err(|e| {
@@ -200,19 +200,15 @@ impl Inner {
         // coalesced
         buffer.truncate(dec_len);
 
-        let initial_local_scid = ConnectionId::generate_with_length(8);
-        let orig_dcid = head.dcid.clone();
+        let (cim, initial_scid, srt) =
+            cid::ConnectionIdManager::as_server(head.scid.unwrap(), head.dcid, 4, hmac_reset_key);
 
         let mut tpc = TransportConfig {
             original_destination_connection_id: OriginalDestinationConnectionId::try_from(
-                orig_dcid.clone(),
+                head.dcid,
             )?,
-            initial_source_connection_id: InitialSourceConnectionId::try_from(
-                initial_local_scid.clone(),
-            )?,
-            stateless_reset_token: StatelessResetTokenTP::try_from(
-                token::StatelessResetToken::new(hmac_reset_key, &initial_local_scid),
-            )?,
+            initial_source_connection_id: InitialSourceConnectionId::try_from(initial_scid)?,
+            stateless_reset_token: StatelessResetTokenTP::try_from(srt)?,
             max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
             active_connection_id_limit: ActiveConnectionIdLimit::try_from(VarInt::from(4))?,
             ..TransportConfig::default()
@@ -236,17 +232,11 @@ impl Inner {
             ..PacketNumberSpace::new()
         };
 
-        let cim = ConnectionIdManager::with_initial_cids(
-            head.scid.clone().unwrap(),
-            initial_local_scid.clone(),
-            None,
-            Some(orig_dcid),
-        );
-
         let mut inner = Self {
             side: Side::Server,
             version: head.version,
             events: Vec::new(),
+            hmac_reset_token_key: hmac_reset_key.clone(),
             tls_session: conn,
             next_secrets: None,
             next_1rtt_packet_keys: None,
@@ -275,7 +265,7 @@ impl Inner {
         // initial packet processing time
         let _m = start.elapsed().as_millis();
 
-        Ok((inner, initial_local_scid))
+        Ok((inner, initial_scid))
     }
 
     pub fn connect(
@@ -283,15 +273,12 @@ impl Inner {
         server_name: rustls::pki_types::ServerName<'static>,
         client_config: Arc<rustls::ClientConfig>,
         hmac_reset_key: &ring::hmac::Key,
-    ) -> Result<(Self, ConnectionId), terror::Error> {
-        let dcid = ConnectionId::generate_with_length(8);
-        let scid = ConnectionId::generate_with_length(8);
+    ) -> Result<(Self, cid::Id), terror::Error> {
+        let (cim, dcid, scid) = cid::ConnectionIdManager::as_client(4);
 
         let mut tpc = TransportConfig {
-            original_destination_connection_id: OriginalDestinationConnectionId::try_from(
-                dcid.clone(),
-            )?,
-            initial_source_connection_id: InitialSourceConnectionId::try_from(scid.clone())?,
+            original_destination_connection_id: OriginalDestinationConnectionId::try_from(dcid)?,
+            initial_source_connection_id: InitialSourceConnectionId::try_from(scid)?,
             stateless_reset_token: StatelessResetTokenTP::try_from(
                 token::StatelessResetToken::new(hmac_reset_key, &scid),
             )?,
@@ -319,8 +306,6 @@ impl Inner {
             })?,
         );
 
-        let cim = ConnectionIdManager::with_initial_cids(dcid.clone(), scid.clone(), None, None);
-
         let ikp = Self::derive_initial_keyset(
             QuicConfig::Client(client_config),
             Version::V1,
@@ -338,6 +323,7 @@ impl Inner {
             side: Side::Client,
             version: 1u32,
             events: Vec::new(),
+            hmac_reset_token_key: hmac_reset_key.clone(),
             tls_session: conn,
             next_secrets: None,
             next_1rtt_packet_keys: None,
@@ -368,7 +354,7 @@ impl Inner {
         config: QuicConfig,
         version: Version,
         side: Side,
-        dcid: &ConnectionId,
+        dcid: &cid::Id,
     ) -> Keys {
         /* for now only the rustls ring provider is used, so we may omit numerous checks */
         config
@@ -383,7 +369,7 @@ impl Inner {
             })
             .flatten()
             .expect("default crypto provider failed to provide initial cipher suite")
-            .keys(&dcid.id, side, version)
+            .keys(dcid.as_slice(), side, version)
     }
 
     fn recv(
@@ -471,9 +457,12 @@ impl Inner {
             todo!("retry packet handling is not yet implemented")
         }
 
-        // TODO if client and packet is initial from server, update cid
+        // if client and packet is initial from server, update cid
+        if self.side == Side::Client && header.space() == SPACE_ID_INITIAL {
+            self.cidm.replace_initial_dcid(header.scid.unwrap());
+        }
 
-        //decrypt packet
+        // decrypt packet
         let keys: &DirectionalKeys = &self.packet_spaces[header.space()]
             .keys
             .as_ref()
@@ -565,16 +554,13 @@ impl Inner {
         self.sm.set_max_streams_bidi(imsb);
         self.sm.set_max_streams_uni(imsu);
 
-        if self.remote_tpc.initial_source_connection_id.get().unwrap()
-            != self.cidm.get_inital_remote_scid().unwrap()
-        {
+        // the peers initial_source_connection_id should have been saved as our first dcid
+        if self.remote_tpc.initial_source_connection_id.get().unwrap() != self.cidm.get_dcid() {
             return Err(terror::Error::quic_transport_error(
                 "scids from packet header and transport parameters differ",
                 terror::QuicTransportError::TransportParameterError,
             ));
         }
-
-        //self.generate_crypto_data();
 
         // init zero rtt if enabled
         if self.zero_rtt_enabled {
@@ -733,38 +719,31 @@ impl Inner {
                 } //STREAMS_BLOCKED (unidirectional)
                 0x18 => {
                     let sqn = payload.get_varint().unwrap();
-                    let retire_prior_to = payload.get_varint()?;
+                    let rpt = payload.get_varint()?;
                     let l = payload.get_u8().unwrap();
 
-                    if (l as usize > MAX_CID_SIZE) || ((l as usize) < 1usize) {
+                    if (l as usize > cid::MAX_CID_SIZE) || ((l as usize) < 1usize) {
                         return Err(terror::Error::quic_transport_error(
                             "received cid exceeds maximum cid size",
                             terror::QuicTransportError::ProtocolViolation,
                         ));
                     }
 
-                    let n_cid = ConnectionId::from(payload.get_bytes(l as usize)?.to_vec());
-
-                    if retire_prior_to > sqn {
-                        return Err(terror::Error::quic_transport_error(
-                            "retire prior to is greater than sequence number",
-                            terror::QuicTransportError::FrameEncodingError,
-                        ));
-                    }
-
-                    //dunno what to do
-                    let _srt = StatelessResetToken::from(payload.get_bytes(0x10)?.to_vec());
+                    let n_cid = cid::Id::from(payload.get_bytes(l as usize)?.to_vec());
+                    let srt = StatelessResetToken::from(payload.get_bytes(0x10)?.to_vec());
 
                     debug!(
                         "received new cid from peer: {} (sqn: {}, rpt: {})",
-                        n_cid, sqn, retire_prior_to
+                        n_cid, sqn, rpt
                     );
 
-                    self.cidm
-                        .register_new_cid(retire_prior_to, sqn, n_cid.clone())?;
+                    self.cidm.handle_new_cid(sqn, rpt, n_cid, srt)?;
                 } //NEW_CONNECTION_ID
                 0x19 => {
-                    let _sequence_number = payload.get_varint()?;
+                    let sqn = payload.get_varint()?;
+                    self.events.push(InnerEvent::RetireConnectionId(
+                        self.cidm.handle_retire_cid(sqn)?,
+                    ));
                 } //RETIRE_CONNECTION_ID
                 0x1a => {
                     let _path_challenge_data = payload.get_u64()?;
@@ -826,6 +805,9 @@ impl Inner {
             "got ack frame acknowledging the following packet numbers: {:?}",
             acknowledged
         );
+
+        self.sm.ack(&acknowledged);
+        self.cidm.ack(&acknowledged);
 
         // both vecs are guaranteed to be sorted with no duplicate values
         // remove acknowledged pns from cached pns awaiting acknowledgement
@@ -959,7 +941,7 @@ impl Inner {
             debug!("remaining space {}", remaining);
 
             let pn = self.packet_spaces[space_id].get_next_pkt_num();
-            let dcid = self.cidm.get_dcid().unwrap();
+            let dcid = self.cidm.get_dcid();
 
             span.record("pn", pn);
 
@@ -976,7 +958,7 @@ impl Inner {
                         (None, packet::LONG_HEADER_TYPE_HANDSHAKE)
                     };
 
-                    let scid = self.cidm.get_scid().unwrap();
+                    let scid = self.cidm.get_scid();
 
                     packet::Header::new_long_header(
                         long_header_type,
@@ -1138,8 +1120,33 @@ impl Inner {
                 }
             }
 
-            // stream frames
+            // stream & cid frames
             if packet_type == packet::PacketType::Short && !is_closing {
+                // NEW_CONNECTION_ID frame
+                // calc size for frame, rpt must be smaller than sqn, frame header, id, srt
+                if buf.cap() >= (1 + (2 * varint_len(self.cidm.peek_next_sqn() as u64)) + 8 + 16) {
+                    if let Some((sqn, rpt, id, srt)) =
+                        self.cidm.issue_new_cid(&self.hmac_reset_token_key, pn)
+                    {
+                        // check if buf has enough space left
+                        buf.put_u8(0x18)?;
+                        buf.put_varint(sqn)?;
+                        buf.put_varint(rpt)?;
+                        buf.put_u8(0x08)?;
+                        buf.put_bytes(id.as_slice())?;
+                        buf.put_bytes(&srt.token)?;
+
+                        self.events.push(InnerEvent::NewConnectionId(id));
+                    }
+                }
+
+                // RETIRE_CONNECTION_ID frames
+                let next_sqn_retirement = self.cidm.peek_next_pending_cid_retirement();
+                if next_sqn_retirement > 0 && buf.cap() >= next_sqn_retirement {
+                    buf.put_u8(0x19)?;
+                    buf.put_varint(self.cidm.pop_next_pending_cid_retirement(pn))?;
+                }
+
                 // create STREAMS_BLOCKED if bidi streams are blocked
                 if let Some(seq) = self.sm.bidi_streams_blocked() {
                     debug!("bidi streams blocked at {}", seq);
@@ -1236,24 +1243,27 @@ impl Inner {
         (packet::PacketType::None, 0)
     }
 
-    pub fn poll_event(&mut self) -> Option<InnerEvent> {
-        self.events.pop()
+    pub fn poll_events(&mut self) -> Vec<InnerEvent> {
+        std::mem::take(&mut self.events)
     }
 }
 
 /// emitted after a packet is received. can be polled via [`Inner::poll_event(&mut self)`].
 enum InnerEvent {
-    // emitted once per connection once it is established and becomes available to the application
+    // emitted once per connection when it is established and becomes available to the application.
+    // emitted after incoming packet
     ConnectionEstablished,
 
     // emitted only when we (our side) issue a new connection id to out peer so that the io
-    // implementation knows which connection ids to match to which connection
-    NewConnectionId(ConnectionId),
+    // implementation knows which connection ids to match to which connection. emitted after
+    // outgoing packet
+    NewConnectionId(cid::Id),
 
-    // emitted only by us when a connection id that we issued is retired
-    RetireConnectionId(ConnectionId),
+    // emitted we receive an RETIRE_CONNECTION_ID from our peer, indicating it wont use that id
+    // anymore to address our endpoint. emitted after incoming packet
+    RetireConnectionId(cid::Id),
 
-    // emitted when the connection has been closed by the peer
+    // emitted when the connection has been closed by the peer. emitted on imcoming packet
     ClosedByPeer,
 }
 
@@ -1318,172 +1328,5 @@ impl PacketNumberSpace {
             &mut self.keys.as_mut().unwrap().remote.packet,
             packet_keys.remote,
         );
-    }
-}
-
-struct ConnectionIdManager {
-    // index represents sequence number
-    // set of cids maintained by peer via NEW_CONNECTION_ID frames. we retire them with
-    // RETIRE_CONNECTION_ID frames
-    dcids: Vec<ConnectionId>,
-
-    // index represents sequence number
-    // set of cids maintained by us which identify the connection on our side. we send
-    // NEW_CONNECTION_ID frames to add cids. the peer retires them with RETIRE_CONNECTION_ID frames
-    scids: Vec<ConnectionId>,
-
-    // highest received "retire prior to"
-    rpt_r: u64,
-
-    // highest sent retire_prior_to
-    rpt_s: u64,
-
-    // set by client
-    retry_source_connection_id: Option<ConnectionId>,
-
-    original_destination_connection_id: Option<ConnectionId>,
-}
-
-impl ConnectionIdManager {
-    fn with_initial_cids(
-        dcid: ConnectionId,
-        scid: ConnectionId,
-        retry_source_connection_id: Option<ConnectionId>,
-        original_destination_connection_id: Option<ConnectionId>,
-    ) -> Self {
-        Self {
-            dcids: vec![dcid],
-            scids: vec![scid],
-            rpt_r: 0,
-            rpt_s: 0,
-            retry_source_connection_id,
-            original_destination_connection_id,
-        }
-    }
-
-    // registeres a new cid from a NEW_CONNECTION_ID frame
-    fn register_new_cid(
-        &mut self,
-        retire_prior_to: u64,
-        sqn: u64,
-        cid: ConnectionId,
-    ) -> Result<(), terror::Error> {
-        if sqn < self.rpt_r {
-            // cid is immediately retired
-            return Ok(());
-        }
-
-        self.rpt_r = std::cmp::max(self.rpt_r, retire_prior_to);
-
-        let dcids_len = self.dcids.len() as u64;
-
-        if dcids_len == sqn {
-            self.dcids.push(cid);
-            return Ok(());
-        }
-
-        if dcids_len > sqn {
-            assert_eq!(cid, self.dcids[sqn as usize]);
-        }
-
-        if dcids_len < sqn {
-            return Err(terror::Error::quic_transport_error(
-                "sequence number is not one greater than previous one",
-                terror::QuicTransportError::ProtocolViolation,
-            ));
-        }
-
-        Ok(())
-    }
-
-    //create a new cid to be used in a NEW_CONNECTION_ID frame
-    fn _issue_new_cid(&mut self) {}
-
-    fn get_inital_remote_scid(&self) -> Option<&ConnectionId> {
-        self.dcids.first()
-    }
-
-    fn get_dcid(&self) -> Option<&ConnectionId> {
-        Some(&self.dcids[self.rpt_r as usize])
-    }
-
-    fn get_scid(&self) -> Option<&ConnectionId> {
-        self.scids.last()
-    }
-}
-
-#[derive(Eq, Hash, PartialEq, Clone, PartialOrd, Ord)]
-pub struct ConnectionId {
-    id: Vec<u8>,
-}
-
-impl ConnectionId {
-    #[inline]
-    pub const fn from_vec(cid: Vec<u8>) -> Self {
-        Self { id: cid }
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.id.len()
-    }
-
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        &self.id
-    }
-
-    #[inline]
-    pub fn id(&self) -> &Vec<u8> {
-        &self.id
-    }
-
-    pub fn generate_with_length(length: usize) -> Self {
-        assert!(length <= MAX_CID_SIZE);
-        let mut b = [0u8; MAX_CID_SIZE];
-        rand::thread_rng().fill_bytes(&mut b[..length]);
-        ConnectionId::from_vec(b[..length].into())
-    }
-}
-
-impl fmt::Display for ConnectionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "0x{}",
-            self.id
-                .iter()
-                .map(|val| format!("{:x}", val))
-                .collect::<Vec<String>>()
-                .join("")
-        )
-    }
-}
-
-impl fmt::Debug for ConnectionId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "0x{}",
-            self.id
-                .iter()
-                .map(|val| format!("{:x}", val))
-                .collect::<Vec<String>>()
-                .join("")
-        )
-    }
-}
-
-impl Default for ConnectionId {
-    #[inline]
-    fn default() -> Self {
-        Self::from_vec(Vec::new())
-    }
-}
-
-impl From<Vec<u8>> for ConnectionId {
-    #[inline]
-    fn from(v: Vec<u8>) -> Self {
-        Self::from_vec(v)
     }
 }

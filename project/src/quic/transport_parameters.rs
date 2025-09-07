@@ -2,27 +2,28 @@ use core::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 use octets::{varint_len, Octets, OctetsMut};
 
-use crate::{terror, token::StatelessResetToken, ConnectionId, MAX_CID_SIZE};
+use crate::{
+    cid::{Id, MAX_CID_SIZE},
+    terror,
+    token::StatelessResetToken,
+};
 
 trait IOHandler<T> {
     fn encode(value: &T, buf: &mut OctetsMut) -> Result<(), octets::BufferTooShortError>;
     fn decode(buf: &mut Octets) -> Result<T, octets::BufferTooShortError>;
 }
 
-impl IOHandler<ConnectionId> for ConnectionId {
-    fn encode(
-        value: &ConnectionId,
-        buf: &mut OctetsMut,
-    ) -> Result<(), octets::BufferTooShortError> {
+impl IOHandler<Id> for Id {
+    fn encode(value: &Id, buf: &mut OctetsMut) -> Result<(), octets::BufferTooShortError> {
         buf.put_varint(value.len() as u64)?;
-        buf.put_bytes(&value.id)?;
+        buf.put_bytes(value.as_slice())?;
         Ok(())
     }
 
-    fn decode(buf: &mut Octets) -> Result<ConnectionId, octets::BufferTooShortError> {
+    fn decode(buf: &mut Octets) -> Result<Id, octets::BufferTooShortError> {
         let length = buf.get_varint()?;
-        Ok(ConnectionId::from_vec(
-            buf.get_bytes(length.try_into().unwrap())?.to_vec(),
+        Ok(Id::from_slice(
+            buf.get_bytes(length.try_into().unwrap())?.as_ref(),
         ))
     }
 }
@@ -90,7 +91,7 @@ impl IOHandler<StatelessResetToken> for StatelessResetToken {
 pub struct PreferredAddressData {
     pub address_v4: Option<SocketAddrV4>,
     pub address_v6: Option<SocketAddrV6>,
-    pub conn_id: ConnectionId,
+    pub conn_id: Id,
     pub stateless_reset_token: StatelessResetToken,
 }
 
@@ -269,7 +270,7 @@ macro_rules! zero_sized_transport_parameter {
     };
 }
 
-transport_parameter!(OriginalDestinationConnectionId, 0x00, ConnectionId);
+transport_parameter!(OriginalDestinationConnectionId, 0x00, Id);
 
 impl OriginalDestinationConnectionId {
     fn validate(self) -> Result<Self, terror::Error> {
@@ -438,7 +439,7 @@ impl ActiveConnectionIdLimit {
     }
 }
 
-transport_parameter!(InitialSourceConnectionId, 0x0f, ConnectionId);
+transport_parameter!(InitialSourceConnectionId, 0x0f, Id);
 
 impl InitialSourceConnectionId {
     fn validate(self) -> Result<Self, terror::Error> {
@@ -452,7 +453,7 @@ impl InitialSourceConnectionId {
     }
 }
 
-transport_parameter!(RetrySourceConnectionId, 0x10, ConnectionId);
+transport_parameter!(RetrySourceConnectionId, 0x10, Id);
 
 impl RetrySourceConnectionId {
     fn validate(self) -> Result<Self, terror::Error> {
@@ -645,7 +646,7 @@ mod tests {
             min_ack_delay: MinAckDelay::try_from(VarInt::from(1000)).unwrap(),
             ack_delay_exponent: AckDelayExponent::try_from(VarInt::from(5)).unwrap(),
             original_destination_connection_id: OriginalDestinationConnectionId::try_from(
-                ConnectionId::from_vec(vec![0xab, 0xab, 0xab, 0xab]),
+                Id::from_slice(&[0xab, 0xab, 0xab, 0xab]),
             )
             .unwrap(),
             ..TransportConfig::default()
@@ -682,8 +683,8 @@ mod tests {
 
         assert_eq!(tpc.max_idle_timeout.get().unwrap().get(), 10000);
         assert_eq!(
-            tpc.initial_source_connection_id.get().unwrap().id,
-            vec![0x03, 0x25, 0x05, 0xd0, 0x49, 0x6f, 0x4c, 0x31]
+            tpc.initial_source_connection_id.get().unwrap().as_slice(),
+            &vec![0x03, 0x25, 0x05, 0xd0, 0x49, 0x6f, 0x4c, 0x31]
         );
         assert_eq!(tpc.active_connection_id_limit.get().unwrap().get(), 5);
         assert!(tpc.grease.get());

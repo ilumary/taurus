@@ -1,4 +1,4 @@
-use crate::{terror, ConnectionId, SPACE_ID_DATA, SPACE_ID_HANDSHAKE, SPACE_ID_INITIAL};
+use crate::{cid, terror, SPACE_ID_DATA, SPACE_ID_HANDSHAKE, SPACE_ID_INITIAL};
 
 use octets::{varint_len, Octets, OctetsMut};
 use rustls::quic::{DirectionalKeys, HeaderProtectionKey};
@@ -271,13 +271,12 @@ impl Frame for AckFrame {
     }
 }
 
-#[derive(Default)]
 pub struct Header {
     // header form and version specific bits
     pub hf: u8,
     pub version: u32,
-    pub dcid: ConnectionId,
-    pub scid: Option<ConnectionId>,
+    pub dcid: cid::Id,
+    pub scid: Option<cid::Id>,
     pub token: Option<Vec<u8>>,
 
     // the following fields are under header protection
@@ -299,8 +298,8 @@ impl Header {
         long_header_type: u8,
         version: u32,
         packet_num: u64,
-        dcid: &ConnectionId,
-        scid: &ConnectionId,
+        dcid: &cid::Id,
+        scid: &cid::Id,
         token: Option<Vec<u8>>,
         packet_length: usize,
     ) -> Result<Self, terror::Error> {
@@ -358,7 +357,7 @@ impl Header {
         key_phase: u8,
         version: u32,
         packet_num: u64,
-        dcid: &ConnectionId,
+        dcid: &cid::Id,
     ) -> Result<Self, terror::Error> {
         if !matches!(spin_bit, 0x00 | 0x01) {
             return Err(terror::Error::header_encoding_error(format!(
@@ -389,8 +388,8 @@ impl Header {
         spin_bit: u8,
         key_phase: u8,
         version: u32,
-        dcid: &ConnectionId,
-        scid: Option<&ConnectionId>,
+        dcid: &cid::Id,
+        scid: Option<&cid::Id>,
         packet_num: u64,
         token: Option<Vec<u8>>,
         length: usize,
@@ -417,7 +416,7 @@ impl Header {
         Self {
             hf,
             version,
-            dcid: dcid.clone(),
+            dcid: *dcid,
             scid: scid.cloned(),
             packet_num,
             packet_num_length,
@@ -690,7 +689,7 @@ mod tests {
                 .unwrap()
                 .quic
                 .unwrap(),
-            &partial_decode.dcid.id,
+            partial_decode.dcid.as_slice(),
             rustls::Side::Server,
         );
 
@@ -746,8 +745,8 @@ mod tests {
     }
     #[test]
     fn test_long_initial_header_creation() {
-        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
-        let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
+        let dcid = cid::Id::from_slice(&[0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let scid = cid::Id::from_slice(&[0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
         let header = Header::new_long_header(0x00, 1, 0, &dcid, &scid, Some(vec![]), 1201).unwrap();
 
         let mut vec = vec![0u8; 29];
@@ -772,8 +771,8 @@ mod tests {
 
     #[test]
     fn test_long_handshake_header_creation() {
-        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
-        let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
+        let dcid = cid::Id::from_slice(&[0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let scid = cid::Id::from_slice(&[0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
         let header = Header::new_long_header(0x02, 1, 1, &dcid, &scid, None, 3200).unwrap();
 
         let mut vec = vec![0u8; 28];
@@ -794,8 +793,8 @@ mod tests {
 
     #[test]
     fn test_long_zero_rtt_header_creation() {
-        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
-        let scid = ConnectionId::from_vec(vec![0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
+        let dcid = cid::Id::from_slice(&[0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let scid = cid::Id::from_slice(&[0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
         let header = Header::new_long_header(0x01, 1, 0, &dcid, &scid, None, 3200).unwrap();
 
         let mut vec = vec![0u8; 28];
@@ -816,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_short_header_creation() {
-        let dcid = ConnectionId::from_vec(vec![0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
+        let dcid = cid::Id::from_slice(&[0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
         let header = Header::new_short_header(0x00, 0x01, 1, 380, &dcid).unwrap();
 
         let mut vec = vec![0u8; 11];

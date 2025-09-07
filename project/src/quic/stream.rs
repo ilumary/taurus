@@ -746,17 +746,16 @@ impl<C: StreamCallback> StreamManager<C> {
 
     // acks a set of ranges of packet numbers. Each packet number may ack frames for multiple
     // streams.
-    pub fn ack(&mut self, pns: Vec<u64>) -> Result<(), terror::Error> {
+    pub fn ack(&mut self, pns: &[u64]) {
         for pn in pns {
-            if let Some(ids) = self.ack_pending.get_mut(&pn) {
+            if let Some(ids) = self.ack_pending.swap_remove(pn) {
                 for id in ids {
-                    if let Some(ss) = self.outbound.get_mut(id) {
-                        ss.pending.swap_remove(&pn);
+                    if let Some(ss) = self.outbound.get_mut(&id) {
+                        ss.pending.swap_remove(pn);
                     }
                 }
             }
         }
-        Ok(())
     }
 
     // resets any given stream_id. If a receiving stream is reset, a final size must be supplied
@@ -1767,7 +1766,7 @@ mod tests {
 
         sm.append(send_stream.unwrap(), &[5u8; 10], true).unwrap();
 
-        let written2 = sm.emit_single(&mut result[8..], 0x00).unwrap();
+        let written2 = sm.emit_single(&mut result[8..], 0x01).unwrap();
 
         assert_eq!(result[8], 0x0f);
         assert_eq!(result[9] as u64, send_stream.unwrap());
@@ -1778,6 +1777,44 @@ mod tests {
         assert_eq!(written2, 4 + 14); //HEADER + DATA LEN
         assert!(sm.outbound_ready.is_empty());
         assert_eq!(sm.sent, 20);
+    }
+
+    #[test]
+    fn stream_manager_ack() {
+        let config = StreamManagerConfig::default();
+        let mut sm = StreamManager::<TestStreamWaker>::new(config, rustls::Side::Server as u8);
+
+        // 1 uni stream with 64 connection limit and 64 initial stream limit
+        sm.set_max_streams_uni(1);
+        sm.set_max_data(64);
+        sm.set_initial_data_limits(0, 0, 64);
+
+        let mut result = [0u8; 64];
+
+        let send_stream = sm.initiate(false, None).unwrap();
+        sm.append(send_stream.unwrap(), &[4u8; 64], false).unwrap();
+
+        assert_eq!(
+            *sm.outbound_ready.first().unwrap(),
+            (u8::MAX, send_stream.unwrap())
+        );
+
+        let _ = sm.emit_single(&mut result[..8], 0x00).unwrap();
+        let _ = sm.emit_single(&mut result[8..16], 0x01).unwrap();
+        let _ = sm.emit_single(&mut result[16..24], 0x04).unwrap();
+        let _ = sm.emit_single(&mut result[24..32], 0x05).unwrap();
+        let _ = sm.emit_single(&mut result[32..40], 0x06).unwrap();
+        let _ = sm.emit_single(&mut result[40..48], 0x09).unwrap();
+        let _ = sm.emit_single(&mut result[48..56], 0x0a).unwrap();
+        let _ = sm.emit_single(&mut result[56..], 0x0b).unwrap();
+
+        let pre_keys = [0x00, 0x01, 0x04, 0x05, 0x06, 0x09, 0x0a, 0x0b];
+        assert!(pre_keys.iter().all(|k| sm.ack_pending.contains_key(k)));
+
+        sm.ack(&[0x00, 0x01, 0x05, 0x06, 0x0a, 0x0b]);
+
+        let after_keys = [0x04, 0x09];
+        assert!(after_keys.iter().all(|k| sm.ack_pending.contains_key(k)));
     }
 
     #[test]
