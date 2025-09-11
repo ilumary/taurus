@@ -28,6 +28,10 @@ However, some fundamental features are still incomplete. Therefore, currently in
 
 * Congestion control with loss detection and retransmissions
 
+## Testing
+
+Most of QUIC's key features in my implementation are split into logical domains, each in their own module. These include, but are not limited to, connection ids, socket io, streams, packet header functions, transport parameters, and flow control. Each functional module is tested extensively through unit tests to precisely comply with the standard. My implementation has reached a stage where I also require system/integration tests to validate the overall functionality. I am currently working on implementing these tests which poses some challenges.
+
 ## Extensions
 
 Once the basic QUIC spec is implemented and taurus fully complies with [RFC 9000](https://datatracker.ietf.org/doc/rfc9000), [RFC 9001](https://datatracker.ietf.org/doc/rfc9001), [RFC 9002](https://datatracker.ietf.org/doc/rfc9002), and [RFC 8999](https://datatracker.ietf.org/doc/rfc8999), the following extensions are planned:

@@ -208,6 +208,13 @@ impl ClientConfig {
     }
 
     pub async fn build(self) -> Result<Client, terror::Error> {
+        self.build_with::<io::DefaultTransmitProvider>()
+    }
+
+    fn build_with<S>(self) -> Result<Client, terror::Error>
+    where
+        S: io::TransmitProvider,
+    {
         let (server_tx, _) = mpsc::channel::<Connection>(1);
         let (ncc_tx, ncc_rx) =
             mpsc::channel::<(SocketAddr, ServerName<'static>, oneshot::Sender<Connection>)>(64);
@@ -224,7 +231,7 @@ impl ClientConfig {
             ncc_tx: IndexMap::new(),
         };
 
-        io::event_loop(self.listen_on, 1500, 8, 8, endpoint);
+        io::event_loop::<S>(self.listen_on, 1500, 8, 8, endpoint);
 
         Ok(Client { connector: ncc_tx })
     }
@@ -318,6 +325,13 @@ impl ServerConfig {
     }
 
     pub async fn build(self) -> Result<Server, terror::Error> {
+        self.build_with::<io::DefaultTransmitProvider>()
+    }
+
+    fn build_with<S>(self) -> Result<Server, terror::Error>
+    where
+        S: io::TransmitProvider,
+    {
         let (new_connection_tx, new_connection_rx) = mpsc::channel::<Connection>(64);
         let (_, ncc_rx) = mpsc::channel::<(SocketAddr, ServerName, oneshot::Sender<Connection>)>(1);
         let hmac_reset_key = [0u8; 64];
@@ -333,7 +347,7 @@ impl ServerConfig {
             ncc_tx: IndexMap::new(),
         };
 
-        io::event_loop(self.address, 1500, 8, 8, endpoint);
+        io::event_loop::<S>(self.address, 1500, 8, 8, endpoint);
 
         Ok(Server {
             address: self.address,
@@ -810,4 +824,259 @@ pub(crate) trait ConnectionApi: Send + Sync {
     fn keep_alive(&self, enable: bool);
 
     fn zero_rtt(&self, enable: bool);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::{
+        collections::HashMap,
+        net::{Ipv4Addr, SocketAddrV4},
+        sync::{Arc, OnceLock},
+    };
+
+    use async_trait::async_trait;
+    use tokio::sync::{mpsc, RwLock};
+
+    type PacketHook = Option<Arc<dyn Fn(&mut io::Packet) + Send + Sync>>;
+
+    static PACKET_ROUTER: OnceLock<Arc<RwLock<PacketRouter>>> = OnceLock::new();
+
+    fn get_router() -> Arc<RwLock<PacketRouter>> {
+        PACKET_ROUTER
+            .get_or_init(|| Arc::new(RwLock::new(PacketRouter::new())))
+            .clone()
+    }
+
+    /// maps socket addresses to their receive channels. used for testing only
+    struct PacketRouter {
+        sockets: HashMap<SocketAddr, mpsc::UnboundedSender<io::Packet>>,
+    }
+
+    impl PacketRouter {
+        fn new() -> Self {
+            Self {
+                sockets: HashMap::new(),
+            }
+        }
+
+        fn register_socket(
+            &mut self,
+            addr: SocketAddr,
+            sender: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
+        ) {
+            self.sockets.insert(addr, sender);
+        }
+
+        fn unregister_socket(&mut self, addr: &SocketAddr) {
+            self.sockets.remove(addr);
+        }
+
+        fn route_packet(
+            &self,
+            data: &[u8],
+            from: SocketAddr,
+            to: SocketAddr,
+        ) -> std::io::Result<usize> {
+            if let Some(sender) = self.sockets.get(&to) {
+                let packet = (data.to_vec(), from);
+                sender.send(packet).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionRefused,
+                        "Destination socket closed",
+                    )
+                })?;
+                Ok(data.len())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("No socket bound to {}", to),
+                ))
+            }
+        }
+    }
+
+    // test socket implementation that routes packets through memory
+    pub struct TestSocket {
+        local_addr: SocketAddr,
+        receiver: Arc<RwLock<mpsc::UnboundedReceiver<io::Packet>>>,
+        _sender: mpsc::UnboundedSender<io::Packet>,
+        packet_hook: PacketHook,
+    }
+
+    impl TestSocket {
+        fn new(addr: SocketAddr, packet_hook: PacketHook) -> std::io::Result<Self> {
+            let (sender, receiver) = mpsc::unbounded_channel();
+
+            // register with global router
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let binding = get_router();
+                    let mut router = binding.write().await;
+                    router.register_socket(addr, sender.clone());
+                })
+            });
+
+            Ok(Self {
+                local_addr: addr,
+                receiver: Arc::new(RwLock::new(receiver)),
+                _sender: sender,
+                packet_hook,
+            })
+        }
+    }
+
+    impl Drop for TestSocket {
+        fn drop(&mut self) {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let binding = get_router();
+                    let mut router = binding.write().await;
+                    router.unregister_socket(&self.local_addr);
+                })
+            });
+        }
+    }
+
+    #[async_trait]
+    impl io::Transmit for TestSocket {
+        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let mut receiver = self.receiver.write().await;
+
+            match receiver.recv().await {
+                Some((data, from_addr)) => {
+                    let len = std::cmp::min(buf.len(), data.len());
+                    buf[..len].copy_from_slice(&data[..len]);
+                    Ok((len, from_addr))
+                }
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Socket channel closed",
+                )),
+            }
+        }
+
+        async fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+            // we make a copy to modify it
+            let mut packet: io::Packet = (buf.to_vec(), to);
+
+            // apply hook if present
+            if let Some(hook) = &self.packet_hook {
+                hook(&mut packet);
+            }
+
+            let binding = get_router();
+            let router = binding.read().await;
+            router.route_packet(&packet.0, self.local_addr, packet.1)
+        }
+    }
+
+    /// test provider that creates in-memory sockets
+    pub struct TestableTransmitProvider {
+        next_port: u16,
+        packet_hook: PacketHook,
+    }
+
+    impl io::TransmitProvider for TestableTransmitProvider {
+        type Socket = TestSocket;
+
+        fn init() -> Self {
+            Self {
+                next_port: 10000,
+                packet_hook: None,
+            }
+        }
+
+        fn bind(&mut self, mut addr: SocketAddr) -> std::io::Result<Arc<Self::Socket>> {
+            if addr.port() == 0 {
+                addr.set_port(self.next_port);
+                self.next_port += 1;
+            }
+
+            let socket = TestSocket::new(addr, self.packet_hook.clone())?;
+            Ok(Arc::new(socket))
+        }
+    }
+
+    /// utility functions for testing
+    impl TestableTransmitProvider {
+        pub fn set_hook(&mut self, packet_hook: PacketHook) {
+            self.packet_hook = packet_hook;
+        }
+
+        pub async fn clear_sockets(ports: &[u16]) {
+            let router = get_router();
+            let mut router = router.write().await;
+            router
+                .sockets
+                .retain(|addr, _| !ports.contains(&addr.port()));
+        }
+    }
+
+    use crate::io::{Transmit, TransmitProvider};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn custom_socket_packet_routing() {
+        let mut provider = TestableTransmitProvider::init();
+
+        // create two test sockets
+        let addr1 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8001));
+        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8002));
+
+        let socket1 = provider.bind(addr1).unwrap();
+        let socket2 = provider.bind(addr2).unwrap();
+
+        // send packet from socket1 to socket2
+        let test_data = b"Hello, World!";
+        let sent = socket1.send_to(test_data, addr2).await.unwrap();
+        assert_eq!(sent, test_data.len());
+
+        // receive packet on socket2
+        let mut buf = [0u8; 1024];
+        let (received_len, from_addr) = socket2.recv_from(&mut buf).await.unwrap();
+
+        assert_eq!(received_len, test_data.len());
+        assert_eq!(&buf[..received_len], test_data);
+        assert_eq!(from_addr, addr1);
+
+        TestableTransmitProvider::clear_sockets(&[8001, 8002]).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn custom_socket_packet_hook() {
+        let mut provider = TestableTransmitProvider::init();
+
+        // set a hook to modify outgoing packets
+        provider.set_hook(Some(Arc::new(|packet: &mut io::Packet| {
+            if packet.0[0] == b'H' {
+                packet.0[0] = b'B';
+            }
+        })));
+
+        // create two test sockets
+        let addr1 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8003));
+        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8004));
+
+        let socket1 = provider.bind(addr1).unwrap();
+        let socket2 = provider.bind(addr2).unwrap();
+
+        // send packet from socket1 to socket2
+        let test_data = b"Hello, World!";
+        let sent = socket1.send_to(test_data, addr2).await.unwrap();
+        assert_eq!(sent, test_data.len());
+
+        // receive packet on socket2
+        let mut buf = [0u8; 1024];
+        let (received_len, from_addr) = socket2.recv_from(&mut buf).await.unwrap();
+
+        let modified_data = b"Bello, World!";
+
+        assert_eq!(received_len, test_data.len());
+        assert_ne!(&buf[..received_len], test_data);
+        assert_eq!(&buf[..received_len], modified_data);
+        assert_eq!(from_addr, addr1);
+
+        TestableTransmitProvider::clear_sockets(&[8003, 8004]).await;
+    }
 }

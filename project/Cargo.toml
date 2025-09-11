@@ -30,3 +30,4 @@ intrusive-collections = "0.9.7"
 thingbuf = {version = "0.1.6", features = ["static", "alloc"]}
 socket2 = "0.5.8"
 smallvec = "1.15.1"
+async-trait = "0.1.89"
