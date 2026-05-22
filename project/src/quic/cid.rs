@@ -1,7 +1,7 @@
 use crate::{terror, token::StatelessResetToken};
 use smallvec::SmallVec;
 
-use rand::RngCore;
+use rand::Rng;
 use std::{
     collections::VecDeque,
     fmt,
@@ -50,7 +50,7 @@ impl Id {
     fn generate_with_length(length: usize) -> Self {
         assert!(length <= MAX_CID_SIZE);
         let mut b = [0u8; MAX_CID_SIZE];
-        rand::thread_rng().fill_bytes(&mut b[..length]);
+        rand::rng().fill_bytes(&mut b[..length]);
         Id::from_slice(b[..length].into())
     }
 }
@@ -451,7 +451,7 @@ mod tests {
     fn init_hmac_key_value() -> &'static [u8; 64] {
         HMAC_RESET_KEY_VALUE.get_or_init(|| {
             let mut arr = [0u8; 64];
-            rand::thread_rng().fill_bytes(&mut arr);
+            rand::rng().fill_bytes(&mut arr);
             arr
         })
     }

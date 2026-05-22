@@ -14,20 +14,20 @@ name = "quic_bin"
 path = "src/main.rs"
 
 [dependencies]
-octets = "0.3.0"
-rustls = { version = "0.23.21", default-features = false, features = ["ring", "std"] }
-rcgen = "0.13.2"
-rand = "0.8.5"
-ring = "0.17.8"
-tokio = { version = "1.43.0", features = ["full"] }
-tokio-util = { version = "0.7.13" }
-futures = "0.3.31"
-tracing = "0.1.41"
-tracing-subscriber = "0.3.19"
-indexmap = "2.7.0"
-parking_lot = "0.12.3"
-intrusive-collections = "0.9.7"
+octets = "0.3.5"
+rustls = { version = "0.23.37", default-features = false, features = ["ring", "std"] }
+rcgen = "0.14.7"
+rand = "0.10.0"
+ring = "0.17.14"
+tokio = { version = "1.50.0", features = ["full"] }
+tokio-util = { version = "0.7.18" }
+futures = "0.3.32"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "std"] }
+indexmap = "2.13.1"
+parking_lot = "0.12.5"
+intrusive-collections = "0.10.0"
 thingbuf = {version = "0.1.6", features = ["static", "alloc"]}
-socket2 = "0.5.8"
+socket2 = "0.6.3"
 smallvec = "1.15.1"
 async-trait = "0.1.89"

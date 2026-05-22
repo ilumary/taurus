@@ -1,14 +1,11 @@
 use quic::terror;
 
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::{filter::EnvFilter};
 
 fn main() {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::DEBUG)
-        .finish();
-
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
 
     let _ = run_server();
 }

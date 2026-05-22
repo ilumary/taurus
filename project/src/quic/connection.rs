@@ -61,7 +61,7 @@ impl Client {
     ///         .build()
     ///         .await
     ///         .unwrap();
-    ///     
+    ///
     ///     if let Some(connection) = client.connect("[::1]:8080".parse().unwrap()).await {
     ///         println!("connected!");
     ///     }
@@ -102,13 +102,13 @@ impl Client {
     ///         .build()
     ///         .await
     ///         .unwrap();
-    ///     
+    ///
     ///     if let Ok(connecting) = client.connect_to_hostname("www.google.com", 8080, 1).await {
     ///         if let Some(connection) = connecting.await {
     ///             println!("connected!");
     ///         }
     ///     }
-    ///     
+    ///
     ///     // OR
     ///
     ///     if let Ok(connecting) = client.connect_to_hostname("localhost", 8080, 1).await {
@@ -272,7 +272,7 @@ impl Server {
     ///     .build()
     ///     .await
     ///     .unwrap();
-    ///     
+    ///
     ///     while let Some(connection) = server.accept().await {
     ///         println!("connected!");
     ///     }
@@ -360,7 +360,7 @@ impl ServerConfig {
 
 // internal impl
 
-intrusive_adapter!(ConnectionAdapter = Arc<LockedInner>: LockedInner { direct_link: RBTreeAtomicLink });
+intrusive_adapter!(ConnectionAdapter = Arc<LockedInner>: LockedInner { direct_link => RBTreeAtomicLink });
 impl<'a> KeyAdapter<'a> for ConnectionAdapter {
     type Key = cid::Id;
     fn get_key(&self, x: &'a LockedInner) -> cid::Id {
@@ -369,10 +369,10 @@ impl<'a> KeyAdapter<'a> for ConnectionAdapter {
 }
 
 intrusive_adapter!(TransmissionPendingAdapter = Arc<LockedInner>:
-    LockedInner { transmission_link: LinkedListAtomicLink });
+    LockedInner { transmission_link => LinkedListAtomicLink });
 
 intrusive_adapter!(ConnectionClosedAdapter = Arc<LockedInner>:
-    LockedInner { closed_link: LinkedListAtomicLink });
+    LockedInner { closed_link => LinkedListAtomicLink });
 
 struct ConnectionMap {
     // main connection list, sorted by connection id

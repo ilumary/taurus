@@ -1,16 +1,19 @@
 pub mod connection;
 pub mod terror;
 
+mod cc;
 mod cid;
 mod fc;
 mod io;
+mod ranges;
 mod packet;
 mod stream;
 mod token;
 mod transport_parameters;
 
+use crate::{cc::{CongestionController, UnlimitedWindow}, ranges::RangeSet};
 use octets::{varint_len, OctetsMut};
-use packet::{AckFrame, Frame, Header};
+use packet::{AckFrame, Header};
 use rustls::{
     quic::{
         Connection as RustlsConnection, DirectionalKeys, KeyChange, Keys, PacketKeySet, Version,
@@ -71,6 +74,9 @@ struct Inner {
 
     // stream manager, does all stream logic
     sm: StreamManager<stream::StreamWaker>,
+
+    // congestion controller
+    cc: CongestionController<UnlimitedWindow>,
 
     // Packet number spaces, inital, handshake, 1-RTT
     packet_spaces: [PacketNumberSpace; 3],
@@ -244,6 +250,7 @@ impl Inner {
             state: ConnectionState::Initial,
             cidm: cim,
             sm,
+            cc: CongestionController::new(UnlimitedWindow),
             packet_spaces: [
                 initial_space,
                 PacketNumberSpace::new(),
@@ -260,7 +267,7 @@ impl Inner {
 
         // process inital packet explicitly to reduce state keeping
         // no need to check the error type, as the connection is discarded in case of an error
-        inner.process_initial_packet(&head, buffer)?;
+        inner.process_initial_packet(&head, buffer, start)?;
 
         // initial packet processing time
         let _m = start.elapsed().as_millis();
@@ -331,6 +338,7 @@ impl Inner {
             state: ConnectionState::Initial,
             cidm: cim,
             sm,
+            cc: CongestionController::new(UnlimitedWindow),
             packet_spaces: [
                 initial_space,
                 PacketNumberSpace::new(),
@@ -521,7 +529,7 @@ impl Inner {
 
         let (mut payload, _) = payload_cipher.split_at(dec_len)?;
 
-        self.process_payload(header, &mut payload)?;
+        self.process_payload(header, &mut payload, start)?;
 
         // calucate ema
         let _ppt = start.elapsed().as_nanos();
@@ -534,13 +542,14 @@ impl Inner {
         &mut self,
         header: &Header,
         packet_raw: &mut [u8],
+        now: Instant,
     ) -> Result<(), terror::Error> {
         let mut payload = octets::OctetsMut::with_slice(packet_raw);
 
         // skip forth to packet payload
         payload.skip(header.raw_length + header.packet_num_length as usize + 1)?;
 
-        self.process_payload(header, &mut payload)?;
+        self.process_payload(header, &mut payload, now)?;
 
         if let Some(tpc) = self.tls_session.quic_transport_parameters() {
             self.remote_tpc.update(tpc)?;
@@ -584,6 +593,7 @@ impl Inner {
         &mut self,
         header: &Header,
         payload: &mut OctetsMut,
+        now: Instant,
     ) -> Result<(), terror::Error> {
         let mut ack_eliciting = false;
 
@@ -606,8 +616,8 @@ impl Inner {
                 } //PADDING
                 0x01 => {} //PING
                 0x02 | 0x03 => {
-                    let ack = AckFrame::from_bytes(&frame_code, payload);
-                    self.process_ack(ack, header.space())?;
+                    let ack = AckFrame::parse(&frame_code, payload);
+                    self.process_ack(ack, header.space(), now)?;
                 } //ACK
                 0x04 => {
                     let stream_id = payload.get_varint()?;
@@ -785,10 +795,12 @@ impl Inner {
             }
         }
 
+        self.packet_spaces[header.space()]
+            .received_pns
+            .push(header.packet_num);
+
         if ack_eliciting {
-            self.packet_spaces[header.space()]
-                .outgoing_acks
-                .push(header.packet_num);
+            self.packet_spaces[header.space()].ack_eliciting_received = true;
         }
 
         // if we get to here, no error occured and if a protocol error occurs, no frame is the
@@ -798,28 +810,24 @@ impl Inner {
         Ok(())
     }
 
-    fn process_ack(&mut self, ack: AckFrame, space: usize) -> Result<(), terror::Error> {
-        let acknowledged = ack.into_pn_vec();
+    fn process_ack(&mut self, ack: AckFrame, space: usize, now: Instant) -> Result<(), terror::Error> {
+        let (acked_pns, lost_pns) = self.cc.on_ack_received(space, ack, now);
 
-        debug!(
-            "got ack frame acknowledging the following packet numbers: {:?}",
-            acknowledged
-        );
+        debug!(count = acked_pns.len(), space, "processing ACK frame");
 
-        self.sm.ack(&acknowledged);
-        self.cidm.ack(&acknowledged);
+        self.sm.ack(&acked_pns);
+        self.cidm.ack(&acked_pns);
 
-        // both vecs are guaranteed to be sorted with no duplicate values
-        // remove acknowledged pns from cached pns awaiting acknowledgement
-        let to_remove = std::collections::BTreeSet::from_iter(acknowledged);
-        self.packet_spaces[space]
-            .awaiting_acknowledgement
-            .retain(|e| !to_remove.contains(e));
+        // TODO also decide what frames to track with what data
+        // TODO add tracking to what we sent. if we get an ack for a packet in which we sent an ack
+        // we excute:
+        // self.packet_spaces[space].received_pns.remove_until(largest_acked_by_that_packet);
+        // maybe even let on_ack_received return an owning vector to the frames
 
-        debug!(
-            "{:?} are the packet numbers still awaiting acknowledgement",
-            self.packet_spaces[space].awaiting_acknowledgement
-        );
+        if !lost_pns.is_empty() {
+            warn!(count = lost_pns.len(), space, "packets declared lost after ACK");
+            // TODO: mark frames carried by lost_pns for retransmission
+        }
 
         Ok(())
     }
@@ -917,6 +925,8 @@ impl Inner {
         let mut contains_initial = false;
         let mut encoded_packets: usize = 0;
 
+        let mut ack_eliciting = false;
+
         while remaining > 0 {
             let (packet_type, space_id) = self.get_packet_type();
 
@@ -940,6 +950,7 @@ impl Inner {
             debug!("building {} packet", packet_type);
             debug!("remaining space {}", remaining);
 
+            let now = Instant::now();
             let pn = self.packet_spaces[space_id].get_next_pkt_num();
             let dcid = self.cidm.get_dcid();
 
@@ -1065,35 +1076,31 @@ impl Inner {
 
             // fill that packet with data
             // ack frames
-            if !self.packet_spaces[space_id].outgoing_acks.is_empty() && !is_closing {
-                // sort outgoing acks in reverse to ease range building
-                self.packet_spaces[space_id]
-                    .outgoing_acks
-                    .sort_by(|a, b| b.cmp(a));
+            if self.packet_spaces[space_id].ack_eliciting_received && !is_closing {
+                const LOCAL_ACK_DELAY_EXPONENT: u32 = 3;
+                let ack_delay = self.packet_spaces[space_id]
+                    .latest_ack_recv_time
+                    .map(|t| now.duration_since(t).as_micros() as u64 >> LOCAL_ACK_DELAY_EXPONENT)
+                    .unwrap_or(0);
 
-                debug!(
-                    "ACK frame: s[{}] {:?}",
-                    space_id, self.packet_spaces[space_id].outgoing_acks,
-                );
-
-                // TODO figure out delay
-                let ack_delay = 64 * (2 ^ self.remote_tpc.ack_delay_exponent.get().unwrap().get());
+                //debug!(space = space_id, count = self.packet_spaces[space_id].received_pns.len(),
+                //    ack_delay, "encoding ACK frame");
 
                 // directly generate ack frame from packet number vector
-                let ack_frame = AckFrame::from_packet_number_vec(
-                    &self.packet_spaces[space_id].outgoing_acks,
+
+                // TODO there is a bug here. If frame was too small, directly passing the octets buf
+                // still advances it, effectively writing a corrupted frame
+
+                let _ = AckFrame::to_bytes( // TODO decide if we want to do something with the error
+                    &self.packet_spaces[space_id].received_pns,
+                    None, // TODO figure out
                     ack_delay,
+                    &mut buf,
                 );
 
-                if let Err(err) = packet::encode_frame(&ack_frame, &mut buf) {
-                    return Err(terror::Error::buffer_size_error(format!(
-                        "insufficient sized buffer for ack frame ({})",
-                        err
-                    )));
-                };
-
                 //clear vector as packet numbers are now ack'ed
-                self.packet_spaces[space_id].outgoing_acks.clear();
+                self.packet_spaces[space_id].latest_ack_recv_time = None;
+                self.packet_spaces[space_id].ack_eliciting_received = false
             };
 
             // clear queued crypto frames in case the connection is beeing closed
@@ -1115,6 +1122,8 @@ impl Inner {
                     buf.put_bytes(data)?;
 
                     self.packet_spaces[space_id].outgoing_crypto.pop_front();
+
+                    ack_eliciting = true;
                 } else {
                     warn!("not enough space left to encode crypto frame with len {enc_len}");
                 }
@@ -1137,6 +1146,8 @@ impl Inner {
                         buf.put_bytes(&srt.token)?;
 
                         self.events.push(InnerEvent::NewConnectionId(id));
+
+                        ack_eliciting = true;
                     }
                 }
 
@@ -1145,6 +1156,7 @@ impl Inner {
                 if next_sqn_retirement > 0 && buf.cap() >= next_sqn_retirement {
                     buf.put_u8(0x19)?;
                     buf.put_varint(self.cidm.pop_next_pending_cid_retirement(pn))?;
+                    ack_eliciting = true;
                 }
 
                 // create STREAMS_BLOCKED if bidi streams are blocked
@@ -1152,6 +1164,7 @@ impl Inner {
                     debug!("bidi streams blocked at {}", seq);
                     buf.put_varint(0x16)?;
                     buf.put_varint(seq)?;
+                    ack_eliciting = true;
                 }
 
                 // create STREAMS_BLOCKED if uni streams are blocked
@@ -1159,6 +1172,7 @@ impl Inner {
                     debug!("uni streams blocked at {}", seq);
                     buf.put_varint(0x17)?;
                     buf.put_varint(seq)?;
+                    ack_eliciting = true;
                 }
 
                 // create MAX_STREAM_DATA frames for connection
@@ -1176,12 +1190,23 @@ impl Inner {
 
                     buf.put_varint(0x10)?;
                     buf.put_varint(n_md)?;
+                    ack_eliciting = true;
                 }
 
                 // encode stream frame last to ensure enough room for flow control frames.
                 // implicitly encodes DATA_BLOCKED, STREAM_DATA_BLOCKED
                 let bytes = self.sm.emit_fill(buf.as_mut(), pn)?;
                 buf.skip(bytes)?;
+                if bytes > 0 { ack_eliciting = true; }
+
+                // PTO probe: if a probe is required but no ack-eliciting frame has been
+                // written yet, emit a PING. This satisfies the probe obligation without
+                // any retransmission logic; probe_pending is cleared by on_packet_sent
+                if self.cc.probe_pending() && !ack_eliciting && buf.cap() >= 1 {
+                    buf.put_u8(0x01)?; // PING
+                    ack_eliciting = true;
+                    debug!("emitting PING frame to satisfy PTO probe");
+                }
             }
 
             // if is last packet, pad to min size of 1200
@@ -1219,6 +1244,10 @@ impl Inner {
             let packet_length = packet::encrypt(&mut buf, keys, pn, payload_offset)?;
 
             debug!("packet_length: {}", packet_length);
+
+            if ack_eliciting {
+                self.cc.on_packet_sent(space_id, pn, packet_length, now);
+            }
 
             encoded_packets += 1;
             remaining -= packet_length;
@@ -1280,8 +1309,13 @@ enum ConnectionState {
 struct PacketNumberSpace {
     keys: Option<Keys>,
 
-    outgoing_acks: Vec<u64>,
-    awaiting_acknowledgement: Vec<u64>,
+    received_pns: RangeSet,
+
+    // timestamp of the most recent ack-eliciting packet received in this space.
+    // used to compute the ack delay field, the time between receiving the packet and
+    // actually sending the ack
+    latest_ack_recv_time: Option<Instant>,
+    ack_eliciting_received: bool,
 
     outgoing_crypto: VecDeque<(u64, Vec<u8>)>,
     outgoing_crypto_offset: u64,
@@ -1295,8 +1329,9 @@ impl PacketNumberSpace {
     fn new() -> Self {
         Self {
             keys: None,
-            outgoing_acks: Vec::new(),
-            awaiting_acknowledgement: Vec::new(),
+            received_pns: RangeSet::new(64),
+            latest_ack_recv_time: None,
+            ack_eliciting_received: false,
             outgoing_crypto: VecDeque::new(),
             outgoing_crypto_offset: 0,
             next_pkt_num: 0,
@@ -1305,9 +1340,8 @@ impl PacketNumberSpace {
     }
 
     //determines if a space has outgoing crypto data or acks
-    //TODO expand with lost packets
     fn wants_write(&self) -> bool {
-        self.active && (!self.outgoing_acks.is_empty() || !self.outgoing_crypto.is_empty())
+        self.active && (self.ack_eliciting_received || !self.outgoing_crypto.is_empty())
     }
 
     fn get_next_pkt_num(&mut self) -> u64 {
