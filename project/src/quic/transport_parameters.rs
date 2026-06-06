@@ -28,7 +28,7 @@ impl IOHandler<Id> for Id {
     }
 }
 
-#[derive(PartialEq, Default)]
+#[derive(PartialEq, Default, Clone, Copy)]
 pub struct VarInt {
     value: u64,
 }
@@ -87,7 +87,7 @@ impl IOHandler<StatelessResetToken> for StatelessResetToken {
     }
 }
 
-#[derive(PartialEq, Default)]
+#[derive(PartialEq, Default, Clone, Copy)]
 pub struct PreferredAddressData {
     pub address_v4: Option<SocketAddrV4>,
     pub address_v6: Option<SocketAddrV6>,
@@ -150,7 +150,7 @@ trait TransportParameter: Sized {
 
     type ValueType;
 
-    fn get_value(&self) -> Option<&Self::ValueType>;
+    fn get_value(&self) -> &Self::ValueType;
 
     fn decode(buf: &mut Octets) -> Result<Self, terror::Error>;
 
@@ -162,13 +162,14 @@ macro_rules! transport_parameter {
         transport_parameter!($name, $id, $valuetype, <$valuetype as Default>::default());
     };
     ($name:ident, $id:expr, $valuetype:ty, $default:expr) => {
+        #[derive(Clone, Copy)]
         pub struct $name {
             value: $valuetype,
         }
 
         impl $name {
             //Expose get method so that trait can be private
-            pub fn get(&self) -> Option<&$valuetype> {
+            pub fn get(&self) -> &$valuetype {
                 self.get_value()
             }
         }
@@ -192,8 +193,8 @@ macro_rules! transport_parameter {
 
             type ValueType = $valuetype;
 
-            fn get_value(&self) -> Option<&Self::ValueType> {
-                Some(&self.value)
+            fn get_value(&self) -> &Self::ValueType {
+                &self.value
             }
 
             fn decode(buf: &mut Octets) -> Result<Self, terror::Error> {
@@ -247,8 +248,8 @@ macro_rules! zero_sized_transport_parameter {
 
             type ValueType = bool;
 
-            fn get_value(&self) -> Option<&Self::ValueType> {
-                Some(&self.enabled)
+            fn get_value(&self) -> &Self::ValueType {
+                &self.enabled
             }
 
             fn decode(buf: &mut Octets) -> Result<Self, terror::Error> {
@@ -622,15 +623,14 @@ impl TransportConfig {
 
     pub fn get_initial_limits(&self) -> (u64, u64, u64, u64, u64, u64) {
         (
-            self.initial_max_data.get().unwrap().get(),
-            self.initial_max_stream_data_bidi_local.get().unwrap().get(),
+            self.initial_max_data.get().get(),
+            self.initial_max_stream_data_bidi_local.get().get(),
             self.initial_max_stream_data_bidi_remote
                 .get()
-                .unwrap()
                 .get(),
-            self.initial_max_stream_data_uni.get().unwrap().get(),
-            self.initial_max_streams_bidi.get().unwrap().get(),
-            self.initial_max_streams_uni.get().unwrap().get(),
+            self.initial_max_stream_data_uni.get().get(),
+            self.initial_max_streams_bidi.get().get(),
+            self.initial_max_streams_uni.get().get(),
         )
     }
 }
@@ -681,12 +681,12 @@ mod tests {
 
         let tpc = TransportConfig::decode(&raw).unwrap();
 
-        assert_eq!(tpc.max_idle_timeout.get().unwrap().get(), 10000);
+        assert_eq!(tpc.max_idle_timeout.get().get(), 10000);
         assert_eq!(
-            tpc.initial_source_connection_id.get().unwrap().as_slice(),
+            tpc.initial_source_connection_id.get().as_slice(),
             &vec![0x03, 0x25, 0x05, 0xd0, 0x49, 0x6f, 0x4c, 0x31]
         );
-        assert_eq!(tpc.active_connection_id_limit.get().unwrap().get(), 5);
+        assert_eq!(tpc.active_connection_id_limit.get().get(), 5);
         assert!(tpc.grease.get());
     }
 }

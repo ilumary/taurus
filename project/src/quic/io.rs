@@ -7,7 +7,12 @@ use tracing::{error, info};
 
 use crate::connection::Endpoint;
 
-pub type Packet = (Vec<u8>, SocketAddr);
+#[derive(Clone)]
+pub struct Packet {
+    pub data: Vec<u8>,
+    pub local: SocketAddr,
+    pub peer: SocketAddr,
+}
 
 pub type SendQueue = thingbuf::mpsc::Sender<Packet, CustomRecycler>;
 type RecvQueue = thingbuf::mpsc::Receiver<Packet, CustomRecycler>;
@@ -90,8 +95,8 @@ mod platform {
     }
 }
 
-/// non-unix implementation (everything else)
-#[cfg(any(target_os = "macos", windows))]
+/// macos implementation
+#[cfg(target_os = "macos")]
 mod platform {
     use super::*;
 
@@ -110,15 +115,12 @@ mod platform {
         /// ones for server applications, the following implementation isnt very well maintained. it
         /// basically clones the same socket by wrapping it in an [`std::net::Arc<tokio::net::UdpSocket>`].
         fn bind(&mut self, addr: SocketAddr) -> std::io::Result<Arc<Self::Socket>> {
-            let socket = if self.socket.is_some() {
-                self.socket.as_ref().unwrap()
-            } else {
-                let std_socket = std::net::UdpSocket::bind(addr)?;
-                std_socket.set_nonblocking(true)?;
-                &Arc::new(tokio::net::UdpSocket::from_std(std_socket)?)
-            };
-
-            Ok(socket.clone())
+            if let Some(s) = &self.socket { return Ok(s.clone()); }
+            let std_socket = std::net::UdpSocket::bind(addr)?;
+            std_socket.set_nonblocking(true)?;
+            let sock = Arc::new(tokio::net::UdpSocket::from_std(std_socket)?);
+            self.socket = Some(sock.clone());
+            Ok(sock)
         }
     }
 }
@@ -141,12 +143,12 @@ pub struct CustomRecycler {
 
 impl recycling::Recycle<Packet> for CustomRecycler {
     fn new_element(&self) -> Packet {
-        let v = vec![0u8; self.buf_size];
-        (v, "[::1]:8080".parse().unwrap())
+        let unspecified = SocketAddr::from(([0u16; 8], 0));
+        Packet { data: vec![0u8; self.buf_size], local: unspecified, peer: unspecified }
     }
 
     fn recycle(&self, element: &mut Packet) {
-        reset_vec_write_bytes(&mut element.0, self.buf_size);
+        reset_vec_write_bytes(&mut element.data, self.buf_size);
     }
 }
 
@@ -190,19 +192,17 @@ fn start_sockets<S: TransmitProvider>(
             .bind(addr)
             .expect("failed to bind socket to {addr}");
 
+        let local = addr;
         tokio::spawn(async move {
             while let Ok(mut entry) = tx.send_ref().await {
-                let test = &mut entry.0;
-                match socket.recv_from(test).await {
-                    Ok((size, src_addr)) => {
-                        entry.0.truncate(size);
-                        entry.1 = src_addr;
+                match socket.recv_from(&mut entry.data).await {
+                    Ok((size, src)) => {
+                        entry.data.truncate(size);
+                        entry.local = local;
+                        entry.peer = src;
                     }
-                    Err(error) => {
-                        error!("Error while receiving datagram: {:?}", error);
-                        continue;
-                    }
-                };
+                    Err(error) => { error!("recv error: {error:?}"); continue; }
+                }
             }
         });
 
@@ -225,9 +225,10 @@ fn start_sockets<S: TransmitProvider>(
 
         tokio::spawn(async move {
             while let Some(entry) = rx.recv_ref().await {
-                match socket.send_to(&entry.0, entry.1).await {
+                if entry.data.is_empty() { continue; }
+                match socket.send_to(&entry.data, entry.peer).await {
                     Ok(x) => {
-                        info!("sent {} bytes to {}", x, entry.1);
+                        info!("sent {} bytes to {}", x, entry.peer);
                     }
                     Err(error) => {
                         error!("Error while sending datagram: {:?}", error);
@@ -254,9 +255,7 @@ fn poll_socket_receivers<'a, T>(
             std::task::Poll::Ready(Some(rr)) => {
                 return std::task::Poll::Ready(Some(rr));
             }
-            std::task::Poll::Ready(None) => {
-                return std::task::Poll::Ready(None);
-            }
+            std::task::Poll::Ready(None) => { continue; }
             std::task::Poll::Pending => {
                 continue;
             }
@@ -291,7 +290,7 @@ pub fn event_loop<S: TransmitProvider>(
 
             tokio::select! {
                 incoming = recv => {
-                    if let Some(recv_buf) = incoming{
+                    if let Some(recv_buf) = incoming {
                         ep.recv(recv_buf);
                     }
                 }
@@ -303,12 +302,12 @@ pub fn event_loop<S: TransmitProvider>(
                     let data = sender.deref_mut();
                     let mut conn = inner.lock();
 
-                    match conn.fetch_dgram(&mut data.0) {
-                        Ok(len) => data.0.truncate(len),
-                        Err(err) => error!("error while fetching datagram: {err}"),
+                    match conn.fetch_dgram(&mut data.data) {
+                        Ok(len) => data.data.truncate(len),
+                        Err(err) => {error!("error while fetching datagram: {err}"); data.data.clear();},
                     }
 
-                    data.1 = conn.get_current_path();
+                    data.peer = conn.get_current_path();
 
                     drop(conn);
 

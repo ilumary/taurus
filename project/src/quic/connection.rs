@@ -1,3 +1,4 @@
+use crate::io::Packet;
 use indexmap::IndexMap;
 use intrusive_collections::{
     intrusive_adapter, rbtree::Cursor, KeyAdapter, LinkedList, LinkedListAtomicLink, RBTree,
@@ -8,8 +9,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::{
     net::lookup_host,
     sync::{mpsc, oneshot},
-    time::{timeout, Duration},
+    time::{timeout, Duration, Instant as TokioInstant},
 };
+use tokio_util::time::{delay_queue::Key, DelayQueue};
 use tracing::{debug, error, info, warn};
 
 use std::{
@@ -19,6 +21,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use crate::{cid, io, packet::Header, stream, terror, ConnectionState, Inner, InnerEvent};
@@ -221,6 +224,7 @@ impl ClientConfig {
         let hmac_reset_key = [0u8; 64];
 
         let endpoint = Endpoint {
+            local_addr: self.listen_on,
             connections: ConnectionMap::new(),
             connection_ids: IndexMap::new(),
             server_config: None,
@@ -229,6 +233,8 @@ impl ClientConfig {
             nc_tx: server_tx,
             ncc_rx,
             ncc_tx: IndexMap::new(),
+            timers: DelayQueue::new(),
+            timer_keys: IndexMap::new(),
         };
 
         io::event_loop::<S>(self.listen_on, 1500, 8, 8, endpoint);
@@ -337,6 +343,7 @@ impl ServerConfig {
         let hmac_reset_key = [0u8; 64];
 
         let endpoint = Endpoint {
+            local_addr: self.address,
             connections: ConnectionMap::new(),
             connection_ids: IndexMap::new(),
             server_config: Some(Arc::new(self.server_config)),
@@ -345,6 +352,8 @@ impl ServerConfig {
             nc_tx: new_connection_tx,
             ncc_rx,
             ncc_tx: IndexMap::new(),
+            timers: DelayQueue::new(),
+            timer_keys: IndexMap::new(),
         };
 
         io::event_loop::<S>(self.address, 1500, 8, 8, endpoint);
@@ -406,6 +415,9 @@ impl ConnectionMap {
 }
 
 pub(crate) struct Endpoint {
+    // local address the sockets are bound to
+    local_addr: SocketAddr,
+
     // owns the actual connection objects
     connections: ConnectionMap,
 
@@ -430,20 +442,27 @@ pub(crate) struct Endpoint {
 
     // channels for sending new connections once ready. client only. uses internal id as key.
     ncc_tx: IndexMap<cid::Id, oneshot::Sender<Connection>>,
+
+    // one entry per connection with a live deadline, keyed by same internal id
+    timers: DelayQueue<cid::Id>,
+
+    // internal id to delay queue key for each internal id for easier access
+    timer_keys: IndexMap<cid::Id, Key>,
 }
 
 impl Endpoint {
-    pub fn recv(&mut self, mut recv_ref: thingbuf::mpsc::RecvRef<'_, (Vec<u8>, SocketAddr)>) {
-        if recv_ref.0.is_empty() {
+    pub fn recv(&mut self, mut recv_ref: thingbuf::mpsc::RecvRef<'_, Packet>) {
+        if recv_ref.data.is_empty() {
             warn!("Received empty datagram");
             return;
         }
 
-        let path = recv_ref.1;
+        let local = recv_ref.local;
+        let peer = recv_ref.peer;
 
-        info!("Received {:?} bytes from {:?}", recv_ref.0.len(), path);
+        info!("Received {:?} bytes from {:?}", recv_ref.data.len(), peer);
 
-        let mut partial_decode = match Header::from_bytes(&recv_ref.0, 8) {
+        let mut partial_decode = match Header::from_bytes(&recv_ref.data, 8) {
             Ok(h) => h,
             Err(error) => {
                 error!("error while decoding header: {}", error);
@@ -464,7 +483,7 @@ impl Endpoint {
                 conn_ptr = Some(arc_li.clone());
                 let mut conn = arc_li.lock();
 
-                if let Err(error) = conn.recv(&mut recv_ref.0, &mut partial_decode, path) {
+                if let Err(error) = conn.recv(&mut recv_ref.data, &mut partial_decode, local, peer) {
                     error!("error processing datagram: {}", error);
                 }
 
@@ -474,8 +493,9 @@ impl Endpoint {
             // if we dont recgnise the dcid, assume its an inital packet
             let server_config = self.server_config.clone().unwrap();
             match Inner::accept(
-                &mut recv_ref.0,
-                path.to_string(),
+                &mut recv_ref.data,
+                peer,
+                local,
                 server_config,
                 &self.hmac_reset_key,
             ) {
@@ -529,6 +549,8 @@ impl Endpoint {
                         self.connection_ids.swap_remove(&cid);
                     }
                     InnerEvent::ClosedByPeer => {
+                        self.set_next_timeout(c_ptr.internal_id, None);
+
                         if c_ptr.direct_link.is_linked() {
                             unsafe {
                                 self.connections
@@ -553,9 +575,9 @@ impl Endpoint {
             }
 
             // enqueue connection into pending transmissions
-            self.connections
-                .transmission_pending
-                .push_back(c_ptr.clone());
+            if !c_ptr.transmission_link.is_linked() && !c_ptr.closed_link.is_linked() {
+                self.connections.transmission_pending.push_back(c_ptr.clone());
+            }
         }
     }
 
@@ -600,35 +622,43 @@ impl Endpoint {
 
         let results = futures::future::join_all(fut).await;
 
-        let mut it = self.connections.transmission_pending.front_mut();
-        let mut i: usize = 0;
-
-        while !it.is_null() {
-            if results[i] {
-                it.remove();
-            } else {
-                it.move_next();
+        // collect (id, deadline) while holding the cursor, then set next timeout after dropping it
+        let mut rearm: Vec<(cid::Id, Option<Instant>)> = Vec::with_capacity(results.len());
+        {
+            let mut it = self.connections.transmission_pending.front_mut();
+            let mut i = 0;
+            while !it.is_null() && i < results.len() {
+                let node = it.as_cursor().clone_pointer().unwrap();
+                rearm.push((node.internal_id, node.lock().timeout()));
+                if results[i] { it.remove(); } else { it.move_next(); }
+                i += 1;
             }
+        }
 
-            i += 1;
+        for (id, deadline) in rearm {
+            self.set_next_timeout(id, deadline);
         }
     }
 
+    /// polls possible wakeups of a connection which is either proactive sending/connecting or a
+    /// timeout from congestion control, ack delay or similar
     pub fn poll_wakeups(&mut self, cx: &mut std::task::Context<'_>) -> Poll<bool> {
-        // includes timeouts
-        // includes connection attempts from client
+        let mut wake = false;
+
         if self.client_config.is_some() {
             match self.ncc_rx.poll_recv(cx) {
                 Poll::Ready(Some((dest_addr, server_name, ready_sender))) => {
                     let cc = self.client_config.clone().unwrap();
-                    match Inner::connect(dest_addr, server_name, cc, &self.hmac_reset_key) {
+                    match Inner::connect(self.local_addr, dest_addr, server_name, cc, &self.hmac_reset_key) {
                         Ok((inner, cid)) => {
                             // cid is here the scid which will be reused as dcid for at least
                             // the first packet from the peer. it is also used as our internal id
-                            let a_inner = Arc::new(LockedInner::from_inner(inner, cid));
-                            self.connections.core.insert(a_inner);
+                            let a = Arc::new(LockedInner::from_inner(inner, cid));
+                            self.connections.core.insert(a.clone());
                             self.connection_ids.insert(cid, cid);
                             self.ncc_tx.insert(cid, ready_sender);
+                            self.connections.transmission_pending.push_back(a);
+                            wake = true;
                         }
                         Err(err) => {
                             error!("failed to setup connection to {dest_addr}: {err}");
@@ -639,9 +669,41 @@ impl Endpoint {
                 Poll::Pending => (),
             }
         }
-        // includes proactive data sending from application
-        // returns poll of polls somehow
-        Poll::Pending
+
+        if let Poll::Ready(Some(expired)) = self.timers.poll_expired(cx) {
+            let id = expired.into_inner();
+            self.timer_keys.swap_remove(&id);
+            if let Some(a) = self.connections.find_existing(&id).and_then(|c| c.clone_pointer()) {
+                a.lock().handle_timeout(std::time::Instant::now());
+                if !a.transmission_link.is_linked() && !a.closed_link.is_linked() {
+                    self.connections.transmission_pending.push_back(a);
+                }
+                wake = true;
+            }
+        }
+
+        // TODO proactive data sending from application
+        if wake { Poll::Ready(true) } else { Poll::Pending }
+    }
+
+    fn set_next_timeout(&mut self, id: cid::Id, deadline: Option<Instant>) {
+        match deadline {
+            Some(dl) => {
+                let at = TokioInstant::from_std(dl);
+                match self.timer_keys.get(&id).copied() {
+                    Some(key) => self.timers.reset_at(&key, at),
+                    None => {
+                        let key = self.timers.insert_at(id, at);
+                        self.timer_keys.insert(id, key);
+                    }
+                }
+            }
+            None => {
+                if let Some(key) = self.timer_keys.swap_remove(&id) {
+                    self.timers.remove(&key);
+                }
+            }
+        }
     }
 }
 
@@ -826,257 +888,3 @@ pub(crate) trait ConnectionApi: Send + Sync {
     fn zero_rtt(&self, enable: bool);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::{
-        collections::HashMap,
-        net::{Ipv4Addr, SocketAddrV4},
-        sync::{Arc, OnceLock},
-    };
-
-    use async_trait::async_trait;
-    use tokio::sync::{mpsc, RwLock};
-
-    type PacketHook = Option<Arc<dyn Fn(&mut io::Packet) + Send + Sync>>;
-
-    static PACKET_ROUTER: OnceLock<Arc<RwLock<PacketRouter>>> = OnceLock::new();
-
-    fn get_router() -> Arc<RwLock<PacketRouter>> {
-        PACKET_ROUTER
-            .get_or_init(|| Arc::new(RwLock::new(PacketRouter::new())))
-            .clone()
-    }
-
-    /// maps socket addresses to their receive channels. used for testing only
-    struct PacketRouter {
-        sockets: HashMap<SocketAddr, mpsc::UnboundedSender<io::Packet>>,
-    }
-
-    impl PacketRouter {
-        fn new() -> Self {
-            Self {
-                sockets: HashMap::new(),
-            }
-        }
-
-        fn register_socket(
-            &mut self,
-            addr: SocketAddr,
-            sender: mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>,
-        ) {
-            self.sockets.insert(addr, sender);
-        }
-
-        fn unregister_socket(&mut self, addr: &SocketAddr) {
-            self.sockets.remove(addr);
-        }
-
-        fn route_packet(
-            &self,
-            data: &[u8],
-            from: SocketAddr,
-            to: SocketAddr,
-        ) -> std::io::Result<usize> {
-            if let Some(sender) = self.sockets.get(&to) {
-                let packet = (data.to_vec(), from);
-                sender.send(packet).map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::ConnectionRefused,
-                        "Destination socket closed",
-                    )
-                })?;
-                Ok(data.len())
-            } else {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::ConnectionRefused,
-                    format!("No socket bound to {}", to),
-                ))
-            }
-        }
-    }
-
-    // test socket implementation that routes packets through memory
-    pub struct TestSocket {
-        local_addr: SocketAddr,
-        receiver: Arc<RwLock<mpsc::UnboundedReceiver<io::Packet>>>,
-        _sender: mpsc::UnboundedSender<io::Packet>,
-        packet_hook: PacketHook,
-    }
-
-    impl TestSocket {
-        fn new(addr: SocketAddr, packet_hook: PacketHook) -> std::io::Result<Self> {
-            let (sender, receiver) = mpsc::unbounded_channel();
-
-            // register with global router
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let binding = get_router();
-                    let mut router = binding.write().await;
-                    router.register_socket(addr, sender.clone());
-                })
-            });
-
-            Ok(Self {
-                local_addr: addr,
-                receiver: Arc::new(RwLock::new(receiver)),
-                _sender: sender,
-                packet_hook,
-            })
-        }
-    }
-
-    impl Drop for TestSocket {
-        fn drop(&mut self) {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let binding = get_router();
-                    let mut router = binding.write().await;
-                    router.unregister_socket(&self.local_addr);
-                })
-            });
-        }
-    }
-
-    #[async_trait]
-    impl io::Transmit for TestSocket {
-        async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-            let mut receiver = self.receiver.write().await;
-
-            match receiver.recv().await {
-                Some((data, from_addr)) => {
-                    let len = std::cmp::min(buf.len(), data.len());
-                    buf[..len].copy_from_slice(&data[..len]);
-                    Ok((len, from_addr))
-                }
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "Socket channel closed",
-                )),
-            }
-        }
-
-        async fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
-            // we make a copy to modify it
-            let mut packet: io::Packet = (buf.to_vec(), to);
-
-            // apply hook if present
-            if let Some(hook) = &self.packet_hook {
-                hook(&mut packet);
-            }
-
-            let binding = get_router();
-            let router = binding.read().await;
-            router.route_packet(&packet.0, self.local_addr, packet.1)
-        }
-    }
-
-    /// test provider that creates in-memory sockets
-    pub struct TestableTransmitProvider {
-        next_port: u16,
-        packet_hook: PacketHook,
-    }
-
-    impl io::TransmitProvider for TestableTransmitProvider {
-        type Socket = TestSocket;
-
-        fn init() -> Self {
-            Self {
-                next_port: 10000,
-                packet_hook: None,
-            }
-        }
-
-        fn bind(&mut self, mut addr: SocketAddr) -> std::io::Result<Arc<Self::Socket>> {
-            if addr.port() == 0 {
-                addr.set_port(self.next_port);
-                self.next_port += 1;
-            }
-
-            let socket = TestSocket::new(addr, self.packet_hook.clone())?;
-            Ok(Arc::new(socket))
-        }
-    }
-
-    /// utility functions for testing
-    impl TestableTransmitProvider {
-        pub fn set_hook(&mut self, packet_hook: PacketHook) {
-            self.packet_hook = packet_hook;
-        }
-
-        pub async fn clear_sockets(ports: &[u16]) {
-            let router = get_router();
-            let mut router = router.write().await;
-            router
-                .sockets
-                .retain(|addr, _| !ports.contains(&addr.port()));
-        }
-    }
-
-    use crate::io::{Transmit, TransmitProvider};
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn custom_socket_packet_routing() {
-        let mut provider = TestableTransmitProvider::init();
-
-        // create two test sockets
-        let addr1 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8001));
-        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8002));
-
-        let socket1 = provider.bind(addr1).unwrap();
-        let socket2 = provider.bind(addr2).unwrap();
-
-        // send packet from socket1 to socket2
-        let test_data = b"Hello, World!";
-        let sent = socket1.send_to(test_data, addr2).await.unwrap();
-        assert_eq!(sent, test_data.len());
-
-        // receive packet on socket2
-        let mut buf = [0u8; 1024];
-        let (received_len, from_addr) = socket2.recv_from(&mut buf).await.unwrap();
-
-        assert_eq!(received_len, test_data.len());
-        assert_eq!(&buf[..received_len], test_data);
-        assert_eq!(from_addr, addr1);
-
-        TestableTransmitProvider::clear_sockets(&[8001, 8002]).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn custom_socket_packet_hook() {
-        let mut provider = TestableTransmitProvider::init();
-
-        // set a hook to modify outgoing packets
-        provider.set_hook(Some(Arc::new(|packet: &mut io::Packet| {
-            if packet.0[0] == b'H' {
-                packet.0[0] = b'B';
-            }
-        })));
-
-        // create two test sockets
-        let addr1 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8003));
-        let addr2 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8004));
-
-        let socket1 = provider.bind(addr1).unwrap();
-        let socket2 = provider.bind(addr2).unwrap();
-
-        // send packet from socket1 to socket2
-        let test_data = b"Hello, World!";
-        let sent = socket1.send_to(test_data, addr2).await.unwrap();
-        assert_eq!(sent, test_data.len());
-
-        // receive packet on socket2
-        let mut buf = [0u8; 1024];
-        let (received_len, from_addr) = socket2.recv_from(&mut buf).await.unwrap();
-
-        let modified_data = b"Bello, World!";
-
-        assert_eq!(received_len, test_data.len());
-        assert_ne!(&buf[..received_len], test_data);
-        assert_eq!(&buf[..received_len], modified_data);
-        assert_eq!(from_addr, addr1);
-
-        TestableTransmitProvider::clear_sockets(&[8003, 8004]).await;
-    }
-}

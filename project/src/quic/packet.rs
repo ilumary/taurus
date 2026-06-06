@@ -65,31 +65,6 @@ pub fn encrypt(
     Ok(packet_length)
 }
 
-pub fn encode_frame<T: Frame>(
-    frame: &T,
-    buffer: &mut octets::OctetsMut<'_>,
-) -> Result<(), octets::BufferTooShortError> {
-    //check for sufficient remaining size before encoding
-    if frame.len() > buffer.cap() {
-        return Err(octets::BufferTooShortError);
-    }
-
-    frame.to_bytes(buffer).unwrap();
-
-    Ok(())
-}
-
-pub trait Frame {
-    fn from_bytes(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self;
-
-    fn to_bytes(
-        &self,
-        bytes: &mut octets::OctetsMut<'_>,
-    ) -> Result<(), octets::BufferTooShortError>;
-
-    fn len(&self) -> usize;
-}
-
 pub struct AckFrame {
     ranges: Vec<RangeInclusive<u64>>,
     ack_delay: u64,

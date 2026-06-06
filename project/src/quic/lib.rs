@@ -5,13 +5,17 @@ mod cc;
 mod cid;
 mod fc;
 mod io;
+mod path;
 mod ranges;
 mod packet;
 mod stream;
 mod token;
 mod transport_parameters;
 
-use crate::{cc::{CongestionController, UnlimitedWindow}, ranges::RangeSet};
+use crate::{
+    ranges::RangeSet,
+    path::Paths
+};
 use octets::{varint_len, OctetsMut};
 use packet::{AckFrame, Header};
 use rustls::{
@@ -20,6 +24,7 @@ use rustls::{
     },
     Side,
 };
+use rand::Rng;
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc, time::Instant};
 use stream::{StreamManager, StreamManagerConfig};
 use token::StatelessResetToken;
@@ -32,6 +37,8 @@ use transport_parameters::{
 const SPACE_ID_INITIAL: usize = 0x00;
 const SPACE_ID_HANDSHAKE: usize = 0x01;
 const SPACE_ID_DATA: usize = 0x02;
+
+const MAX_PATHS: usize = 4;
 
 enum QuicConfig {
     Server(Arc<rustls::ServerConfig>),
@@ -47,6 +54,8 @@ impl QuicConfig {
     }
 }
 
+// TODO pull out a CryptoProvider or something so a) its exchangeable and b) i can test things like
+// fetch_dgram and so on
 struct Inner {
     // side
     side: Side,
@@ -75,18 +84,15 @@ struct Inner {
     // stream manager, does all stream logic
     sm: StreamManager<stream::StreamWaker>,
 
-    // congestion controller
-    cc: CongestionController<UnlimitedWindow>,
-
     // Packet number spaces, inital, handshake, 1-RTT
     packet_spaces: [PacketNumberSpace; 3],
     current_space: usize,
 
-    // Physical address of connection peer
-    remote: SocketAddr,
+    /// holds all paths of the connection and per path congestion control
+    paths: Paths,
 
     // TransportConfig of remote
-    remote_tpc: TransportConfig,
+    remote_tpc: Option<TransportConfig>,
 
     // application error code
     apec: Option<u64>,
@@ -103,7 +109,7 @@ struct Inner {
 
 impl Inner {
     fn get_current_path(&self) -> SocketAddr {
-        self.remote
+        self.paths.active().peer_addr
     }
 
     fn stream_accept(
@@ -138,13 +144,27 @@ impl Inner {
         self.sm.append(stream_id, buf, fin)
     }
 
-    // creates a connection from an initial packet as a server. Takes the buffer, source address,
-    // server config, hmac reset key and a oneshot channel which gets triggered as soon as the
-    // connection is established. Returns the Connection itself and the initial source connection
-    // id which is now used by the peer as dcid and from which the connection can now be identified.
+    // TODO add idle-timeout / ack-delay
+    /// next deadline this connection needs servicing: loss detection
+    pub fn timeout(&self) -> Option<Instant> {
+        self.paths.next_timeout()
+    }
+
+    /// service whatever fired
+    fn handle_timeout(&mut self, now: Instant) {
+        if let path::PathEvent::NoViablePath = self.paths.on_timeout(now) {
+            self.apec = Some(terror::QuicTransportError::NoViablePath as u64);
+            self.state = ConnectionState::Closing;
+        }
+        let _lost = self.paths.active_mut().on_loss_detection_timeout(now);
+        // _lost / a pending PTO probe get sent on the next fetch_dgram
+    }
+
+    /// accepts a new initial packet
     fn accept(
         buffer: &mut Vec<u8>,
-        src_addr: String,
+        src_addr: SocketAddr,
+        local_addr: SocketAddr,
         server_config: Arc<rustls::ServerConfig>,
         hmac_reset_key: &ring::hmac::Key,
     ) -> Result<(Self, cid::Id), terror::Error> {
@@ -163,11 +183,6 @@ impl Inner {
             Version::V1,
             Side::Server,
             &head.dcid,
-        );
-
-        debug!(
-            origin = src_addr,
-            "initial keys ready for dcid {}", &head.dcid
         );
 
         let header_length = match head.decrypt(buffer, ikp.remote.header.as_ref()) {
@@ -205,6 +220,9 @@ impl Inner {
         // truncate payload is possible because as a server the initial packet from a client cant be
         // coalesced
         buffer.truncate(dec_len);
+
+        let mut p = Paths::new(local_addr, src_addr, true, MAX_PATHS);
+        p.active_mut().on_datagram_received(buffer.len(), start);
 
         let (cim, initial_scid, srt) =
             cid::ConnectionIdManager::as_server(head.scid.unwrap(), head.dcid, 4, hmac_reset_key);
@@ -250,15 +268,14 @@ impl Inner {
             state: ConnectionState::Initial,
             cidm: cim,
             sm,
-            cc: CongestionController::new(UnlimitedWindow),
             packet_spaces: [
                 initial_space,
                 PacketNumberSpace::new(),
                 PacketNumberSpace::new(),
             ],
             current_space: SPACE_ID_INITIAL,
-            remote: src_addr.parse().unwrap(),
-            remote_tpc: TransportConfig::default(),
+            paths: p,
+            remote_tpc: None,
             apec: None,
             pec: None,
             lft: 0x00,
@@ -267,7 +284,7 @@ impl Inner {
 
         // process inital packet explicitly to reduce state keeping
         // no need to check the error type, as the connection is discarded in case of an error
-        inner.process_initial_packet(&head, buffer, start)?;
+        inner.process_initial_packet(&head, buffer,0, start)?;
 
         // initial packet processing time
         let _m = start.elapsed().as_millis();
@@ -275,12 +292,17 @@ impl Inner {
         Ok((inner, initial_scid))
     }
 
+    /// creates a connection as a client with a destination
     pub fn connect(
-        addr: SocketAddr,
+        dst_addr: SocketAddr,
+        local_addr: SocketAddr,
         server_name: rustls::pki_types::ServerName<'static>,
         client_config: Arc<rustls::ClientConfig>,
         hmac_reset_key: &ring::hmac::Key,
     ) -> Result<(Self, cid::Id), terror::Error> {
+        let mut p = Paths::new(local_addr, dst_addr, false, MAX_PATHS);
+        p.active_mut().mark_validated();
+
         let (cim, dcid, scid) = cid::ConnectionIdManager::as_client(4);
 
         let mut tpc = TransportConfig {
@@ -338,15 +360,14 @@ impl Inner {
             state: ConnectionState::Initial,
             cidm: cim,
             sm,
-            cc: CongestionController::new(UnlimitedWindow),
             packet_spaces: [
                 initial_space,
                 PacketNumberSpace::new(),
                 PacketNumberSpace::new(),
             ],
             current_space: SPACE_ID_INITIAL,
-            remote: addr,
-            remote_tpc: TransportConfig::default(),
+            paths: p,
+            remote_tpc: None,
             apec: None,
             pec: None,
             lft: 0x00,
@@ -384,7 +405,8 @@ impl Inner {
         &mut self,
         buffer: &mut [u8],
         partial_decode: &mut Header,
-        _origin: SocketAddr,
+        src_addr: SocketAddr,
+        local_addr: SocketAddr,
     ) -> Result<(), terror::Error> {
         // in theory that should no happen
         if self.state == ConnectionState::Closing || self.state == ConnectionState::Closed {
@@ -393,8 +415,30 @@ impl Inner {
             ));
         }
 
+        // do path stuff
+        let pid = match self.paths.index_of(local_addr, src_addr) {
+            Some(i) => i,
+            None => {
+                let i = self
+                    .paths
+                    .add_path(local_addr, src_addr)
+                    .ok_or_else(|| terror::Error::fatal("path limit reached"))?;
+                // peer is using a new address: validate it before relying on it (§9)
+                if self.state == ConnectionState::Connected {
+                    self.paths.get_mut(i).unwrap().request_validation();
+                }
+               i
+            }
+        };
+
+        // anti-amplification accounting is per datagram, not per coalesced packet (§8)
+        self.paths
+            .get_mut(pid)
+            .unwrap()
+            .on_datagram_received(buffer.len(), Instant::now());
+
         // process the first packet
-        let mut offset = self.recv_single(buffer, partial_decode).inspect_err(|e| {
+        let mut offset = self.recv_single(buffer, partial_decode, pid).inspect_err(|e| {
             // Check if we encountered a quic protocol error
             if (0x01..=0x10).contains(&e.kind()) {
                 self.pec = Some((e.kind(), self.lft));
@@ -415,7 +459,7 @@ impl Inner {
 
             packet_type = partial_decode.hf >> 7;
             let processed_bytes = self
-                .recv_single(&mut buffer[offset..], &mut partial_decode)
+                .recv_single(&mut buffer[offset..], &mut partial_decode, pid)
                 .inspect_err(|e| {
                     // Check if we encountered a quic protocol error
                     if (0x01..=0x10).contains(&e.kind()) {
@@ -438,6 +482,7 @@ impl Inner {
         &mut self,
         packet: &mut [u8],
         header: &mut Header,
+        path: usize,
     ) -> Result<usize, terror::Error> {
         let start = Instant::now();
         debug!("H: {}", header);
@@ -529,7 +574,9 @@ impl Inner {
 
         let (mut payload, _) = payload_cipher.split_at(dec_len)?;
 
-        self.process_payload(header, &mut payload, start)?;
+        // TODO path handling here after decryption
+
+        self.process_payload(header, &mut payload, path, start)?;
 
         // calucate ema
         let _ppt = start.elapsed().as_nanos();
@@ -542,6 +589,7 @@ impl Inner {
         &mut self,
         header: &Header,
         packet_raw: &mut [u8],
+        path: usize,
         now: Instant,
     ) -> Result<(), terror::Error> {
         let mut payload = octets::OctetsMut::with_slice(packet_raw);
@@ -549,27 +597,7 @@ impl Inner {
         // skip forth to packet payload
         payload.skip(header.raw_length + header.packet_num_length as usize + 1)?;
 
-        self.process_payload(header, &mut payload, now)?;
-
-        if let Some(tpc) = self.tls_session.quic_transport_parameters() {
-            self.remote_tpc.update(tpc)?;
-        }
-
-        // register stream limits in stream manager
-        let (imd, imsdbl, imsdbr, imsdu, imsb, imsu) = self.remote_tpc.get_initial_limits();
-
-        self.sm.set_initial_data_limits(imsdbl, imsdbr, imsdu);
-        self.sm.set_max_data(imd);
-        self.sm.set_max_streams_bidi(imsb);
-        self.sm.set_max_streams_uni(imsu);
-
-        // the peers initial_source_connection_id should have been saved as our first dcid
-        if self.remote_tpc.initial_source_connection_id.get().unwrap() != self.cidm.get_dcid() {
-            return Err(terror::Error::quic_transport_error(
-                "scids from packet header and transport parameters differ",
-                terror::QuicTransportError::TransportParameterError,
-            ));
-        }
+        self.process_payload(header, &mut payload,path, now)?;
 
         // init zero rtt if enabled
         if self.zero_rtt_enabled {
@@ -593,9 +621,11 @@ impl Inner {
         &mut self,
         header: &Header,
         payload: &mut OctetsMut,
+        path: usize,
         now: Instant,
     ) -> Result<(), terror::Error> {
         let mut ack_eliciting = false;
+        let mut non_probing = false;
 
         while payload.peek_u8().is_ok() {
             let frame_code = payload.get_u8().unwrap();
@@ -608,6 +638,11 @@ impl Inner {
             }
 
             match frame_code {
+                0x00 | 0x18 | 0x1a | 0x1b => {}
+                _ => non_probing = true,
+            }
+
+            match frame_code {
                 0x00 => {
                     // the first received padding indicates that the rest of the packet is also
                     // padded and can therefore be skipped
@@ -617,7 +652,7 @@ impl Inner {
                 0x01 => {} //PING
                 0x02 | 0x03 => {
                     let ack = AckFrame::parse(&frame_code, payload);
-                    self.process_ack(ack, header.space(), now)?;
+                    self.process_ack(&ack, header.space(), path, now)?;
                 } //ACK
                 0x04 => {
                     let stream_id = payload.get_varint()?;
@@ -634,7 +669,7 @@ impl Inner {
                     let _offset = payload.get_varint()?;
                     let crypto_data = payload.get_bytes_with_varint_length()?.to_vec();
 
-                    self.process_crypto_data(&crypto_data);
+                    self.process_crypto_data(&crypto_data)?;
 
                     // test if all required crypto data has been exchanged for the connection to be
                     // considered established
@@ -646,8 +681,11 @@ impl Inner {
                         event!(
                             Level::INFO,
                             "connection established to {}",
-                            self.remote.to_string()
+                            self.paths.active().peer_addr
                         );
+
+                        self.paths.active_mut().cc_mut().confirm_handshake();
+                        self.paths.active_mut().mark_validated();
 
                         self.state = ConnectionState::Connected;
                         self.events.push(InnerEvent::ConnectionEstablished);
@@ -756,10 +794,14 @@ impl Inner {
                     ));
                 } //RETIRE_CONNECTION_ID
                 0x1a => {
-                    let _path_challenge_data = payload.get_u64()?;
+                    let data = payload.get_u64()?.to_be_bytes();
+                    if let Some(p) = self.paths.get_mut(path) {
+                        p.on_path_challenge(data);
+                    }
                 } //PATH_CHALLENGE
                 0x1b => {
-                    let _path_response_data = payload.get_u64()?;
+                    let data = payload.get_u64()?.to_be_bytes();
+                    let _r = self.paths.on_path_response(data);
                 } //PATH_RESPONSE
                 0x1c | 0x1d => {
                     let ec = payload.get_varint()?;
@@ -795,6 +837,28 @@ impl Inner {
             }
         }
 
+        // connection migration: a non-probing 1-RTT packet from a non-active
+        // path that is the newest we've seen means the peer moved. Switch our send
+        // path to it and validate concurrently; anti-amplification + the fresh per-path
+        // cc keep us correct on the new path until it validates
+        if header.space() == SPACE_ID_DATA
+            && self.state == ConnectionState::Connected
+            && non_probing
+            && path != self.paths.active_idx()
+            && self.packet_spaces[header.space()]
+                .received_pns
+                .largest().unwrap_or(0) < header.packet_num
+        {
+            debug!(
+                "peer migrated to {}, switching active path",
+                self.paths.get(path).unwrap().peer_addr
+            );
+            self.paths.migrate_to(path);
+            if !self.paths.get(path).unwrap().is_validated() {
+                self.paths.get_mut(path).unwrap().request_validation();
+            }
+        }
+
         self.packet_spaces[header.space()]
             .received_pns
             .push(header.packet_num);
@@ -810,8 +874,11 @@ impl Inner {
         Ok(())
     }
 
-    fn process_ack(&mut self, ack: AckFrame, space: usize, now: Instant) -> Result<(), terror::Error> {
-        let (acked_pns, lost_pns) = self.cc.on_ack_received(space, ack, now);
+    fn process_ack(&mut self, ack: &AckFrame, space: usize, path: usize, now: Instant) -> Result<(), terror::Error> {
+        let (acked_pns, lost_pns) = match self.paths.get_mut(path) {
+            Some(p) => p.on_ack_received(space, ack, now),
+            None => return Ok(()),
+        };
 
         debug!(count = acked_pns.len(), space, "processing ACK frame");
 
@@ -832,7 +899,7 @@ impl Inner {
         Ok(())
     }
 
-    fn process_crypto_data(&mut self, crypto_data: &[u8]) {
+    fn process_crypto_data(&mut self, crypto_data: &[u8]) -> Result<(), terror::Error> {
         match self.tls_session.read_hs(crypto_data) {
             Ok(()) => debug!("consumed {} bytes from crypto frame", crypto_data.len()),
             Err(err) => {
@@ -852,6 +919,46 @@ impl Inner {
         {
             let _ = true;
         }
+
+        if self.remote_tpc.is_none() {
+            if let Some(raw) = self.tls_session.quic_transport_parameters() {
+
+                match TransportConfig::decode(raw) {
+                    Ok(tpc) => self.remote_tpc = Some(tpc),
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+
+                let rtpc = self.remote_tpc.as_ref().unwrap();
+
+                // register stream limits in stream manager
+                let (imd, imsdbl, imsdbr, imsdu, imsb, imsu) = rtpc.get_initial_limits();
+
+                self.sm.set_initial_data_limits(imsdbl, imsdbr, imsdu);
+                self.sm.set_max_data(imd);
+                self.sm.set_max_streams_bidi(imsb);
+                self.sm.set_max_streams_uni(imsu);
+
+                // the peers initial_source_connection_id should have been saved as our first dcid
+                if rtpc.initial_source_connection_id.get() != self.cidm.get_dcid() {
+                    return Err(terror::Error::quic_transport_error(
+                        "scids from packet header and transport parameters differ",
+                        terror::QuicTransportError::TransportParameterError,
+                    ));
+                }
+
+                // set congestion control values
+                //self.cc.set_ack_delay_exponent(rtpc.ack_delay_exponent);
+                //self.cc.set_max_ack_delay(std::time::Duration::from_millis(rtpc.max_ack_delay.get().get()));
+                self.paths.active_mut().cc_mut().set_ack_delay_exponent(rtpc.ack_delay_exponent);
+                self.paths.active_mut().cc_mut().set_max_ack_delay(
+                    std::time::Duration::from_millis(rtpc.max_ack_delay.get().get()),
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn generate_crypto_data(&mut self) {
@@ -916,10 +1023,16 @@ impl Inner {
             ));
         }
 
-        let availible = buffer.len();
-        let max_payload_size = self.remote_tpc.max_udp_payload_size.get().unwrap().get();
+        let cwnd = self.paths.active().cwnd_available();
+        let budget = self.paths.active().send_budget();
+        let max_payload_size = self
+            .remote_tpc
+            .as_ref()
+            .map(|t| t.max_udp_payload_size.get().get() as usize)
+            .unwrap_or(1200);
+        let mut remaining = buffer.len().min(cwnd).min(budget).min(max_payload_size);
+        debug!("remaining: {}", remaining);
 
-        let mut remaining = std::cmp::min(availible, max_payload_size as usize);
         let mut written: usize = 0;
 
         let mut contains_initial = false;
@@ -1019,6 +1132,8 @@ impl Inner {
             // encode header and keep track of where the length field has been encoded
             let mut header_length_offset: usize = 0;
             header.to_bytes(&mut buf, &mut header_length_offset)?;
+
+            let mut path_challenge_sent: Option<[u8; 8]> = None;
 
             //println!("after header encoding: {:x?}", &buf.buf()[..buf.off()]);
 
@@ -1131,6 +1246,28 @@ impl Inner {
 
             // stream & cid frames
             if packet_type == packet::PacketType::Short && !is_closing {
+                // PATH_RESPONSE, echo any received challenges first
+                while buf.cap() >= 9 {
+                    match self.paths.active_mut().poll_response() {
+                        Some(data) => {
+                            buf.put_u8(0x1b)?;
+                            buf.put_u64(u64::from_be_bytes(data))?;
+                            ack_eliciting = true;
+                        }
+                        None => break,
+                    }
+                }
+
+                // PATH_CHALLENGE, emit one if the active path wants validating
+                if self.paths.active().probing_required() && buf.cap() >= 9 {
+                    let mut b = [0u8; 8];
+                    rand::rng().fill_bytes(&mut b);
+                    buf.put_u8(0x1a)?;
+                    buf.put_u64(u64::from_be_bytes(b))?;
+                    ack_eliciting = true;
+                    path_challenge_sent = Some(b);
+                }
+
                 // NEW_CONNECTION_ID frame
                 // calc size for frame, rpt must be smaller than sqn, frame header, id, srt
                 if buf.cap() >= (1 + (2 * varint_len(self.cidm.peek_next_sqn() as u64)) + 8 + 16) {
@@ -1202,7 +1339,7 @@ impl Inner {
                 // PTO probe: if a probe is required but no ack-eliciting frame has been
                 // written yet, emit a PING. This satisfies the probe obligation without
                 // any retransmission logic; probe_pending is cleared by on_packet_sent
-                if self.cc.probe_pending() && !ack_eliciting && buf.cap() >= 1 {
+                if self.paths.active().cc().probe_pending() && !ack_eliciting && buf.cap() >= 1 {
                     buf.put_u8(0x01)?; // PING
                     ack_eliciting = true;
                     debug!("emitting PING frame to satisfy PTO probe");
@@ -1221,6 +1358,15 @@ impl Inner {
                         "datagram contains initial frame and this last packet is padded by: {}",
                         skip
                     );
+                    buf.skip(skip)?;
+                }
+            }
+
+            // if packet contains a path challenge, pad to 1200 bytes to confirm min mtu
+            if path_challenge_sent.is_some() {
+                let target = 1200usize.saturating_sub(written + aead_tag_len);
+                if buf.off() < target {
+                    let skip = (target - buf.off()).min(buf.cap());
                     buf.skip(skip)?;
                 }
             }
@@ -1245,8 +1391,18 @@ impl Inner {
 
             debug!("packet_length: {}", packet_length);
 
-            if ack_eliciting {
+            /*if ack_eliciting {
                 self.cc.on_packet_sent(space_id, pn, packet_length, now);
+            }*/
+            self.paths
+                .active_mut()
+                .on_packet_sent(pn, space_id, packet_length, ack_eliciting, now);
+
+            if let Some(data) = path_challenge_sent {
+                // datagram_len = coalesced prefix + this packet; >= 1200 also validates the MTU
+                self.paths
+                    .active_mut()
+                    .add_challenge_sent(data, written + packet_length, now);
             }
 
             encoded_packets += 1;

@@ -52,15 +52,6 @@ impl RangeSet {
         self.insert(val..=val);
     }
 
-    /*/// returns `true` if `val` is contained in any tracked range
-    #[inline]
-    pub fn contains(&self, val: u64) -> bool {
-        match self {
-            RangeSet::Inline(inline) => inline.contains(val),
-            RangeSet::BTree(btree) => btree.contains(val),
-        }
-    }*/
-
     /// remove all tracked values strictly below `val`
     pub fn remove_below(&mut self, val: u64) {
         match self {
@@ -71,24 +62,6 @@ impl RangeSet {
         self.rebalance();
     }
 
-    /*/// the largest value in the set, or `None` if empty
-    #[inline]
-    pub fn largest(&self) -> Option<u64> {
-        match self {
-            RangeSet::Inline(inline) => inline.inner.last().map(|&(_, e)| e),
-            RangeSet::BTree(btree) => btree.inner.values().next_back().copied(),
-        }
-    }*/
-
-    /*/// the smallest value in the set, or `None` if empty
-    #[inline]
-    pub fn smallest(&self) -> Option<u64> {
-        match self {
-            RangeSet::Inline(inline) => inline.inner.first().map(|&(s, _)| s),
-            RangeSet::BTree(btree) => btree.inner.keys().next().copied(),
-        }
-    }*/
-
     /// number of disjoint ranges currently stored
     #[inline]
     pub fn num_ranges(&self) -> usize {
@@ -98,12 +71,6 @@ impl RangeSet {
         }
     }
 
-    /*/// `true` if the set contains no values
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.num_ranges() == 0
-    }*/
-
     #[inline]
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = RangeInclusive<u64>> + '_ {
         let it: Box<dyn DoubleEndedIterator<Item = RangeInclusive<u64>>> = match self {
@@ -111,6 +78,14 @@ impl RangeSet {
             RangeSet::BTree(b) => Box::new(b.inner.iter().map(|(&s, &e)| s..=e)),
         };
         it
+    }
+
+    /// returns the largest saved value
+    pub fn largest(&self) -> Option<u64> {
+        match self {
+            RangeSet::Inline(inline) => inline.inner.last().map(|&(_, e)| e),
+            RangeSet::BTree(btree) => btree.inner.values().next_back().copied(),
+        }
     }
 
     #[inline]
@@ -184,19 +159,6 @@ impl InlineRangeSet {
         }
     }
 
-    /*#[inline]
-    fn contains(&self, val: u64) -> bool {
-        for &(s, e) in &self.inner {
-            if val < s {
-                return false;
-            }
-            if val <= e {
-                return true;
-            }
-        }
-        false
-    }*/
-
     fn remove_below(&mut self, val: u64) {
         while let Some((start, end)) = self.inner.first_mut() {
             if val >= *end {
@@ -260,14 +222,6 @@ impl BTreeRangeSet {
             .map(|(&s, &e)| s..=e)
             .next()
     }
-
-    /*#[inline]
-    fn contains(&self, val: u64) -> bool {
-        self.inner
-            .range(..=val)
-            .next_back()
-            .is_some_and(|(_, &end)| val <= end)
-    }*/
 
     fn remove_below(&mut self, val: u64) {
         let to_remove: Vec<RangeInclusive<u64>> = self

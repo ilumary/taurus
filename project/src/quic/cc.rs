@@ -1,6 +1,6 @@
 use crate::{
     packet::AckFrame,
-    transport_parameters::{AckDelayExponent, VarInt},
+    transport_parameters::AckDelayExponent,
 };
 use std::{
     collections::VecDeque,
@@ -137,11 +137,7 @@ impl RttEstimator {
 
         // rttvar = 3/4 · rttvar + 1/4 · |smoothed_rtt − adjusted_rtt|
         // smoothed_rtt = 7/8 · smoothed_rtt + 1/8 · adjusted_rtt
-        let abs_diff = if self.smoothed_rtt > adjusted_rtt {
-            self.smoothed_rtt - adjusted_rtt
-        } else {
-            adjusted_rtt - self.smoothed_rtt
-        };
+        let abs_diff = self.smoothed_rtt.abs_diff(adjusted_rtt);
         self.rttvar = (self.rttvar * 3 + abs_diff) / 4;
         self.smoothed_rtt = (self.smoothed_rtt * 7 + adjusted_rtt) / 8;
 
@@ -217,6 +213,7 @@ impl SpaceState {
     }
 
     /// call when a packet is proactively sent
+    /// TODO replace with call into cc
     fn insert(&mut self, pn: u64, packet: SentPacket) {
         if self.sent.is_empty() {
             self.first_pn = pn;
@@ -372,7 +369,7 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
     }
 
     pub fn set_ack_delay_exponent(&mut self, ade: AckDelayExponent) {
-        self.ack_delay_exponent = ade.get().unwrap_or(&VarInt::from(3)).get() as u32;
+        self.ack_delay_exponent = ade.get().get() as u32;
     }
 
     pub fn set_max_ack_delay(&mut self, delay: Duration) {
@@ -400,7 +397,7 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
         self.bytes_in_flight += size;
         self.probe_pending = false;
 
-        self.spaces[space as usize].insert(
+        self.spaces[space].insert(
             pn,
             SentPacket {
                 time_sent: now,
@@ -437,30 +434,29 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
     pub fn on_ack_received(
         &mut self,
         space: usize,
-        ack_frame: AckFrame,
+        ack_frame: &AckFrame,
         now: Instant,
     ) -> (Vec<u64>, Vec<u64>) {
-        let idx = space as usize;
         let largest_acked = ack_frame.largest_acknowledged();
 
-        let is_new_largest = self.spaces[idx]
+        let is_new_largest = self.spaces[space]
             .largest_acked
             .is_none_or(|prev| largest_acked > prev);
 
         if is_new_largest {
-            if let Some(time_sent) = self.spaces[idx].get(largest_acked).map(|p| p.time_sent) {
+            if let Some(time_sent) = self.spaces[space].get(largest_acked).map(|p| p.time_sent) {
                 let latest_rtt = now.duration_since(time_sent);
                 let ack_delay = self.decode_ack_delay(ack_frame.ack_delay());
                 self.rtt.update(latest_rtt, ack_delay, space);
             }
-            self.spaces[idx].largest_acked = Some(largest_acked);
+            self.spaces[space].largest_acked = Some(largest_acked);
         }
 
         let mut acked_pns: Vec<u64> = Vec::new();
         let mut acked_bytes: usize = 0;
 
         for ri in ack_frame.ranges() {
-            for (pn, pkt) in self.spaces[idx].remove_range(*ri.start(), *ri.end()) {
+            for (pn, pkt) in self.spaces[space].remove_range(*ri.start(), *ri.end()) {
                 self.bytes_in_flight = self.bytes_in_flight.saturating_sub(pkt.size);
                 acked_bytes += pkt.size;
                 acked_pns.push(pn);
@@ -480,7 +476,7 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
         }
 
         let loss_delay = self.rtt.loss_delay();
-        let (lost_pns, lost_bytes) = self.spaces[idx].detect_lost_packets(loss_delay, now);
+        let (lost_pns, lost_bytes) = self.spaces[space].detect_lost_packets(loss_delay, now);
 
         if !lost_pns.is_empty() {
             debug!(
@@ -536,7 +532,7 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
             let mut all_lost = Vec::new();
             let mut total_bytes: usize = 0;
             for space in SPACE_ID_INITIAL..=SPACE_ID_DATA {
-                let (pns, bytes) = self.spaces[space as usize].detect_lost_packets(loss_delay, now);
+                let (pns, bytes) = self.spaces[space].detect_lost_packets(loss_delay, now);
                 total_bytes += bytes;
                 all_lost.extend(pns);
             }
@@ -586,6 +582,10 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
 
     pub fn pto_count(&self) -> u32 {
         self.pto_count
+    }
+
+    pub fn pto(&self) -> Duration {
+        self.rtt.pto(self.handshake_confirmed)
     }
 
     fn decode_ack_delay(&self, encoded: u64) -> Duration {
