@@ -48,10 +48,6 @@ impl From<u64> for VarInt {
 impl IOHandler<VarInt> for VarInt {
     fn encode(value: &VarInt, buf: &mut OctetsMut) -> Result<(), octets::BufferTooShortError> {
         let length = varint_len(value.value) as u64;
-        println!(
-            "encoding {:x?} with length field {:x?}",
-            value.value, length
-        );
         buf.put_varint(length)?;
         buf.put_varint(value.value)?;
         Ok(())
@@ -444,7 +440,7 @@ transport_parameter!(InitialSourceConnectionId, 0x0f, Id);
 
 impl InitialSourceConnectionId {
     fn validate(self) -> Result<Self, terror::Error> {
-        if self.value.len() > MAX_CID_SIZE && self.value.len() > 0 {
+        if self.value.len() > MAX_CID_SIZE && !self.value.is_empty() {
             return Err(terror::Error::quic_transport_error(
                 "malformed, badly formatted or absent initial source connection id",
                 terror::QuicTransportError::TransportParameterError,
@@ -458,7 +454,7 @@ transport_parameter!(RetrySourceConnectionId, 0x10, Id);
 
 impl RetrySourceConnectionId {
     fn validate(self) -> Result<Self, terror::Error> {
-        if self.value.len() > MAX_CID_SIZE && self.value.len() > 0 {
+        if self.value.len() > MAX_CID_SIZE && !self.value.is_empty() {
             return Err(terror::Error::quic_transport_error(
                 "malformed, badly formatted or absent retry source connection id",
                 terror::QuicTransportError::TransportParameterError,
@@ -469,7 +465,7 @@ impl RetrySourceConnectionId {
 }
 
 //Params outside of RFC 9000
-zero_sized_transport_parameter!(Grease, 0xb6);
+/*zero_sized_transport_parameter!(Grease, 0xb6);
 transport_parameter!(MaxDatagramFrameSize, 0x20, VarInt, 0x00.into());
 
 impl MaxDatagramFrameSize {
@@ -485,7 +481,7 @@ impl MinAckDelay {
     fn validate(self) -> Result<Self, terror::Error> {
         Ok(self)
     }
-}
+}*/
 
 //RFC 9000 Section 18.2
 //TODO expand to RFC 9287 & draft-ietf-quic-ack-frequency
@@ -510,10 +506,10 @@ pub struct TransportConfig {
     pub retry_source_connection_id: RetrySourceConnectionId,
 
     //Params outside of RFC 9000
-    pub grease: Grease,
-    pub max_datagram_frame_size: MaxDatagramFrameSize,
-    pub grease_quic_bit: GreaseQuicBit,
-    pub min_ack_delay: MinAckDelay,
+    //pub grease: Grease,
+    //pub max_datagram_frame_size: MaxDatagramFrameSize,
+    //pub grease_quic_bit: GreaseQuicBit,
+    //pub min_ack_delay: MinAckDelay,
 }
 
 impl TransportConfig {
@@ -560,10 +556,10 @@ impl TransportConfig {
                 0x0010 => {
                     self.retry_source_connection_id = RetrySourceConnectionId::decode(&mut b)?
                 }
-                0x00b6 => self.grease = Grease::decode(&mut b)?,
-                0x0020 => self.max_datagram_frame_size = MaxDatagramFrameSize::decode(&mut b)?,
-                0x2ab2 => self.grease_quic_bit = GreaseQuicBit::decode(&mut b)?,
-                0xff04de1a => self.min_ack_delay = MinAckDelay::decode(&mut b)?,
+                //0x00b6 => self.grease = Grease::decode(&mut b)?,
+                //0x0020 => self.max_datagram_frame_size = MaxDatagramFrameSize::decode(&mut b)?,
+                //0x2ab2 => self.grease_quic_bit = GreaseQuicBit::decode(&mut b)?,
+                //0xff04de1a => self.min_ack_delay = MinAckDelay::decode(&mut b)?,
                 _ => {
                     let data = b
                         .get_bytes_with_varint_length()
@@ -608,10 +604,10 @@ impl TransportConfig {
             write_tp!(retry_source_connection_id);
 
             //other transport params only after GREASE
-            write_tp!(grease);
-            write_tp!(max_datagram_frame_size);
-            write_tp!(grease_quic_bit);
-            write_tp!(min_ack_delay);
+            //write_tp!(grease);
+            //write_tp!(max_datagram_frame_size);
+            //write_tp!(grease_quic_bit);
+            //write_tp!(min_ack_delay);
 
             written = buf.off();
         }
@@ -642,8 +638,8 @@ mod tests {
     #[test]
     fn test_transport_parameter_encoding() {
         let tpc = TransportConfig {
-            grease: Grease::from(true),
-            min_ack_delay: MinAckDelay::try_from(VarInt::from(1000)).unwrap(),
+            //grease: Grease::from(true),
+            //min_ack_delay: MinAckDelay::try_from(VarInt::from(1000)).unwrap(),
             ack_delay_exponent: AckDelayExponent::try_from(VarInt::from(5)).unwrap(),
             original_destination_connection_id: OriginalDestinationConnectionId::try_from(
                 Id::from_slice(&[0xab, 0xab, 0xab, 0xab]),
@@ -655,8 +651,7 @@ mod tests {
         let result = tpc.encode(rustls::Side::Server).unwrap();
 
         let expected = vec![
-            0x00, 0x04, 0xab, 0xab, 0xab, 0xab, 0x0a, 0x01, 0x05, 0x40, 0xb6, 0x00, 0xc0, 0x00,
-            0x00, 0x00, 0xff, 0x04, 0xde, 0x1a, 0x02, 0x43, 0xe8,
+            0x00, 0x04, 0xab, 0xab, 0xab, 0xab, 0x0a, 0x01, 0x05,
         ];
 
         assert_eq!(result, expected);
@@ -687,6 +682,6 @@ mod tests {
             &vec![0x03, 0x25, 0x05, 0xd0, 0x49, 0x6f, 0x4c, 0x31]
         );
         assert_eq!(tpc.active_connection_id_limit.get().get(), 5);
-        assert!(tpc.grease.get());
+        //assert!(tpc.grease.get());
     }
 }

@@ -7,7 +7,7 @@ pub const INITIAL_MAX_DATA_UNI_STREAM: u64 = 0x400;
 pub const MAX_WINDOW_STREAM: u64 = 0x4000;
 pub const MAX_WINDOW_CONNECTION: u64 = 0x10000;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct InitialStreamDataLimits {
     // initial send limit on our side for bidi streams opened by peer
     pub max_stream_data_bidi_local: u64,

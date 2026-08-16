@@ -42,6 +42,8 @@ impl Error {
     taurus_error!(invalid_stream, 0x1c);
     taurus_error!(dns_lookup_error, 0x1d);
     taurus_error!(dns_timeout, 0x1d);
+    taurus_error!(concurrent_accept, 0x1c);
+    taurus_error!(connection_closed, 0x1d);
     taurus_error!(taurus_misc_error, 0xff);
 
     pub fn quic_transport_error<T>(reason: T, code: QuicTransportError) -> Self

@@ -1,15 +1,26 @@
 use crate::{terror, token::StatelessResetToken};
-use smallvec::SmallVec;
-
+use octets::varint_len;
 use rand::Rng;
+use smallvec::SmallVec;
 use std::{
     collections::VecDeque,
     fmt,
     hash::{Hash, Hasher},
+    time::{Duration, Instant},
 };
 use tracing::warn;
 
 pub const MAX_CID_SIZE: usize = 0x14;
+
+/// length of the stateless reset token
+const SRT_LEN: usize = 0x10;
+
+/// length of every cid we issue
+const ISSUED_CID_LEN: usize = 0x08;
+
+/// rotation triggers
+const ROTATE_AFTER: Duration = Duration::from_secs(5 * 60);
+const ROTATE_AFTER_BYTES: u64 = 16 * 1024 * 1024;
 
 const MAX_CID_RETIREMENTS_IN_FLIGHT: usize = 0x04;
 const MAX_NEW_CIDS_IN_FLIGHT: usize = 0x04;
@@ -49,16 +60,19 @@ impl Id {
 
     fn generate_with_length(length: usize) -> Self {
         assert!(length <= MAX_CID_SIZE);
-        let mut b = [0u8; MAX_CID_SIZE];
-        rand::rng().fill_bytes(&mut b[..length]);
-        Id::from_slice(b[..length].into())
+        let mut id = Self {
+            len: length as u8,
+            bytes: [0u8; MAX_CID_SIZE],
+        };
+        rand::rng().fill_bytes(&mut id.bytes[..length]);
+        id
     }
 }
 
 impl PartialEq for Id {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.len == other.len && self.as_slice() == other.as_slice()
+        self.as_slice() == other.as_slice()
     }
 }
 
@@ -81,8 +95,7 @@ impl Ord for Id {
 impl Hash for Id {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u8(self.len);
-        state.write(&self.bytes[..self.len as usize]);
+        self.as_slice().hash(state);
     }
 }
 
@@ -92,17 +105,20 @@ impl fmt::Display for Id {
         for b in self.as_slice() {
             write!(f, "{:02x}", b)?;
         }
-        write!(f, "")
+        Ok(())
     }
 }
 
 impl fmt::Debug for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "0x")?;
-        for b in self.as_slice() {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, "")
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl core::borrow::Borrow<[u8]> for Id {
+    #[inline]
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
     }
 }
 
@@ -113,97 +129,101 @@ impl From<Vec<u8>> for Id {
     }
 }
 
+/// Tracks both halves of the connection id state machine.
 pub struct ConnectionIdManager {
-    // dcids (received from peer) & scids (our own)
-    // index is sequence number, active cids start at retire_prior_to
-    dcids: Vec<Id>,
-    scids: Vec<Id>,
+    // ids the peer issued (our dcids)
+    dcids: VecDeque<Option<Id>>,
+    dcid_srt: VecDeque<Option<StatelessResetToken>>,
+    dcid_base: u64,
 
-    // keep stateless reset tokens seperate from ids as they are rarely needed
-    dcid_srt: Vec<StatelessResetToken>,
-    scid_srt: Vec<StatelessResetToken>,
+    // the dcid we currently send with
+    dcid_current: Id,
+    dcid_current_sqn: u64,
+    // highest retire prior to the peer has sent us
+    dcid_rpt: u64,
+    // number of active dcids
+    dcid_active: u64,
 
-    // active connection id limit (from our peer), i.e. how many they are willing to maintain, we
-    // must not issue more active ids than this limit
+    // ids we issued (our scids)
+    scids: VecDeque<Option<Id>>,
+    scid_srt: VecDeque<Option<StatelessResetToken>>,
+    scid_base: u64,
+    // retire prior to we advertise
+    scid_rpt: u64,
+    // active ids for peer
+    scid_avail: u64,
+
+    // active_connection_id_limit from the peer
     peer_cid_limit: u64,
-
-    // active cid limit we sent to our peer, used only to enforce limit
+    // active_connection_id_limit we advertised
     local_cid_limit: u64,
 
-    // retire prior to tracking
-    dcid_rpt_sqn: u64,
-    scid_rpt_sqn: u64,
-
-    // initial connection ids (immutable after handshake)
+    // handshake ids, immutable afterwards
     retry_scid: Option<Id>,
     original_dcid: Option<Id>,
-    initial_scid: Option<Id>,
+    // the scid field of every long header packet
+    initial_scid: Id,
 
-    // rotation-based tracking of time and received bytes plus an immediate trigger, for example
-    // used on path change / NAT rebinding / migration to trigger issuance of new cid
-    last_issued: std::time::Instant,
+    // rotation triggers
+    last_issued: Instant,
     recv_byte_counter: u64,
     immediate: bool,
 
-    // retired connection ids awaiting RETIRE_CONNECTION_ID frame transmission
-    pending_cid_retirements: VecDeque<u64>,
-
-    // in-flight retirements. we limit ourselves to a maximum of one retired cid per packet.
-    // vec contains tuple of packet number and the retired cids sqn.
-    cid_retirements_if: SmallVec<[(u64, u64); MAX_CID_RETIREMENTS_IN_FLIGHT]>,
-
-    // in-flight NEW_CONNECTION_ID frames. we limit ourselves to a max of one new cid per packet.
-    // vec contains tuple of (pn, sqn, rpt) so we can trivially reconstruct it in case of loss.
-    new_cid_if: SmallVec<[(u64, u64, u64); MAX_NEW_CIDS_IN_FLIGHT]>,
+    // dcid sqns awaiting a RETIRE_CONNECTION_ID frame, first send or retransmit
+    pending_retire: VecDeque<u64>,
+    // scid sqns awaiting a NEW_CONNECTION_ID retransmit
+    pending_new: SmallVec<[u64; 4]>,
 }
 
 impl ConnectionIdManager {
     fn new(
-        dcids: Vec<Id>,
-        scids: Vec<Id>,
-        retry_scid: Option<Id>,
+        initial_dcid: Id,
+        initial_scid: Id,
+        initial_scid_srt: Option<StatelessResetToken>,
         original_dcid: Option<Id>,
-        initial_scid: Option<Id>,
         local_cid_limit: u64,
     ) -> Self {
+        let mut dcids = VecDeque::with_capacity(4);
+        dcids.push_back(Some(initial_dcid));
+        let mut dcid_srt = VecDeque::with_capacity(4);
+        dcid_srt.push_back(None);
+
+        let mut scids = VecDeque::with_capacity(4);
+        scids.push_back(Some(initial_scid));
+        let mut scid_srt = VecDeque::with_capacity(4);
+        scid_srt.push_back(initial_scid_srt);
+
         Self {
             dcids,
+            dcid_srt,
+            dcid_base: 0,
+            dcid_current: initial_dcid,
+            dcid_current_sqn: 0,
+            dcid_rpt: 0,
+            dcid_active: 1,
             scids,
-            dcid_srt: Vec::new(),
-            scid_srt: Vec::new(),
+            scid_srt,
+            scid_base: 0,
+            scid_rpt: 0,
+            scid_avail: 1,
             peer_cid_limit: 0,
             local_cid_limit,
-            dcid_rpt_sqn: 0,
-            scid_rpt_sqn: 0,
-            retry_scid,
+            retry_scid: None,
             original_dcid,
             initial_scid,
-            last_issued: std::time::Instant::now(),
+            last_issued: Instant::now(),
             recv_byte_counter: 0,
             immediate: false,
-            pending_cid_retirements: VecDeque::new(),
-            cid_retirements_if: SmallVec::new(),
-            new_cid_if: SmallVec::new(),
+            pending_retire: VecDeque::new(),
+            pending_new: SmallVec::new(),
         }
     }
 
-    // the connection id that a client selects for the first dcid field it sends and any connection id
-    // provided by a retry packet are not assigned sequence numbers.
-    // the first dcid is entered into the dcid vector, despite it having no formal sqn. as soon as
-    // the servers initial packet with its choice arrives, it is replaced
-    // returns (self, dcid, scid)
     pub fn as_client(local_cid_limit: u64) -> (Self, Id, Id) {
-        let dcid = Id::generate_with_length(8);
-        let scid = Id::generate_with_length(8);
+        let dcid = Id::generate_with_length(ISSUED_CID_LEN);
+        let scid = Id::generate_with_length(ISSUED_CID_LEN);
 
-        let cidm = Self::new(
-            vec![dcid],
-            vec![scid],
-            None,
-            Some(dcid),
-            Some(scid),
-            local_cid_limit,
-        );
+        let cidm = Self::new(dcid, scid, None, Some(dcid), local_cid_limit);
 
         (cidm, dcid, scid)
     }
@@ -214,39 +234,78 @@ impl ConnectionIdManager {
         local_cid_limit: u64,
         hmac_reset_token_key: &ring::hmac::Key,
     ) -> (Self, Id, StatelessResetToken) {
-        let i_scid = Id::generate_with_length(8);
-        let srt = crate::token::StatelessResetToken::new(hmac_reset_token_key, &i_scid);
+        let i_scid = Id::generate_with_length(ISSUED_CID_LEN);
+        let srt = StatelessResetToken::new(hmac_reset_token_key, &i_scid);
 
         let cidm = Self::new(
-            vec![initial_dcid],
-            vec![i_scid],
-            None,
+            initial_dcid,
+            i_scid,
+            Some(srt),
             Some(original_dcid),
-            Some(i_scid),
             local_cid_limit,
         );
 
         (cidm, i_scid, srt)
     }
 
-    pub fn get_initial_scid_unchecked(&self) -> Id {
-        self.initial_scid.unwrap()
+    /// active_connection_id_limit received from the peer
+    #[inline]
+    pub fn set_peer_cid_limit(&mut self, limit: u64) {
+        self.peer_cid_limit = limit;
     }
 
-    /// client only, used to replace dcid (sqn=0) for server after its initial packet arrives
+    /// client only, replaces the placeholder dcid with the servers choice once
+    /// its initial packet arrives
     pub fn replace_initial_dcid(&mut self, connection_id: Id) {
-        assert_eq!(*self.original_dcid.as_ref().unwrap(), self.dcids[0]);
-        self.dcids[0] = connection_id;
+        debug_assert_eq!(self.dcid_base, 0);
+        // whichever unsequenced id is currently parked in the slot
+        debug_assert_eq!(self.retry_scid.or(self.original_dcid), self.dcids[0]);
+        self.set_unsequenced_dcid(connection_id);
     }
 
-    /// returns a valid scid
+    /// client only. the cid from a retry packet carries no sequence number, so
+    /// it takes the same slot until the server's initial replaces it.
+    pub fn set_retry_scid(&mut self, connection_id: Id) {
+        debug_assert_eq!(self.dcid_base, 0);
+        self.retry_scid = Some(connection_id);
+        self.set_unsequenced_dcid(connection_id);
+    }
+
+    /// value to check the peer's retry_source_connection_id transport parameter against
+    #[inline]
+    pub fn retry_scid(&self) -> Option<&Id> {
+        self.retry_scid.as_ref()
+    }
+
+    #[inline]
+    fn set_unsequenced_dcid(&mut self, connection_id: Id) {
+        self.dcids[0] = Some(connection_id);
+        if self.dcid_current_sqn == 0 {
+            self.dcid_current = connection_id;
+        }
+    }
+
+    #[inline]
     pub fn get_scid(&self) -> &Id {
-        &self.scids[self.scid_rpt_sqn as usize]
+        &self.initial_scid
     }
 
-    /// returns a valid dcid
+    /// the dcid to put in outgoing packets
+    #[inline]
     pub fn get_dcid(&self) -> &Id {
-        &self.dcids[self.dcid_rpt_sqn as usize]
+        &self.dcid_current
+    }
+
+    #[inline]
+    pub fn on_bytes_received(&mut self, bytes: u64) {
+        self.recv_byte_counter = self.recv_byte_counter.saturating_add(bytes);
+    }
+
+    /// forces issuance on the next packet, for path change / nat rebinding /
+    /// migration
+    #[inline]
+    pub fn trigger_immediate(&mut self) {
+        self.immediate = true;
     }
 
     /// handles an incoming NEW_CONNECTION_ID frame
@@ -264,38 +323,87 @@ impl ConnectionIdManager {
             ));
         }
 
-        // if the sequence number is lower than retire prior to, the new cid is either a
-        // retransmission and already retired or must be immediately retired
-        if sqn < self.dcid_rpt_sqn {
-            if !self.pending_cid_retirements.contains(&sqn) {
-                self.pending_cid_retirements.push_back(sqn);
+        if cid.is_empty() {
+            return Err(terror::Error::quic_transport_error(
+                "received zero length connection id",
+                terror::QuicTransportError::FrameEncodingError,
+            ));
+        }
+
+        // below the base means we already retired it
+        if sqn < self.dcid_base {
+            return Ok(());
+        }
+
+        // we must be able to track at least twice the limit we advertised
+        if self.pending_retire.len() as u64 > self.local_cid_limit.saturating_mul(2) {
+            return Err(terror::Error::quic_transport_error(
+                "too many connection ids awaiting retirement",
+                terror::QuicTransportError::ConnectionIdLimitError,
+            ));
+        }
+
+        // cap how far ahead of the base a sequence number may sit
+        let window = self.local_cid_limit.saturating_mul(3);
+        if sqn - self.dcid_base >= window {
+            return Err(terror::Error::quic_transport_error(
+                "connection id sequence number too far ahead",
+                terror::QuicTransportError::ConnectionIdLimitError,
+            ));
+        }
+
+        // retire everything below the new watermark before adding the new id
+        if rpt > self.dcid_rpt {
+            for s in self.dcid_rpt..rpt {
+                self.retire_dcid(s);
+            }
+            self.dcid_rpt = rpt;
+        }
+
+        // grow to cover sqn, leaving None in any gap left by reordering
+        let idx = (sqn - self.dcid_base) as usize;
+        if idx >= self.dcids.len() {
+            self.dcids.resize(idx + 1, None);
+            self.dcid_srt.resize(idx + 1, None);
+        }
+
+        if let Some(known) = self.dcids[idx] {
+            // receipt of the same frame again is not an error, but reusing
+            // a sequence number for a different id MAY be treated as one
+            if known != cid {
+                return Err(terror::Error::quic_transport_error(
+                    "sequence number reused for a different connection id",
+                    terror::QuicTransportError::ProtocolViolation,
+                ));
             }
             return Ok(());
         }
 
-        // check if new retire_prior_to is higher than current
-        if rpt > self.dcid_rpt_sqn {
-            self.pending_cid_retirements
-                .append(&mut (self.dcid_rpt_sqn..rpt).collect());
-            self.dcid_rpt_sqn = rpt;
+        if sqn < self.dcid_rpt {
+            // already retired by this or an earlier retire prior to
+            if !self.pending_retire.contains(&sqn) {
+                self.pending_retire.push_back(sqn);
+            }
+            return Ok(());
         }
 
-        if self.dcids.len() < sqn as usize {
-            return Err(terror::Error::quic_transport_error(
-                "sequence number is increasing by more than one",
-                terror::QuicTransportError::ProtocolViolation,
-            ));
+        self.dcids[idx] = Some(cid);
+        self.dcid_srt[idx] = Some(srt);
+        self.dcid_active += 1;
+
+        // the retirement above can leave us with nothing to send with
+        let current_live = self
+            .dcid_current_sqn
+            .checked_sub(self.dcid_base)
+            .and_then(|i| self.dcids.get(i as usize))
+            .is_some_and(|slot| slot.is_some());
+        if !current_live {
+            self.select_dcid();
         }
 
-        // if exactly next cid, save cid, assume if sqn lower, its a retransmission and both cids
-        // match
-        if self.dcids.len() == sqn as usize {
-            self.dcids.push(cid);
-            self.dcid_srt.push(srt);
-        }
-
-        // check active_connection_id_limit
-        if (self.dcids.len() as u64 - self.dcid_rpt_sqn) > self.local_cid_limit {
+        // if the active count exceeds what we advertised after adding
+        // and retiring, the connection MUST be closed
+        if self.dcid_active > self.local_cid_limit {
             return Err(terror::Error::quic_transport_error(
                 "peer exceeded local connection id limit",
                 terror::QuicTransportError::ConnectionIdLimitError,
@@ -305,105 +413,214 @@ impl ConnectionIdManager {
         Ok(())
     }
 
-    pub fn handle_retire_cid(&mut self, sqn: u64) -> Result<Id, terror::Error> {
-        // we havent even issued that cid or its our last
-        if sqn as usize >= self.scids.len() - 1 {
+    /// handles an incoming RETIRE_CONNECTION_ID frame
+    pub fn handle_retire_cid(&mut self, sqn: u64) -> Result<Option<Id>, terror::Error> {
+        if sqn >= self.scid_base + self.scids.len() as u64 {
             return Err(terror::Error::quic_transport_error(
-                "received retire cid frame with sequence number referring to highest or non-issued cid",
+                "retire cid frame references a connection id we never issued",
                 terror::QuicTransportError::ProtocolViolation,
             ));
         }
 
-        self.scid_rpt_sqn = std::cmp::max(self.scid_rpt_sqn, sqn + 1);
+        // popped off the front already, so this is a duplicate
+        let Some(idx) = sqn.checked_sub(self.scid_base) else {
+            return Ok(None);
+        };
+        let idx = idx as usize;
 
-        Ok(self.scids[sqn as usize])
+        let Some(id) = self.scids[idx].take() else {
+            return Ok(None);
+        };
+        self.scid_srt[idx] = None;
+
+        // only ids at or above our advertised rpt counted towards what the peer
+        // may use after honouring it
+        if sqn >= self.scid_rpt {
+            self.scid_avail = self.scid_avail.saturating_sub(1);
+        }
+
+        // a retired id is never sent again, drop any queued retransmit
+        self.pending_new.retain(|s| *s != sqn);
+
+        self.reclaim_scid_front();
+
+        Ok(Some(id))
     }
 
-    /// returns true if one of three triggers turn true. first is that the number of active cids is
-    /// lower than the peers limit. second is a time based trigger. third is a data based trigger.
-    /// immediate is triggered on path change / nat rebinding / migration.
-    pub fn should_issue_cid(&self) -> bool {
-        //TODO make thresholds configurable
-        let under_limit = ((self.scids.len() as u64) - self.scid_rpt_sqn) < self.peer_cid_limit;
-        let time_elapsed =
-            std::time::Instant::now() - self.last_issued >= std::time::Duration::new(5 * 60, 0);
+    /// wire size of the NEW_CONNECTION_ID frame we would send next, or 0 if we
+    /// do not want to send one
+    pub fn next_new_cid_len(&self, now: Instant) -> usize {
+        let sqn = match self.pending_new.last() {
+            Some(&sqn) => sqn,
+            None if self.should_issue_cid(now) => self.scid_base + self.scids.len() as u64,
+            None => return 0,
+        };
 
-        //TODO maybe change so that bytes come from outside and we only calc a module and save a
-        //bool if we already triggered this "windows" for new cid
-        let bytes_threshold = self.recv_byte_counter >= (1024 * 1024 * 16);
-
-        under_limit | time_elapsed | bytes_threshold | self.immediate
+        // type + sequence number + retire prior to + length + cid + token
+        1 + varint_len(sqn) + varint_len(self.scid_rpt) + 1 + ISSUED_CID_LEN + SRT_LEN
     }
 
-    /// issues a new cid for our peer, aka our scid, their dcid. returns (sqn, rpt, id, srt). may
-    /// return none if issuing a new cid would be invalid
+    /// returns (sqn, rpt, id, srt) for the next NEW_CONNECTION_ID frame
     pub fn issue_new_cid(
         &mut self,
         hmac_key: &ring::hmac::Key,
-        packet_number: u64,
+        now: Instant,
     ) -> Option<(u64, u64, Id, StatelessResetToken)> {
-        if !self.should_issue_cid() {
+        // a lost NEW_CONNECTION_ID is sent again
+        if let Some(sqn) = self.pending_new.pop() {
+            let slot = sqn
+                .checked_sub(self.scid_base)
+                .and_then(|i| Some((self.scids.get(i as usize)?, self.scid_srt.get(i as usize)?)));
+            return match slot {
+                Some((Some(id), Some(srt))) => Some((sqn, self.scid_rpt, *id, *srt)),
+                _ => None,
+            };
+        }
+
+        if !self.should_issue_cid(now) {
             return None;
         }
 
-        if self.new_cid_if.len() >= MAX_NEW_CIDS_IN_FLIGHT {
-            warn!("issuing a new cid would exceed the in-flight limit");
-            return None;
-        }
-
-        // generate new cid
-        let id = Id::generate_with_length(8);
-        let sqn = self.scids.len() as u64;
-
-        // generate stateless reset token
+        let sqn = self.scid_base + self.scids.len() as u64;
+        let id = Id::generate_with_length(ISSUED_CID_LEN);
         let srt = StatelessResetToken::new(hmac_key, &id);
 
-        // save id
-        self.scids.push(id);
-        self.scid_srt.push(srt);
+        self.scids.push_back(Some(id));
+        self.scid_srt.push_back(Some(srt));
+        self.scid_avail += 1;
 
-        // figure out if we need to increase retire prior to
-        let under_limit = ((self.scids.len() as u64) - self.scid_rpt_sqn) <= self.peer_cid_limit;
-        if !under_limit {
-            self.scid_rpt_sqn += 1;
+        // we may exceed the peer's limit only if the same frame demands
+        // retirement of the excess
+        while self.scid_avail > self.peer_cid_limit && self.scid_rpt < sqn {
+            let idx = (self.scid_rpt - self.scid_base) as usize;
+            if self.scids[idx].is_some() {
+                self.scid_avail -= 1;
+            }
+            self.scid_rpt += 1;
         }
 
-        // save issued time for time-based trigger
-        self.last_issued = std::time::Instant::now();
+        self.last_issued = now;
+        self.recv_byte_counter = 0;
+        self.immediate = false;
 
-        // save into in-flight vec
-        self.new_cid_if
-            .push((packet_number, sqn, self.scid_rpt_sqn));
-
-        Some((sqn, self.scid_rpt_sqn, id, srt))
+        Some((sqn, self.scid_rpt, id, srt))
     }
 
-    /// removes incoming acked frames from in-flight tracking structures
-    pub fn ack(&mut self, pns: &[u64]) {
-        self.cid_retirements_if
-            .retain(|(pn, _sqn)| !pns.contains(pn));
-        self.new_cid_if.retain(|(pn, _sqn, _rpt)| !pns.contains(pn));
-    }
-
-    /// returns the next sequence number for our cids
-    pub fn peek_next_sqn(&self) -> usize {
-        self.scids.len()
-    }
-
-    /// returns the next sqn to be retired varint size, if no cid is to be retired, returns 0
-    pub fn peek_next_pending_cid_retirement(&self) -> usize {
-        if let Some(pending) = self.pending_cid_retirements.front() {
-            return octets::varint_len(*pending);
+    /// wire size of the next RETIRE_CONNECTION_ID frame, 0 if none is pending
+    #[inline]
+    pub fn next_retire_cid_len(&self) -> usize {
+        match self.pending_retire.front() {
+            Some(&sqn) => 1 + varint_len(sqn),
+            None => 0,
         }
-        0
     }
 
-    /// pops next sqn to be retired out of queue and enters it into in-flight tracking. should only
-    /// be called after [`ConnectionIdManager::peek_next_pending_cid_retirement()`].
-    pub fn pop_next_pending_cid_retirement(&mut self, pn: u64) -> u64 {
-        let sqn = self.pending_cid_retirements.pop_front().unwrap();
-        self.cid_retirements_if.push((pn, sqn));
+    pub fn wants_write(&self) -> bool {
+        !self.pending_new.is_empty() || !self.pending_retire.is_empty()
+    }
+
+    /// pops the sequence number for the next RETIRE_CONNECTION_ID frame
+    #[inline]
+    pub fn pop_retire_cid(&mut self) -> u64 {
+        let sqn = self
+            .pending_retire
+            .pop_front()
+            .expect("pop_retire_cid without a pending retirement");
+        debug_assert_ne!(sqn, self.dcid_current_sqn);
         sqn
+    }
+
+    pub fn on_new_cid_lost(&mut self, sqn: u64) {
+        let Some(idx) = sqn.checked_sub(self.scid_base) else {
+            return;
+        };
+
+        if self.scids.get(idx as usize).and_then(|s| *s).is_none() {
+            return;
+        }
+
+        if !self.pending_new.contains(&sqn) {
+            self.pending_new.push(sqn);
+        }
+    }
+
+    pub fn on_retire_cid_lost(&mut self, sqn: u64) {
+        if !self.pending_retire.contains(&sqn) {
+            self.pending_retire.push_front(sqn);
+        }
+    }
+
+    /// true if one of four triggers fires: we are below the peer's limit, the
+    /// rotation timer expired, enough bytes arrived, or a path change asked for it
+    pub fn should_issue_cid(&self, now: Instant) -> bool {
+        if self.scid_avail < self.peer_cid_limit {
+            return true;
+        }
+
+        if self.scid_base < self.scid_rpt || self.peer_cid_limit == 0 {
+            return false;
+        }
+
+        self.immediate
+            || self.recv_byte_counter >= ROTATE_AFTER_BYTES
+            || now.duration_since(self.last_issued) >= ROTATE_AFTER
+    }
+
+    fn retire_dcid(&mut self, sqn: u64) {
+        let Some(idx) = sqn.checked_sub(self.dcid_base) else {
+            return;
+        };
+
+        let idx = idx as usize;
+        let Some(slot) = self.dcids.get_mut(idx) else {
+            return;
+        };
+
+        if slot.take().is_none() {
+            return;
+        }
+
+        self.dcid_srt[idx] = None;
+        self.dcid_active = self.dcid_active.saturating_sub(1);
+        self.pending_retire.push_back(sqn);
+
+        if self.dcid_current_sqn == sqn {
+            self.select_dcid();
+        }
+        self.reclaim_dcid_front();
+    }
+
+    fn select_dcid(&mut self) {
+        match self
+            .dcids
+            .iter()
+            .enumerate()
+            .find_map(|(i, slot)| (*slot).map(|id| (i as u64, id)))
+        {
+            Some((i, id)) => {
+                self.dcid_current_sqn = self.dcid_base + i;
+                self.dcid_current = id;
+            }
+            None => warn!("peer retired every connection id without a replacement"),
+        }
+    }
+
+    #[inline]
+    fn reclaim_dcid_front(&mut self) {
+        while matches!(self.dcids.front(), Some(None)) {
+            self.dcids.pop_front();
+            self.dcid_srt.pop_front();
+            self.dcid_base += 1;
+        }
+    }
+
+    #[inline]
+    fn reclaim_scid_front(&mut self) {
+        while matches!(self.scids.front(), Some(None)) {
+            self.scids.pop_front();
+            self.scid_srt.pop_front();
+            self.scid_base += 1;
+        }
     }
 }
 
@@ -411,333 +628,496 @@ impl ConnectionIdManager {
 mod tests {
     use super::*;
 
-    static HMAC_KEY: std::sync::OnceLock<ring::hmac::Key> = std::sync::OnceLock::new();
-    static HMAC_RESET_KEY_VALUE: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
-
-    fn get_cid_manager(num_dcids: u64, num_scids: u64) -> ConnectionIdManager {
-        let mut dcids: Vec<Id> = vec![];
-        let mut scids: Vec<Id> = vec![];
-
-        for _ in 0..num_dcids {
-            dcids.push(Id::generate_with_length(8));
-        }
-
-        for _ in 0..num_scids {
-            scids.push(Id::generate_with_length(8));
-        }
-
-        ConnectionIdManager {
-            dcids,
-            scids,
-            dcid_srt: Vec::new(),
-            scid_srt: Vec::new(),
-            peer_cid_limit: 4,
-            local_cid_limit: 4,
-            dcid_rpt_sqn: 0,
-            scid_rpt_sqn: 0,
-            retry_scid: None,
-            original_dcid: None,
-            initial_scid: None,
-            last_issued: std::time::Instant::now(),
-            recv_byte_counter: 0,
-            immediate: false,
-            pending_cid_retirements: VecDeque::new(),
-            cid_retirements_if: SmallVec::new(),
-            new_cid_if: SmallVec::new(),
-        }
-    }
-
-    // helper
-    fn init_hmac_key_value() -> &'static [u8; 64] {
-        HMAC_RESET_KEY_VALUE.get_or_init(|| {
-            let mut arr = [0u8; 64];
-            rand::rng().fill_bytes(&mut arr);
-            arr
-        })
-    }
-
-    // helper
-    fn init_hmac_reset_key() -> &'static ring::hmac::Key {
-        HMAC_KEY
-            .get_or_init(|| ring::hmac::Key::new(ring::hmac::HMAC_SHA256, init_hmac_key_value()))
-    }
-
-    // helper
-    fn get_srt(id: &Id) -> StatelessResetToken {
-        let key = init_hmac_reset_key();
-        StatelessResetToken::new(key, id)
-    }
-
-    // a helper to make deterministic test keys
     fn test_key() -> ring::hmac::Key {
-        let bytes = [0xAB; 32];
-        ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &bytes)
+        ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &[0xAB; 32])
+    }
+
+    fn srt_of(id: &Id) -> StatelessResetToken {
+        StatelessResetToken::new(&test_key(), id)
+    }
+
+    fn manager(num_dcids: u64, num_scids: u64) -> ConnectionIdManager {
+        assert!(num_dcids >= 1 && num_scids >= 1);
+        let (mut m, _, _) = ConnectionIdManager::as_client(4);
+        m.set_peer_cid_limit(4);
+
+        for sqn in 1..num_dcids {
+            let id = Id::generate_with_length(8);
+            m.handle_new_cid(sqn, 0, id, srt_of(&id)).unwrap();
+        }
+
+        for _ in 1..num_scids {
+            let id = Id::generate_with_length(8);
+            m.scids.push_back(Some(id));
+            m.scid_srt.push_back(Some(srt_of(&id)));
+            m.scid_avail += 1;
+        }
+        m
     }
 
     #[test]
     fn connection_establishment_client_to_server() {
-        // client MAYBE make id generation only possible in manager so ids are directly stored
-        let (mut c_cid_manager, c_initial_dcid, c_initial_scid) = ConnectionIdManager::as_client(4);
-
-        // server get initialized with inital packet
-        let (s_cid_manager, s_initial_scid, _) =
+        let (mut c, c_initial_dcid, c_initial_scid) = ConnectionIdManager::as_client(4);
+        let (s, s_initial_scid, _) =
             ConnectionIdManager::as_server(c_initial_scid, c_initial_dcid, 4, &test_key());
 
-        // server should answer with correct dcid and scid in initial packet
-        assert_eq!(c_initial_scid, s_cid_manager.get_dcid().clone());
-        assert_eq!(s_initial_scid, s_cid_manager.get_scid().clone());
+        assert_eq!(c_initial_scid, *s.get_dcid());
+        assert_eq!(s_initial_scid, *s.get_scid());
 
-        // client must then update the servers scid (for client dcid), which is seq = 0
-        c_cid_manager.replace_initial_dcid(s_initial_scid);
+        c.replace_initial_dcid(s_initial_scid);
 
-        // client should then use its own chosen scid and server chose dcid until a
-        // NEW_CONNECTION_ID is issued
-        assert_eq!(s_initial_scid, c_cid_manager.get_dcid().clone());
-        assert_eq!(c_initial_scid, c_cid_manager.get_scid().clone());
+        assert_eq!(s_initial_scid, *c.get_dcid());
+        assert_eq!(c_initial_scid, *c.get_scid());
     }
 
     #[test]
-    fn valid_new_connection_id() {
-        // assume start state after handshake with a single cid for d/s with sqn 0
-        let mut idm = get_cid_manager(1, 1);
+    fn scid_stays_the_initial_one_across_rotation() {
+        // the scid field must not change during the handshake even if we issue new ids
+        let mut m = manager(1, 1);
+        let initial = *m.get_scid();
+        m.peer_cid_limit = 4;
 
-        let ncid = Id::generate_with_length(8);
-        let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(1, 0, ncid, token);
+        let (_, _, id, _) = m.issue_new_cid(&test_key(), Instant::now()).unwrap();
 
-        assert!(result.is_ok());
-        assert_eq!(idm.dcids[1], ncid);
+        assert_ne!(initial, id);
+        assert_eq!(initial, *m.get_scid());
     }
 
     #[test]
-    fn invalid_new_cid_limit_exceeded() {
-        // assume start state with 4 dcids
-        let mut idm = get_cid_manager(4, 1);
+    fn retry_scid_takes_the_unsequenced_slot_until_the_server_initial() {
+        let (mut c, c_initial_dcid, _) = ConnectionIdManager::as_client(4);
+        assert_eq!(*c.get_dcid(), c_initial_dcid);
+        assert!(c.retry_scid().is_none());
 
+        // a retry replaces the dcid, but carries no sequence number
+        let retry = Id::generate_with_length(8);
+        c.set_retry_scid(retry);
+        assert_eq!(*c.get_dcid(), retry);
+        assert_eq!(c.retry_scid(), Some(&retry));
+        assert_eq!(c.dcids.len(), 1);
+
+        // the server initial cid then supplies the id that really is sqn 0
+        let server_scid = Id::generate_with_length(8);
+        c.replace_initial_dcid(server_scid);
+        assert_eq!(*c.get_dcid(), server_scid);
+        assert_eq!(c.dcid_current_sqn, 0);
+        assert_eq!(c.retry_scid(), Some(&retry));
+    }
+
+    #[test]
+    fn retirement_queue_is_bounded() {
+        let mut m = manager(1, 1);
+        // a peer churning ids faster than we drain the queue must not be able
+        // to grow it without bound
+        let budget = m.local_cid_limit * 2;
+        for sqn in 1..=budget + 4 {
+            let id = Id::generate_with_length(8);
+            if m.handle_new_cid(sqn, sqn, id, srt_of(&id)).is_err() {
+                assert!(m.pending_retire.len() as u64 > budget);
+                return;
+            }
+        }
+        panic!("retirement queue grew past the limit without erroring");
+    }
+
+    #[test]
+    fn new_cid_is_stored_at_its_sequence_number() {
+        let mut m = manager(1, 1);
         let ncid = Id::generate_with_length(8);
-        let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(4, 0, ncid, token);
 
-        assert!(result.is_err());
+        assert!(m.handle_new_cid(1, 0, ncid, srt_of(&ncid)).is_ok());
+        assert_eq!(m.dcids[1], Some(ncid));
+        assert_eq!(m.dcid_srt[1].unwrap().token, srt_of(&ncid).token);
+        assert_eq!(m.dcid_active, 2);
+        assert_eq!(m.dcid_current_sqn, 0);
+    }
+
+    #[test]
+    fn new_cid_rejects_rpt_above_sqn() {
+        let mut m = manager(4, 1);
+        let ncid = Id::generate_with_length(8);
+
+        let r = m.handle_new_cid(4, 5, ncid, srt_of(&ncid));
+
         assert_eq!(
-            result.unwrap_err().kind(),
+            r.unwrap_err().kind(),
+            terror::QuicTransportError::FrameEncodingError as u64
+        );
+        assert_eq!(m.dcids.len(), 4);
+        assert_eq!(m.dcid_rpt, 0);
+        assert!(m.pending_retire.is_empty());
+    }
+
+    #[test]
+    fn new_cid_rejects_zero_length_id() {
+        let mut m = manager(1, 1);
+        let empty = Id::default();
+
+        let r = m.handle_new_cid(1, 0, empty, srt_of(&empty));
+
+        assert_eq!(
+            r.unwrap_err().kind(),
+            terror::QuicTransportError::FrameEncodingError as u64
+        );
+    }
+
+    #[test]
+    fn new_cid_over_local_limit_is_an_error() {
+        let mut m = manager(4, 1);
+        let ncid = Id::generate_with_length(8);
+
+        let r = m.handle_new_cid(4, 0, ncid, srt_of(&ncid));
+
+        assert_eq!(
+            r.unwrap_err().kind(),
             terror::QuicTransportError::ConnectionIdLimitError as u64
         );
     }
 
     #[test]
-    fn valid_new_cid_limit_barely_not_exceeded() {
-        // assume start state with 4 dcids
-        let mut idm = get_cid_manager(4, 1);
-
+    fn new_cid_at_the_limit_with_retirement_is_accepted() {
+        // lets the peer exceed the limit when the same frame retires the excess
+        let mut m = manager(4, 1);
         let ncid = Id::generate_with_length(8);
-        let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(4, 1, ncid, token);
 
-        assert!(result.is_ok());
-        assert_eq!(idm.dcids[4], ncid);
-        assert_eq!(idm.dcid_rpt_sqn, 1);
-        assert_eq!(idm.pending_cid_retirements[0], 0);
+        assert!(m.handle_new_cid(4, 1, ncid, srt_of(&ncid)).is_ok());
+        assert_eq!(m.dcids[4 - m.dcid_base as usize], Some(ncid));
+        assert_eq!(m.dcid_rpt, 1);
+        assert_eq!(m.dcid_active, 4);
+        assert_eq!(m.pending_retire, [0]);
+        assert_eq!(m.dcid_current_sqn, 1);
     }
 
     #[test]
-    fn valid_new_cid_retire_all_but_one() {
-        // assume start state with 4 dcids
-        let mut idm = get_cid_manager(4, 1);
-
+    fn new_cid_can_retire_every_earlier_id() {
+        let mut m = manager(4, 1);
         let ncid = Id::generate_with_length(8);
-        let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(4, 4, ncid, token);
 
-        assert!(result.is_ok());
-        assert_eq!(idm.dcids[4], ncid);
-        assert_eq!(idm.dcid_rpt_sqn, 4);
-        assert_eq!(idm.pending_cid_retirements[0], 0);
-        assert_eq!(idm.pending_cid_retirements[3], 3);
+        assert!(m.handle_new_cid(4, 4, ncid, srt_of(&ncid)).is_ok());
+        assert_eq!(m.dcid_rpt, 4);
+        assert_eq!(m.dcid_active, 1);
+        assert_eq!(m.pending_retire, [0, 1, 2, 3]);
+        assert_eq!(m.dcid_base, 4);
+        assert_eq!(m.dcid_current_sqn, 4);
+        assert_eq!(*m.get_dcid(), ncid);
     }
 
     #[test]
-    fn invalid_new_cid_retire_too_many() {
-        // assume start state with 4 dcids
-        let mut idm = get_cid_manager(4, 1);
+    fn reordered_new_cid_leaves_a_gap() {
+        let mut m = manager(1, 1);
+        let third = Id::generate_with_length(8);
+        let second = Id::generate_with_length(8);
 
+        assert!(m.handle_new_cid(2, 0, third, srt_of(&third)).is_ok());
+        assert_eq!(m.dcids[1], None);
+        assert_eq!(m.dcids[2], Some(third));
+        assert_eq!(m.dcid_active, 2);
+
+        assert!(m.handle_new_cid(1, 0, second, srt_of(&second)).is_ok());
+        assert_eq!(m.dcids[1], Some(second));
+        assert_eq!(m.dcid_active, 3);
+    }
+
+    #[test]
+    fn duplicate_new_cid_is_ignored_but_a_changed_id_is_not() {
+        let mut m = manager(1, 1);
         let ncid = Id::generate_with_length(8);
-        let token = get_srt(&ncid);
-        let result = idm.handle_new_cid(4, 5, ncid, token);
 
-        assert!(result.is_err());
-        assert_eq!(idm.dcids.len(), 4);
-        assert_eq!(idm.dcid_rpt_sqn, 0);
-        assert!(idm.pending_cid_retirements.is_empty());
+        assert!(m.handle_new_cid(1, 0, ncid, srt_of(&ncid)).is_ok());
+        // the same frame again must not be an error
+        assert!(m.handle_new_cid(1, 0, ncid, srt_of(&ncid)).is_ok());
+        assert_eq!(m.dcid_active, 2);
+
+        let other = Id::generate_with_length(8);
+        let r = m.handle_new_cid(1, 0, other, srt_of(&other));
+        assert_eq!(
+            r.unwrap_err().kind(),
+            terror::QuicTransportError::ProtocolViolation as u64
+        );
     }
 
     #[test]
-    fn handle_retire_cid_from_peer() {
-        // assume start state with 4 dcids
-        let mut idm = get_cid_manager(4, 4);
+    fn new_cid_below_the_base() {
+        let mut m = manager(2, 1);
+        let high = Id::generate_with_length(8);
 
-        assert!(!idm.should_issue_cid());
+        assert!(m.handle_new_cid(2, 2, high, srt_of(&high)).is_ok());
+        assert_eq!(m.pending_retire, [0, 1]);
+        assert_eq!(m.dcid_base, 2);
+        m.pending_retire.clear();
 
-        let mut r = idm.handle_retire_cid(0);
-
-        assert!(r.is_ok());
-        assert_eq!(idm.scid_rpt_sqn, 1);
-        assert!(idm.should_issue_cid());
-        assert_eq!(*idm.get_scid(), idm.scids[1].clone());
-
-        r = idm.handle_retire_cid(1);
-
-        assert!(r.is_ok());
-        assert_eq!(idm.scid_rpt_sqn, 2);
-        assert!(idm.should_issue_cid());
-        assert_eq!(*idm.get_scid(), idm.scids[2].clone());
-
-        r = idm.handle_retire_cid(2);
-
-        assert!(r.is_ok());
-        assert_eq!(idm.scid_rpt_sqn, 3);
-        assert!(idm.should_issue_cid());
-        assert_eq!(*idm.get_scid(), idm.scids[3].clone());
-
-        r = idm.handle_retire_cid(3);
-
-        assert!(r.is_err());
-        assert_eq!(idm.scid_rpt_sqn, 3);
-        assert!(idm.should_issue_cid());
-        assert_eq!(*idm.get_scid(), idm.scids[3].clone());
-
-        r = idm.handle_retire_cid(4);
-
-        assert!(r.is_err());
-        assert_eq!(idm.scid_rpt_sqn, 3);
-        assert!(idm.should_issue_cid());
-        assert_eq!(*idm.get_scid(), idm.scids[3].clone());
+        let late = Id::generate_with_length(8);
+        assert!(m.handle_new_cid(1, 0, late, srt_of(&late)).is_ok());
+        assert!(m.pending_retire.is_empty());
+        assert_eq!(m.dcid_active, 1);
     }
 
     #[test]
-    fn issue_new_cid_with_in_flight_limit() {
-        // assume state with zero scids
-        let mut idm = get_cid_manager(1, 0);
-        idm.peer_cid_limit = 5;
+    fn new_cid_in_a_gap_below_retire_prior_to_is_retired() {
+        let mut m = manager(1, 1);
+        let high = Id::generate_with_length(8);
+        assert!(m.handle_new_cid(3, 2, high, srt_of(&high)).is_ok());
+        assert_eq!(m.pending_retire, [0]);
+        assert_eq!(m.dcid_base, 1);
 
-        let tk = test_key();
-
-        // first packet
-        let mut result = idm.issue_new_cid(&tk, 1);
-
-        assert!(result.is_some());
-
-        let (sqn, rpt, id, srt) = result.unwrap();
-        assert_eq!(sqn, 0);
-        assert_eq!(rpt, 0);
-        assert!(srt.verify(&tk, &id));
-        assert!(idm.scids.ends_with(&[id]));
-        assert!(idm.new_cid_if.ends_with(&[(1, 0, 0)]));
-
-        // second packet
-        result = idm.issue_new_cid(&tk, 2);
-
-        assert!(result.is_some());
-
-        let (sqn, rpt, id, srt) = result.unwrap();
-        assert_eq!(sqn, 1);
-        assert_eq!(rpt, 0);
-        assert!(srt.verify(&tk, &id));
-        assert!(idm.scids.ends_with(&[id]));
-        assert!(idm.new_cid_if.ends_with(&[(2, 1, 0)]));
-
-        // third & fourth packet
-        result = idm.issue_new_cid(&tk, 3);
-        assert!(result.is_some());
-        result = idm.issue_new_cid(&tk, 4);
-        assert!(result.is_some());
-
-        // now we got 4 active scids
-        assert_eq!(idm.scids.len(), 4);
-
-        // fifth packet, now our in-flight limit is hit
-        result = idm.issue_new_cid(&tk, 5);
-
-        assert!(result.is_none());
-
-        // we still want to issue because we got one left in our limit
-        assert!(idm.should_issue_cid());
-
-        // assume all in-flight frames got successfully ack'd
-        idm.new_cid_if.clear();
-
-        // sixth packet, we can issue again
-        result = idm.issue_new_cid(&tk, 6);
-
-        assert!(result.is_some());
-
-        let (sqn, rpt, id, srt) = result.unwrap();
-        assert_eq!(sqn, 4);
-        assert_eq!(rpt, 0);
-        assert!(srt.verify(&tk, &id));
-        assert!(idm.scids.ends_with(&[id]));
-        assert!(idm.new_cid_if.ends_with(&[(6, 4, 0)]));
-
-        // now the peers limit is satisfied so we dont want to issue any more
-        assert!(!idm.should_issue_cid());
+        let late = Id::generate_with_length(8);
+        assert!(m.handle_new_cid(1, 0, late, srt_of(&late)).is_ok());
+        assert_eq!(m.pending_retire, [0, 1]);
+        assert_eq!(m.dcid_active, 1);
+        assert_eq!(m.dcid_current_sqn, 3);
     }
 
     #[test]
-    fn issue_new_cid_through_time_rotation() {
-        let mut idm = get_cid_manager(4, 4);
-        let tk = test_key();
+    fn absurd_sequence_number_does_not_allocate() {
+        let mut m = manager(1, 1);
+        let ncid = Id::generate_with_length(8);
 
-        // modify last_issued to 5 mins prior now
-        idm.last_issued = std::time::Instant::now() - std::time::Duration::new(5 * 60, 0);
+        let r = m.handle_new_cid(u64::MAX / 2, 0, ncid, srt_of(&ncid));
 
-        // new cid should be issued due to timed trigger
-        let result = idm.issue_new_cid(&tk, 10);
+        assert_eq!(
+            r.unwrap_err().kind(),
+            terror::QuicTransportError::ConnectionIdLimitError as u64
+        );
+        assert_eq!(m.dcids.len(), 1);
+    }
 
-        assert!(result.is_some());
+    #[test]
+    fn retire_cid() {
+        let mut m = manager(1, 4);
+        let id2 = m.scids[2].unwrap();
+        assert_eq!(m.handle_retire_cid(2).unwrap(), Some(id2));
+        assert!(m.scids[0].is_some());
+        assert!(m.scids[1].is_some());
+        assert_eq!(m.scids[2], None);
+        assert!(m.scids[3].is_some());
+        assert_eq!(m.scid_avail, 3);
+        assert_eq!(m.scid_base, 0);
 
-        let (sqn, rpt, id, srt) = result.unwrap();
+        // accepts the highest issued sequence_number
+        let mut m = manager(1, 4);
+        assert!(m.handle_retire_cid(3).unwrap().is_some());
+        assert_eq!(m.scid_avail, 3);
+
+        // rejects an unissued sequence number
+        let mut m = manager(1, 4);
+        let r = m.handle_retire_cid(4);
+        assert_eq!(
+            r.unwrap_err().kind(),
+            terror::QuicTransportError::ProtocolViolation as u64
+        );
+        assert_eq!(m.scid_avail, 4);
+
+        // idempotence
+        let mut m = manager(1, 4);
+        assert!(m.handle_retire_cid(2).unwrap().is_some());
+        assert_eq!(m.handle_retire_cid(2).unwrap(), None);
+        assert_eq!(m.scid_avail, 3);
+
+        // reclaims the ring front
+        let mut m = manager(1, 4);
+        assert!(m.handle_retire_cid(1).unwrap().is_some());
+        assert_eq!(m.scid_base, 0);
+        assert!(m.handle_retire_cid(0).unwrap().is_some());
+        assert_eq!(m.scid_base, 2);
+        assert_eq!(m.scids.len(), 2);
+        assert_eq!(m.handle_retire_cid(0).unwrap(), None);
+    }
+
+    #[test]
+    fn issue_tops_up_to_the_peer_limit_then_stops() {
+        let mut m = manager(1, 1);
+        m.set_peer_cid_limit(3);
+        let now = Instant::now();
+        let key = test_key();
+
+        for expected_sqn in 1..3 {
+            let (sqn, rpt, id, srt) = m.issue_new_cid(&key, now).unwrap();
+            assert_eq!(sqn, expected_sqn);
+            assert_eq!(rpt, 0);
+            assert!(srt.verify(&key, &id));
+            assert_eq!(m.scids[sqn as usize], Some(id));
+        }
+
+        assert_eq!(m.scid_avail, 3);
+        assert!(!m.should_issue_cid(now));
+        assert!(m.issue_new_cid(&key, now).is_none());
+        assert_eq!(m.next_new_cid_len(now), 0);
+    }
+
+    #[test]
+    fn issue_before_transport_parameters_is_suppressed() {
+        // peer_cid_limit is 0 until the peer's transport parameters arrive
+        let (mut m, _, _) = ConnectionIdManager::as_client(4);
+        let now = Instant::now();
+
+        assert!(!m.should_issue_cid(now));
+        assert!(m.issue_new_cid(&test_key(), now).is_none());
+        assert!(!m.should_issue_cid(now + ROTATE_AFTER * 2));
+    }
+
+    #[test]
+    fn time_trigger_forces_rotation_and_raises_retire_prior_to() {
+        let mut m = manager(1, 4);
+        m.set_peer_cid_limit(4);
+        let now = Instant::now();
+        let key = test_key();
+
+        assert!(!m.should_issue_cid(now));
+
+        let later = now + ROTATE_AFTER;
+        let (sqn, rpt, id, _) = m.issue_new_cid(&key, later).unwrap();
+
         assert_eq!(sqn, 4);
         assert_eq!(rpt, 1);
-        assert!(srt.verify(&tk, &id));
-        assert!(idm.scids.ends_with(&[id]));
-        assert!(idm.new_cid_if.ends_with(&[(10, 4, 1)]));
+        assert_eq!(m.scids[4], Some(id));
+        assert_eq!(m.scid_avail, 4);
+        assert!(!m.should_issue_cid(later + ROTATE_AFTER));
+
+        assert!(m.handle_retire_cid(0).unwrap().is_some());
+        assert_eq!(m.scid_base, 1);
+        assert!(m.should_issue_cid(later + ROTATE_AFTER));
     }
 
     #[test]
-    fn issue_new_cid_through_recv_bytes_rotation() {
-        let mut idm = get_cid_manager(4, 4);
-        let tk = test_key();
+    fn byte_and_immediate_triggers() {
+        let mut m = manager(1, 4);
+        m.set_peer_cid_limit(4);
+        let now = Instant::now();
 
-        // modify so that we received at least 16MB
-        idm.recv_byte_counter = (1024 * 1024 * 16) + 1;
+        assert!(!m.should_issue_cid(now));
+        m.on_bytes_received(ROTATE_AFTER_BYTES);
+        assert!(m.should_issue_cid(now));
 
-        // new cid should be issued due to timed trigger
-        let result = idm.issue_new_cid(&tk, 10);
+        assert!(m.issue_new_cid(&test_key(), now).is_some());
+        assert_eq!(m.recv_byte_counter, 0);
 
-        assert!(result.is_some());
+        m.trigger_immediate();
+        assert!(m.immediate);
+        assert!(!m.should_issue_cid(now));
+        assert!(m.handle_retire_cid(0).unwrap().is_some());
+        assert!(m.should_issue_cid(now));
+    }
 
-        let (sqn, rpt, id, srt) = result.unwrap();
-        assert_eq!(sqn, 4);
+    #[test]
+    fn new_cid_frame_length() {
+        let mut m = manager(1, 1);
+        m.set_peer_cid_limit(4);
+        let now = Instant::now();
+
+        let len = m.next_new_cid_len(now);
+        let (sqn, rpt, id, _) = m.issue_new_cid(&test_key(), now).unwrap();
+
+        // type + sqn + rpt + length byte + cid + token
+        let encoded = 1 + varint_len(sqn) + varint_len(rpt) + 1 + id.len() + SRT_LEN;
+        assert_eq!(len, encoded);
+    }
+
+    #[test]
+    fn retire_frame_length() {
+        let mut m = manager(1, 1);
+        assert_eq!(m.next_retire_cid_len(), 0);
+
+        let high = Id::generate_with_length(8);
+        m.handle_new_cid(1, 1, high, srt_of(&high)).unwrap();
+
+        // type byte + varint
+        assert_eq!(m.next_retire_cid_len(), 1 + varint_len(0));
+        assert_eq!(m.pop_retire_cid(), 0);
+        assert_eq!(m.next_retire_cid_len(), 0);
+    }
+
+    #[test]
+    fn lost_new_cid_is_resent_with_the_same_id() {
+        let mut m = manager(1, 1);
+        m.set_peer_cid_limit(4);
+        let now = Instant::now();
+        let key = test_key();
+
+        let (sqn, _, id, srt) = m.issue_new_cid(&key, now).unwrap();
+        while m.issue_new_cid(&key, now).is_some() {}
+
+        m.on_new_cid_lost(sqn);
+        assert_eq!(
+            m.next_new_cid_len(now),
+            1 + varint_len(sqn) + varint_len(m.scid_rpt) + 1 + 8 + SRT_LEN
+        );
+
+        let (rsqn, _, rid, rsrt) = m.issue_new_cid(&key, now).unwrap();
+
+        assert_eq!(rsqn, sqn);
+        assert_eq!(rid, id);
+        assert_eq!(rsrt.token, srt.token);
+        assert!(m.pending_new.is_empty());
+    }
+
+    #[test]
+    fn lost_new_cid_is_not_resent_once_retired() {
+        let mut m = manager(1, 1);
+        m.set_peer_cid_limit(4);
+        let now = Instant::now();
+        let key = test_key();
+
+        let (sqn, _, _, _) = m.issue_new_cid(&key, now).unwrap();
+        m.on_new_cid_lost(sqn);
+        assert_eq!(m.pending_new.as_slice(), &[sqn]);
+
+        assert!(m.handle_retire_cid(sqn).unwrap().is_some());
+        assert!(m.pending_new.is_empty());
+
+        m.on_new_cid_lost(sqn);
+        assert!(m.pending_new.is_empty());
+    }
+
+    #[test]
+    fn lost_new_cid_carries_the_current_retire_prior_to() {
+        let mut m = manager(1, 4);
+        m.set_peer_cid_limit(4);
+        let now = Instant::now();
+        let key = test_key();
+
+        let (sqn, rpt, _, _) = m.issue_new_cid(&key, now + ROTATE_AFTER).unwrap();
         assert_eq!(rpt, 1);
-        assert!(srt.verify(&tk, &id));
-        assert!(idm.scids.ends_with(&[id]));
-        assert!(idm.new_cid_if.ends_with(&[(10, 4, 1)]));
+
+        m.on_new_cid_lost(1);
+        let (rsqn, rrpt, _, _) = m.issue_new_cid(&key, now).unwrap();
+        assert_eq!(rsqn, 1);
+        assert_eq!(rrpt, 1);
+        assert_ne!(rsqn, sqn);
     }
 
     #[test]
-    fn ack_in_flight_frames() {
-        let mut idm = get_cid_manager(4, 4);
+    fn lost_retire_cid_is_requeued_ahead_of_the_rest() {
+        let mut m = manager(1, 1);
+        let high = Id::generate_with_length(8);
+        m.handle_new_cid(2, 2, high, srt_of(&high)).unwrap();
+        assert_eq!(m.pending_retire, [0]);
 
-        idm.new_cid_if.push((1, 1, 0));
-        idm.new_cid_if.push((3, 2, 0));
-        idm.new_cid_if.push((7, 3, 0));
+        assert_eq!(m.pop_retire_cid(), 0);
+        assert_eq!(m.next_retire_cid_len(), 0);
 
-        idm.cid_retirements_if.push((4, 0));
-        idm.cid_retirements_if.push((5, 1));
+        let late = Id::generate_with_length(8);
+        m.handle_new_cid(1, 0, late, srt_of(&late)).unwrap();
+        assert_eq!(m.pending_retire, [1]);
 
-        idm.ack(&[0, 1, 2, 3, 4]);
+        m.on_retire_cid_lost(0);
+        assert_eq!(m.pending_retire, [0, 1]);
 
-        assert_eq!(idm.new_cid_if.len(), 1);
-        assert_eq!(idm.cid_retirements_if.len(), 1);
+        m.on_retire_cid_lost(0);
+        assert_eq!(m.pending_retire, [0, 1]);
+    }
+
+    #[test]
+    fn retired_dcid_is_never_the_one_we_send_with() {
+        // RETIRE_CONNECTION_ID must not name the dcid of its own packet
+        let mut m = manager(3, 1);
+        assert_eq!(m.dcid_current_sqn, 0);
+
+        let ncid = Id::generate_with_length(8);
+        m.handle_new_cid(3, 2, ncid, srt_of(&ncid)).unwrap();
+
+        assert_eq!(m.dcid_current_sqn, 2);
+        while m.next_retire_cid_len() > 0 {
+            assert_ne!(m.pop_retire_cid(), m.dcid_current_sqn);
+        }
     }
 }

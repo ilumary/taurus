@@ -1,6 +1,6 @@
-use crate::{cid, terror, SPACE_ID_DATA, SPACE_ID_HANDSHAKE, SPACE_ID_INITIAL, ranges::RangeSet};
+use crate::{cid, ranges::RangeSet, terror, SPACE_ID_DATA, SPACE_ID_HANDSHAKE, SPACE_ID_INITIAL};
 
-use octets::{varint_len, Octets, OctetsMut};
+use octets::{Octets, OctetsMut};
 use rustls::quic::{DirectionalKeys, HeaderProtectionKey};
 
 use std::{fmt, ops::RangeInclusive};
@@ -52,6 +52,13 @@ pub fn encrypt(
     let (mut first, mut rest) = header.split_at(1)?;
     let pn_end = Ord::min(pn_offset + 3, rest.len());
 
+    let sample_offset = pn_offset + 4;
+    if sample_offset + keys.header.sample_len() > packet_length {
+        return Err(terror::Error::buffer_size_error(
+            "packet too short to sample for header protection",
+        ));
+    }
+
     keys.header
         .encrypt_in_place(
             &sample.as_ref()[..keys.header.sample_len()],
@@ -74,7 +81,6 @@ pub struct AckFrame {
 }
 
 impl AckFrame {
-
     /// parses an [`AckFrame`] from raw bytes
     pub fn parse(frame_code: &u8, bytes: &mut octets::OctetsMut<'_>) -> Self {
         let largest = bytes.get_varint().unwrap();
@@ -118,7 +124,7 @@ impl AckFrame {
         rs: &RangeSet,
         ecn_counts: Option<(u64, u64, u64)>,
         ack_delay: u64,
-        out: &mut octets::OctetsMut<'_>
+        out: &mut octets::OctetsMut<'_>,
     ) -> Result<usize, octets::BufferTooShortError> {
         let begin = out.off();
         let frame_type: u64 = if ecn_counts.is_some() { 0x03 } else { 0x02 };
@@ -171,160 +177,256 @@ impl AckFrame {
     }
 }
 
+/// QUIC header
 pub struct Header {
-    // header form and version specific bits
+    /// header form and version specific bits
     pub hf: u8,
-    pub version: u32,
-    pub dcid: cid::Id,
-    pub scid: Option<cid::Id>,
-    pub token: Option<Vec<u8>>,
 
-    // the following fields are under header protection
+    /// QUIC version
+    pub version: u32,
+
+    /// destination connection id
+    pub dcid: cid::Id,
+
+    /// source connection id, absent if short
+    pub scid: Option<cid::Id>,
+
+    /// byte range of the token within the packet buffer
+    pub token: Option<core::ops::Range<usize>>,
+
+    /// packet number
     pub packet_num: u64,
+
+    /// packet numbet length
     pub packet_num_length: u8,
 
-    // packet length including packet_num
+    /// encoded payload length
     pub length: usize,
 
-    // header length excluding packet num
+    /// wire length of packet
     pub raw_length: usize,
 
-    // packet number space for key retrieval, either 0, 1 or 2
+    /// space this packet belongs to
     space: usize,
 }
 
 impl Header {
-    pub fn new_long_header(
-        long_header_type: u8,
-        version: u32,
-        packet_num: u64,
-        dcid: &cid::Id,
-        scid: &cid::Id,
-        token: Option<Vec<u8>>,
-        packet_length: usize,
-    ) -> Result<Self, terror::Error> {
-        let space: usize = match long_header_type {
-            LONG_HEADER_TYPE_INITIAL => SPACE_ID_INITIAL,
-            0x01 => SPACE_ID_DATA,
-            LONG_HEADER_TYPE_HANDSHAKE => SPACE_ID_HANDSHAKE,
-            0x03 => todo!("retry packets are not yet implemented"),
-            _ => unreachable!("invalid long header type: {}", long_header_type),
+    /// peeks dcid as fast as possible for incoming path
+    pub fn peek_dcid(buf: &[u8], local_cid_len: usize) -> Result<&[u8], terror::Error> {
+        let mut b = Octets::with_slice(buf);
+        let hf = b.get_u8()?;
+        let len = if (hf & LS_TYPE_BIT) == 0 {
+            local_cid_len
+        } else {
+            b.get_u32()?;
+            let l = b.get_u8()? as usize;
+            if l > cid::MAX_CID_SIZE {
+                return Err(terror::Error::quic_transport_error(
+                    "dcid longer than 20 bytes",
+                    terror::QuicTransportError::ProtocolViolation,
+                ));
+            }
+            l
         };
+        Ok(b.get_bytes(len)?.buf())
+    }
 
-        if !matches!(long_header_type, 0x00..=0x03) {
-            return Err(terror::Error::header_encoding_error(format!(
-                "unsupported long header type {:?}",
-                long_header_type
-            )));
+    /// parses a header from raw byte slice
+    pub fn from_bytes(buffer: &[u8], dcid_len: usize) -> Result<Header, terror::Error> {
+        let mut b = Octets::with_slice(buffer);
+        let hf = b.get_u8()?;
+
+        if (hf & LS_TYPE_BIT) == 0 {
+            let dcid = b.get_bytes(dcid_len)?;
+            return Ok(Header {
+                hf,
+                version: 0,
+                dcid: cid::Id::from_slice(dcid.buf()),
+                scid: None,
+                token: None,
+                packet_num: 0,
+                packet_num_length: 0,
+                length: 0,
+                raw_length: b.off(),
+                space: SPACE_ID_DATA,
+            });
         }
 
-        if long_header_type == 0x00 && token.is_none() {
-            return Err(terror::Error::header_encoding_error(
-                "token required for initial header",
+        let version = b.get_u32()?;
+
+        let dcid_length = b.get_u8()? as usize;
+        if dcid_length > cid::MAX_CID_SIZE {
+            return Err(terror::Error::quic_transport_error(
+                "dcid longer than 20 bytes",
+                terror::QuicTransportError::ProtocolViolation,
             ));
         }
+        let dcid = cid::Id::from_slice(b.get_bytes(dcid_length)?.buf());
 
-        let mut raw_length = 1 + 4 + 1 + dcid.len() + 1 + scid.len();
+        let scid_length = b.get_u8()? as usize;
+        if scid_length > cid::MAX_CID_SIZE {
+            return Err(terror::Error::quic_transport_error(
+                "scid longer than 20 bytes",
+                terror::QuicTransportError::ProtocolViolation,
+            ));
+        }
+        let scid = cid::Id::from_slice(b.get_bytes(scid_length)?.buf());
 
-        if long_header_type == 0x00 {
-            // token length is encoded as variable length integer
-            let token_length_length = varint_len(token.as_ref().unwrap().len() as u64);
+        let mut token = None;
+        let mut space = SPACE_ID_DATA;
 
-            raw_length += token_length_length + token.as_ref().unwrap().len();
+        match (hf & LONG_PACKET_TYPE) >> 4 {
+            0x00 => {
+                // Initial
+                let tl = b.get_varint()? as usize;
+                let start = b.off();
+                b.skip(tl)?;
+                token = Some(start..start + tl);
+                space = SPACE_ID_INITIAL;
+            }
+            0x01 => {}                          // 0-RTT
+            0x02 => space = SPACE_ID_HANDSHAKE, // Handshake
+            0x03 => {
+                // Retry
+                return Ok(Header {
+                    hf,
+                    version,
+                    dcid,
+                    scid: Some(scid),
+                    token: None,
+                    packet_num: 0,
+                    packet_num_length: 0,
+                    length: 0,
+                    raw_length: b.off(),
+                    space: SPACE_ID_INITIAL,
+                });
+            }
+            _ => unreachable!("2-bit long packet type"),
         }
 
-        //variable length packet length always encoded as length 4
-        raw_length += PACKET_LENGTH_ENCODING_LENGTH;
+        let length = b.get_varint()? as usize;
 
-        Ok(Header::new(
-            0x01,
-            long_header_type,
-            0x00,
-            0x00,
-            version,
-            dcid,
-            Some(scid),
-            packet_num,
-            token,
-            packet_length,
-            raw_length,
-            space,
-        ))
-    }
-
-    pub fn new_short_header(
-        spin_bit: u8,
-        key_phase: u8,
-        version: u32,
-        packet_num: u64,
-        dcid: &cid::Id,
-    ) -> Result<Self, terror::Error> {
-        if !matches!(spin_bit, 0x00 | 0x01) {
-            return Err(terror::Error::header_encoding_error(format!(
-                "unsupported header spin bit {:?}",
-                spin_bit
-            )));
-        }
-
-        if !matches!(key_phase, 0x00 | 0x01) {
-            return Err(terror::Error::header_encoding_error(format!(
-                "unsupported header key phase {:?}",
-                key_phase
-            )));
-        }
-
-        let raw_length = 1 + dcid.len();
-
-        Ok(Header::new(
-            0x00, 0x00, spin_bit, key_phase, version, dcid, None, packet_num, None, 0, raw_length,
-            2,
-        ))
-    }
-
-    //not public because values are not error checked
-    fn new(
-        header_form: u8,
-        long_header_type: u8,
-        spin_bit: u8,
-        key_phase: u8,
-        version: u32,
-        dcid: &cid::Id,
-        scid: Option<&cid::Id>,
-        packet_num: u64,
-        token: Option<Vec<u8>>,
-        length: usize,
-        raw_length: usize,
-        space: usize,
-    ) -> Self {
-        let packet_num_length = Header::calculate_pn_length(packet_num as u32);
-        let mut hf: u8 = 0x00;
-
-        //set header form bit
-        hf |= header_form << 7;
-
-        //set fixed bit for every header type
-        hf |= 1 << 6;
-
-        hf |= spin_bit << 5;
-
-        hf |= long_header_type << 4;
-
-        hf |= key_phase << 2;
-
-        hf |= packet_num_length;
-
-        Self {
+        Ok(Header {
             hf,
             version,
-            dcid: *dcid,
-            scid: scid.cloned(),
-            packet_num,
-            packet_num_length,
+            dcid,
+            scid: Some(scid),
             token,
+            packet_num: 0,
+            packet_num_length: 0,
             length,
-            raw_length,
+            raw_length: b.off(),
             space,
+        })
+    }
+
+    /// calculates wire length of long header
+    pub fn long_header_len(
+        long_header_type: u8,
+        dcid: &cid::Id,
+        scid: &cid::Id,
+        token: Option<&[u8]>,
+        packet_num: u64,
+    ) -> usize {
+        let mut n = 1 + 4 + 1 + dcid.len() + 1 + scid.len();
+        if long_header_type == LONG_HEADER_TYPE_INITIAL {
+            let tl = token.map_or(0, |t| t.len());
+            n += octets::varint_len(tl as u64) + tl;
         }
+        n + PACKET_LENGTH_ENCODING_LENGTH
+            + Self::calculate_pn_length(packet_num as u32) as usize
+            + 1
+    }
+
+    /// calculates wire length of short header
+    #[inline]
+    pub fn short_header_len(dcid: &cid::Id, packet_num: u64) -> usize {
+        1 + dcid.len() + Self::calculate_pn_length(packet_num as u32) as usize + 1
+    }
+
+    #[inline]
+    fn put_pn(b: &mut OctetsMut, pn: u64, pn_length: u8) -> Result<(), terror::Error> {
+        match pn_length {
+            0 => b.put_u8(pn as u8)?,
+            1 => b.put_u16(pn as u16)?,
+            2 => b.put_u24(pn as u32)?,
+            3 => b.put_u32(pn as u32)?,
+            _ => unreachable!("pn length is 2 bits"),
+        };
+        Ok(())
+    }
+
+    fn header_byte(long: bool, spin_bit: u8, lht: u8, key_phase: u8, pn_length: u8) -> u8 {
+        let mut hf = 0u8;
+        hf |= (long as u8) << 7;
+        hf |= 1 << 6;
+        hf |= spin_bit << 5;
+        hf |= lht << 4;
+        hf |= key_phase << 2;
+        hf |= pn_length;
+        hf
+    }
+
+    pub fn encode_long(
+        b: &mut OctetsMut,
+        long_header_type: u8,
+        version: u32,
+        dcid: &cid::Id,
+        scid: &cid::Id,
+        token: Option<&[u8]>,
+        packet_num: u64,
+    ) -> Result<(u8, Option<usize>), terror::Error> {
+        debug_assert!(matches!(long_header_type, 0x00..=0x03));
+        let pn_length = Self::calculate_pn_length(packet_num as u32);
+
+        b.put_u8(Self::header_byte(true, 0, long_header_type, 0, pn_length))?;
+        b.put_u32(version)?;
+        b.put_u8(dcid.len() as u8)?;
+        b.put_bytes(dcid.as_slice())?;
+        b.put_u8(scid.len() as u8)?;
+        b.put_bytes(scid.as_slice())?;
+
+        if long_header_type == LONG_HEADER_TYPE_INITIAL {
+            match token {
+                Some(t) => {
+                    b.put_varint(t.len() as u64)?;
+                    b.put_bytes(t)?;
+                }
+                None => {
+                    b.put_varint(0)?;
+                }
+            }
+        }
+
+        let length_field_offset = b.off();
+        b.put_varint_with_len(0, PACKET_LENGTH_ENCODING_LENGTH)?; // placeholder
+        Self::put_pn(b, packet_num, pn_length)?;
+
+        Ok((pn_length, Some(length_field_offset)))
+    }
+
+    pub fn encode_short(
+        b: &mut OctetsMut,
+        spin_bit: u8,
+        key_phase: u8,
+        dcid: &cid::Id,
+        packet_num: u64,
+    ) -> Result<(u8, Option<usize>), terror::Error> {
+        let pn_length = Self::calculate_pn_length(packet_num as u32);
+        b.put_u8(Self::header_byte(false, spin_bit, 0, key_phase, pn_length))?;
+        b.put_bytes(dcid.as_slice())?;
+        Self::put_pn(b, packet_num, pn_length)?;
+        Ok((pn_length, None))
+    }
+
+    pub fn patch_length(
+        b: &mut OctetsMut,
+        length_field_offset: usize,
+        length: usize,
+    ) -> Result<(), terror::Error> {
+        let (_, mut l) = b.split_at(length_field_offset)?;
+        l.put_varint_with_len(length as u64, PACKET_LENGTH_ENCODING_LENGTH)?;
+        Ok(())
     }
 
     pub fn decrypt(
@@ -360,116 +462,9 @@ impl Header {
         Ok(self.raw_length + self.packet_num_length as usize + 1)
     }
 
-    //TODO retry & version negotiation packets
-    pub fn to_bytes(
-        &self,
-        b: &mut octets::OctetsMut,
-        lfo: &mut usize,
-    ) -> Result<(), octets::BufferTooShortError> {
-        b.put_u8(self.hf)?;
-
-        if let Some(scid) = &self.scid {
-            //long header
-            b.put_u32(self.version)?;
-            b.put_u8(self.dcid.len().try_into().unwrap())?;
-            b.put_bytes(self.dcid.as_slice())?;
-            b.put_u8(scid.len().try_into().unwrap())?;
-            b.put_bytes(scid.as_slice())?;
-
-            //initial
-            if ((self.hf & LONG_PACKET_TYPE) >> 4) == 0x00 {
-                let token = self.token.as_ref().unwrap();
-                let token_length = token.len();
-
-                b.put_varint(token_length.try_into().unwrap())?;
-                b.put_bytes(token)?;
-            }
-
-            //packet length, always write as 4 byte varint to allow for later
-            *lfo = b.off();
-            b.put_varint_with_len(self.length as u64, PACKET_LENGTH_ENCODING_LENGTH)?;
-        } else {
-            //short header
-            b.put_bytes(self.dcid.as_slice())?;
-        }
-
-        //packet number
-        match self.packet_num_length {
-            0 => b.put_u8(self.packet_num.try_into().unwrap())?,
-            1 => b.put_u16(self.packet_num.try_into().unwrap())?,
-            2 => b.put_u24(self.packet_num as u32)?,
-            3 => b.put_u32(self.packet_num as u32)?,
-            _ => unreachable!(
-                "unsupported packet number length {}",
-                self.packet_num_length
-            ),
-        };
-
-        Ok(())
-    }
-
-    pub fn from_bytes(
-        buffer: &[u8],
-        dcid_len: usize,
-    ) -> Result<Header, octets::BufferTooShortError> {
-        let mut b = Octets::with_slice(buffer);
-        let mut space: usize = 2;
-        let hf = b.get_u8()?;
-
-        if ((hf & LS_TYPE_BIT) >> 7) == 0 {
-            //short packet
-            let dcid = b.get_bytes(dcid_len)?;
-
-            return Ok(Header {
-                hf,
-                version: 0,
-                dcid: dcid.to_vec().into(),
-                scid: None,
-                packet_num: 0,
-                packet_num_length: 0,
-                token: None,
-                length: 0,
-                raw_length: b.off(),
-                space,
-            });
-        }
-
-        let v = b.get_u32()?;
-
-        let dcid_length = b.get_u8()?; // TODO check for max cid len of 20
-        let dcid = b.get_bytes(dcid_length as usize)?.to_vec();
-
-        let scid_length = b.get_u8()?; // TODO check for max cid len of 20
-        let scid = b.get_bytes(scid_length as usize)?.to_vec();
-
-        let mut tok: Option<Vec<u8>> = None;
-
-        match (hf & LONG_PACKET_TYPE) >> 4 {
-            0x00 => {
-                // Initial
-                tok = Some(b.get_bytes_with_varint_length()?.to_vec());
-                space = 0;
-            }
-            0x01 => (),        // Zero-RTT
-            0x02 => space = 1, // Handshake
-            0x03 => (),        // Retry
-            _ => panic!("Fatal Error with packet type"),
-        }
-
-        let length = b.get_varint()? as usize;
-
-        Ok(Header {
-            hf,
-            version: v,
-            dcid: dcid.into(),
-            scid: Some(scid.into()),
-            packet_num: 0,
-            packet_num_length: 0,
-            token: tok,
-            length,
-            raw_length: b.off(),
-            space,
-        })
+    #[inline]
+    pub fn token<'a>(&self, packet: &'a [u8]) -> Option<&'a [u8]> {
+        self.token.clone().map(|r| &packet[r])
     }
 
     pub fn space(&self) -> usize {
@@ -486,30 +481,30 @@ impl Header {
     }
 }
 
-impl fmt::Display for Header {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.hf & 0b1000_0000) >> 7 {
-            0 => {
-                write!(
-                    f,
-                    "SH {:#b} version: {:#06x?} pn: {:#010x?} dcid: {} raw_length:{:?}",
-                    self.hf, self.version, self.packet_num, self.dcid, self.raw_length
-                )
-            }
-            1 => {
-                write!(
-                    f,
-                    "[LH] {:#b} version: {:#06x?} pn: {:#010x?} dcid: {} scid: 0x{} token:{:x?} length:{:?} raw_length:{:?}",
-                    self.hf,
-                    self.version,
-                    self.packet_num,
-                    self.dcid,
-                    self.scid.as_ref().unwrap(),
-                    self.token.as_ref().unwrap_or(&vec![0u8; 0]),
-                    self.length,
-                    self.raw_length
-                )
-            }
+impl core::fmt::Display for Header {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let token = match &self.token {
+            Some(r) => r.len(),
+            None => 0,
+        };
+        match (self.hf & LS_TYPE_BIT) >> 7 {
+            0 => write!(
+                f,
+                "SH {:#b} version:{:#06x?} pn:{:#010x?} dcid:{} raw_length:{}",
+                self.hf, self.version, self.packet_num, self.dcid, self.raw_length
+            ),
+            1 => write!(
+                f,
+                "[LH] {:#b} version:{:#06x?} pn:{:#010x?} dcid:{} scid:{} token:{}B length:{} raw_length:{}",
+                self.hf,
+                self.version,
+                self.packet_num,
+                self.dcid,
+                self.scid.as_ref().map(|c| c.to_string()).unwrap_or_default(),
+                token,
+                self.length,
+                self.raw_length
+            ),
             _ => unreachable!("you just broke the laws of physics"),
         }
     }
@@ -538,14 +533,15 @@ impl From<usize> for PacketType {
 }
 
 impl From<PacketType> for String {
+    #[inline]
     fn from(pt: PacketType) -> String {
         match pt {
-            PacketType::None => "None".to_string(),
-            PacketType::Initial => "Initial".to_string(),
-            PacketType::ZeroRtt => "ZeroRtt".to_string(),
-            PacketType::Handshake => "Handshake".to_string(),
-            PacketType::Retry => "Retry".to_string(),
-            PacketType::Short => "Short".to_string(),
+            PacketType::None => "N".to_string(),
+            PacketType::Initial => "I".to_string(),
+            PacketType::ZeroRtt => "Z".to_string(),
+            PacketType::Handshake => "H".to_string(),
+            PacketType::Retry => "R".to_string(),
+            PacketType::Short => "S".to_string(),
         }
     }
 }
@@ -556,142 +552,151 @@ impl fmt::Display for PacketType {
     }
 }
 
-// Tests
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    //TODO expand to other packet types through all pns
+    fn id(bytes: &[u8]) -> cid::Id {
+        cid::Id::from_slice(bytes)
+    }
+
+    // encode header, write a payload, patch length
+    fn encode_initial(
+        dcid: &cid::Id,
+        scid: &cid::Id,
+        token: Option<&[u8]>,
+        pn: u64,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut back = vec![0u8; 256];
+        let (meta, hdr_end, len_field);
+        {
+            let mut b = OctetsMut::with_slice(&mut back);
+            meta = Header::encode_long(&mut b, LONG_HEADER_TYPE_INITIAL, 1, dcid, scid, token, pn)
+                .unwrap();
+            hdr_end = b.off();
+            len_field = meta.1.unwrap();
+            b.put_bytes(payload).unwrap();
+            let total = back.len();
+            let mut b2 = OctetsMut::with_slice(&mut back[..total]);
+            // length covers pn + payload (no AEAD tag here)
+            let length = payload.len() + meta.0 as usize + 1;
+            Header::patch_length(&mut b2, len_field, length).unwrap();
+        }
+        let _ = hdr_end;
+        back
+    }
+
     #[test]
-    fn intial_header_decoding_server_side() {
-        let mut head_raw: [u8; 64] = [
-            0xc3, 0x00, 0x00, 0x00, 0x01, 0x14, 0x8b, 0x36, 0x1e, 0xd4, 0x6c, 0xbf, 0xde, 0x7f,
-            0xa3, 0x7e, 0xb4, 0xd6, 0xb9, 0xa6, 0x68, 0xf4, 0x49, 0x3e, 0x75, 0xf6, 0x08, 0x21,
-            0x8a, 0xd5, 0x88, 0xe8, 0x40, 0x4a, 0xfb, 0x00, 0x44, 0x8a, 0x7f, 0x81, 0x22, 0x1f,
-            0xf1, 0xf4, 0x4a, 0x64, 0x00, 0x6a, 0x32, 0xf4, 0xb3, 0x67, 0x99, 0xdc, 0x9e, 0x18,
-            0xe1, 0x5c, 0x9f, 0xee, 0x48, 0x37, 0x7b, 0xc4,
-        ];
-
-        let mut partial_decode = Header::from_bytes(&head_raw, 8).unwrap();
-
-        rustls::crypto::ring::default_provider()
-            .install_default()
+    fn long_header_len_matches_encoded_offset() {
+        let dcid = id(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let scid = id(&[9, 10, 11, 12]);
+        let token = &[0xAAu8; 17][..];
+        let mut back = vec![0u8; 128];
+        let end = {
+            let mut b = OctetsMut::with_slice(&mut back);
+            Header::encode_long(
+                &mut b,
+                LONG_HEADER_TYPE_INITIAL,
+                1,
+                &dcid,
+                &scid,
+                Some(token),
+                300,
+            )
             .unwrap();
+            b.off()
+        };
+        assert_eq!(
+            end,
+            Header::long_header_len(LONG_HEADER_TYPE_INITIAL, &dcid, &scid, Some(token), 300)
+        );
+    }
 
-        let ikp = rustls::quic::Keys::initial(
-            rustls::quic::Version::V1,
-            rustls::crypto::ring::default_provider().cipher_suites[1]
-                .tls13()
-                .unwrap(),
-            rustls::crypto::ring::default_provider().cipher_suites[1]
-                .tls13()
-                .unwrap()
-                .quic
-                .unwrap(),
-            partial_decode.dcid.as_slice(),
-            rustls::Side::Server,
+    #[test]
+    fn token_encode() {
+        let dcid = id(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let scid = id(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        let pkt = encode_initial(&dcid, &scid, None, 5, &[0xDE, 0xAD]);
+        let parsed = Header::from_bytes(&pkt, 8).unwrap();
+
+        assert_eq!(parsed.token(&pkt), Some(&[][..]));
+        assert_eq!(parsed.space(), SPACE_ID_INITIAL);
+        assert_eq!(parsed.dcid, dcid);
+        assert_eq!(parsed.scid, Some(scid));
+
+        let pkt = encode_initial(&dcid, &scid, Some(&[0u8]), 5, &[0xDE, 0xAD]);
+        let parsed = Header::from_bytes(&pkt, 8).unwrap();
+        assert_eq!(parsed.token(&pkt), Some(&[0u8][..]));
+    }
+
+    #[test]
+    fn token_borrow_not_copy() {
+        let dcid = id(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let scid = id(&[9, 10, 11, 12, 13, 14, 15, 16]);
+        let token = &[0x11u8, 0x22, 0x33, 0x44, 0x55][..];
+        let pkt = encode_initial(&dcid, &scid, Some(token), 5, &[0xDE, 0xAD]);
+        let parsed = Header::from_bytes(&pkt, 8).unwrap();
+
+        let borrowed = parsed.token(&pkt).unwrap();
+        assert_eq!(borrowed, token);
+        let range = parsed.token.clone().unwrap();
+        assert_eq!(&pkt[range], token);
+    }
+
+    #[test]
+    fn peek_dcid() {
+        let dcid = id(&[7, 7, 7, 7, 7, 7, 7, 7]);
+        let scid = id(&[8, 8, 8, 8]);
+        let pkt = encode_initial(&dcid, &scid, None, 1, &[0x00]);
+        assert_eq!(Header::peek_dcid(&pkt, 8).unwrap(), dcid.as_slice());
+        assert_eq!(
+            Header::peek_dcid(&pkt, 8).unwrap(),
+            Header::from_bytes(&pkt, 8).unwrap().dcid.as_slice()
         );
 
-        let header_length = match partial_decode.decrypt(&mut head_raw, ikp.remote.header.as_ref())
+        // short header: dcid length is not on the wire, caller supplies it
+        let mut back = vec![0u8; 64];
         {
-            Ok(s) => s,
-            Err(error) => panic!("Error: {}", error),
+            let mut b = OctetsMut::with_slice(&mut back);
+            Header::encode_short(&mut b, 0, 0, &dcid, 9).unwrap();
+        }
+        assert_eq!(Header::peek_dcid(&back, 8).unwrap(), dcid.as_slice());
+    }
+
+    #[test]
+    fn short_header_roundtrip() {
+        let dcid = id(&[3, 1, 4, 1, 5, 9, 2, 6]);
+        let mut back = vec![0u8; 64];
+        let meta = {
+            let mut b = OctetsMut::with_slice(&mut back);
+            Header::encode_short(&mut b, 1, 0, &dcid, 0x0102).unwrap()
         };
-
-        assert_eq!(header_length, 39);
-        assert_eq!(partial_decode.version, 1);
-        assert_eq!(partial_decode.packet_num, 0);
-        assert_eq!(partial_decode.packet_num_length, 0);
-        assert_eq!(partial_decode.length, 1162);
-        assert_eq!(partial_decode.raw_length, 38);
+        assert!(meta.1.is_none());
+        assert_eq!(meta.0, 1); // 0x0102 needs two bytes
+        let parsed = Header::from_bytes(&back, 8).unwrap();
+        assert_eq!(parsed.space(), SPACE_ID_DATA);
+        assert_eq!(parsed.dcid, dcid);
+        assert!(parsed.scid.is_none());
     }
 
     #[test]
-    fn long_initial_header_creation() {
-        let dcid = cid::Id::from_slice(&[0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
-        let scid = cid::Id::from_slice(&[0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
-        let header = Header::new_long_header(0x00, 1, 0, &dcid, &scid, Some(vec![]), 1201).unwrap();
-
-        let mut vec = vec![0u8; 29];
-
-        let mut b = octets::OctetsMut::with_slice(&mut vec);
-
-        let mut length_offset: usize = 0;
-        header.to_bytes(&mut b, &mut length_offset).unwrap();
-
-        let expected = vec![
-            0xc0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
-            0x08, 0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b, 0x00, 0x80, 0x00, 0x04, 0xb1,
-            0x00,
-        ];
-
-        assert_eq!(vec, expected);
-        assert_eq!(header.raw_length, 28);
-    }
-
-    #[test]
-    fn long_handshake_header_creation() {
-        let dcid = cid::Id::from_slice(&[0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
-        let scid = cid::Id::from_slice(&[0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
-        let header = Header::new_long_header(0x02, 1, 1, &dcid, &scid, None, 3200).unwrap();
-
-        let mut vec = vec![0u8; 28];
-
-        let mut b = octets::OctetsMut::with_slice(&mut vec);
-
-        let mut length_offset: usize = 0;
-        header.to_bytes(&mut b, &mut length_offset).unwrap();
-
-        let expected = vec![
-            0xe0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
-            0x08, 0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b, 0x80, 0x00, 0x0c, 0x80, 0x01,
-        ];
-
-        assert_eq!(vec, expected);
-        assert_eq!(header.raw_length, 27);
-    }
-
-    #[test]
-    fn long_zero_rtt_header_creation() {
-        let dcid = cid::Id::from_slice(&[0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
-        let scid = cid::Id::from_slice(&[0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b]);
-        let header = Header::new_long_header(0x01, 1, 0, &dcid, &scid, None, 3200).unwrap();
-
-        let mut vec = vec![0u8; 28];
-
-        let mut b = octets::OctetsMut::with_slice(&mut vec);
-
-        let mut length_offset: usize = 0;
-        header.to_bytes(&mut b, &mut length_offset).unwrap();
-
-        let expected = vec![
-            0xd0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef,
-            0x08, 0xd5, 0x85, 0x23, 0x1b, 0xd5, 0x85, 0x23, 0x1b, 0x80, 0x00, 0x0c, 0x80, 0x00,
-        ];
-
-        assert_eq!(vec, expected);
-        assert_eq!(header.raw_length, 27);
-    }
-
-    #[test]
-    fn short_header_creation() {
-        let dcid = cid::Id::from_slice(&[0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef]);
-        let header = Header::new_short_header(0x00, 0x01, 1, 380, &dcid).unwrap();
-
-        let mut vec = vec![0u8; 11];
-
-        let mut b = octets::OctetsMut::with_slice(&mut vec);
-
-        let mut length_offset: usize = 0;
-        header.to_bytes(&mut b, &mut length_offset).unwrap();
-
-        let expected = vec![
-            0x45, 0x34, 0xa7, 0x84, 0xef, 0x34, 0xa7, 0x84, 0xef, 0x01, 0x7c,
-        ];
-
-        assert_eq!(vec, expected);
-        assert_eq!(header.raw_length, 9);
+    fn handshake_header_carries_no_token_field() {
+        let dcid = id(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let scid = id(&[9, 10, 11, 12]);
+        let mut back = vec![0u8; 128];
+        let len_field = {
+            let mut b = OctetsMut::with_slice(&mut back);
+            let m =
+                Header::encode_long(&mut b, LONG_HEADER_TYPE_HANDSHAKE, 1, &dcid, &scid, None, 2)
+                    .unwrap();
+            b.put_bytes(&[0xAB, 0xCD]).unwrap();
+            m.1.unwrap()
+        };
+        Header::patch_length(&mut OctetsMut::with_slice(&mut back), len_field, 2 + 1).unwrap();
+        let parsed = Header::from_bytes(&back, 8).unwrap();
+        assert_eq!(parsed.space(), SPACE_ID_HANDSHAKE);
+        assert!(parsed.token.is_none());
     }
 
     #[test]
@@ -718,7 +723,6 @@ mod tests {
         assert_eq!(f.ack_delay, 2000);
         assert_eq!(f.ecn_counts, None);
     }
-
 
     #[test]
     fn ack_frame_encodes_and_decodes_with_ecn_conuts() {

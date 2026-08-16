@@ -1,32 +1,28 @@
-use crate::io::Packet;
-use indexmap::IndexMap;
-use intrusive_collections::{
-    intrusive_adapter, rbtree::Cursor, KeyAdapter, LinkedList, LinkedListAtomicLink, RBTree,
-    RBTreeAtomicLink,
-};
-use parking_lot::Mutex;
+use rustc_hash::FxHashMap;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use tokio::{
-    net::lookup_host,
-    sync::{mpsc, oneshot},
-    time::{timeout, Duration, Instant as TokioInstant},
-};
-use tokio_util::time::{delay_queue::Key, DelayQueue};
-use tracing::{debug, error, info, warn};
+use tokio::sync::oneshot;
 
 use std::{
+    cell::{Cell, RefCell},
     future,
     future::Future,
     net::SocketAddr,
     pin::Pin,
+    rc::Rc,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
+    time::Duration,
 };
 
-use crate::{cid, io, packet::Header, stream, terror, ConnectionState, Inner, InnerEvent};
+use crate::{
+    cid,
+    endpoint::{
+        self, ConnectRequest, EndpointConfig, Handler, ShardConfig, ShardCore, ShardedEndpoint,
+    },
+    stream, terror, Inner,
+};
 
-// received from a call to Client::connect(). resolves to the connection if successful
+/// received from a call to Client::connect(). resolves to the connection if successful
 pub struct Connecting {
     rx: oneshot::Receiver<Connection>,
 }
@@ -43,9 +39,10 @@ impl Future for Connecting {
     }
 }
 
-// holds single channel handle to send a client connect to the endpoint
+/// handed to the client's root future. lives on shard 0 and is `!Send`, so every
+/// connection it opens is owned by the shard the root future runs on
 pub struct Client {
-    connector: mpsc::Sender<(SocketAddr, ServerName<'static>, oneshot::Sender<Connection>)>,
+    pub(crate) core: Rc<ShardCore>,
 }
 
 impl Client {
@@ -54,25 +51,22 @@ impl Client {
     ///
     /// # Example
     ///
-    /// ```
+    /// ```ignore
     /// use quic::connection::ClientConfig;
     ///
-    /// async fn run_client() {
-    ///     let mut client = quic::connection::ClientConfig::new("/path/to/cert.der")
+    /// fn main() -> Result<(), quic::terror::Error> {
+    ///     quic::connection::ClientConfig::new("/path/to/cert.der")
     ///         .with_supported_protocols(vec!["hq-29".to_owned()])
     ///         .listen_on("[::1]:4433")
-    ///         .build()
-    ///         .await
-    ///         .unwrap();
-    ///
-    ///     if let Some(connection) = client.connect("[::1]:8080".parse().unwrap()).await {
-    ///         println!("connected!");
-    ///     }
+    ///         .run(|client| async move {
+    ///             if let Some(connection) = client.connect("[::1]:8080".parse().unwrap()).await {
+    ///                 println!("connected!");
+    ///             }
+    ///         })
     /// }
-    ///
     /// ```
-    pub fn connect(&mut self, to: SocketAddr) -> Connecting {
-        let (conn_ready_tx, conn_ready_rx) = oneshot::channel();
+    pub fn connect(&self, to: SocketAddr) -> Connecting {
+        let (reply, rx) = oneshot::channel();
         let hostname = match to.ip() {
             std::net::IpAddr::V4(ipv4) if ipv4.is_loopback() => "localhost".to_string(),
             std::net::IpAddr::V6(ipv6) if ipv6.is_loopback() => "localhost".to_string(),
@@ -81,87 +75,92 @@ impl Client {
 
         let server_name = ServerName::try_from(hostname.to_owned()).unwrap();
 
-        self.connector
-            .try_send((to, server_name, conn_ready_tx))
-            .unwrap();
-        Connecting { rx: conn_ready_rx }
+        tracing::debug!(peer = %to, name = %hostname, "connect requested");
+
+        self.core.connects.borrow_mut().push(ConnectRequest {
+            peer: to,
+            server_name,
+            reply,
+        });
+
+        Connecting { rx }
     }
 
-    /// used to connect to an actual hostname and port. convenience implementation
-    /// to wrap dns hostname lookup, therefore async. May take on the order of around
-    /// 100ms on slos networks. custom timeout may be specified in seconds via the
-    /// `dns_timeout` param. yields a connecting future which in turn yields
-    /// [`Option<Connection>`]
+    /// used to connect to an actual hostname and port. Convenience implementation to
+    /// to wrap dns hostname lookup, therefore async. Custom timeout may be specified
+    /// in seconds via the `dns_timeout` param. Yields a connecting future which
+    /// in turn yields [`Option<Connection>`]
     ///
-    /// # Example
-    ///
-    /// ```
-    /// use quic::connection::ClientConfig;
-    ///
-    /// async fn run_client() {
-    ///     let mut client = quic::connection::ClientConfig::new("/path/to/cert.der")
-    ///         .with_supported_protocols(vec!["hq-29".to_owned()])
-    ///         .listen_on("[::1]:4433")
-    ///         .build()
-    ///         .await
-    ///         .unwrap();
-    ///
-    ///     if let Ok(connecting) = client.connect_to_hostname("www.google.com", 8080, 1).await {
-    ///         if let Some(connection) = connecting.await {
-    ///             println!("connected!");
-    ///         }
-    ///     }
-    ///
-    ///     // OR
-    ///
-    ///     if let Ok(connecting) = client.connect_to_hostname("localhost", 8080, 1).await {
-    ///         if let Some(connection) = connecting.await {
-    ///             println!("connected!");
-    ///         }
-    ///     }
-    /// }
-    ///
-    /// ```
+    /// the lookup itself runs on the offload pool, never on the shard, because a
+    /// shard thread has no dns resolver driving it
     pub async fn connect_to_hostname(
-        &mut self,
+        &self,
         hostname: &str,
         port: u16,
         dns_timeout: u64,
     ) -> Result<Connecting, terror::Error> {
-        let addr = timeout(
-            Duration::from_secs(dns_timeout),
-            lookup_host((hostname, port)),
-        )
-        .await
-        .map_err(|_| {
-            terror::Error::dns_timeout(format!(
-                "timout during dns resolution for {hostname}:{port}"
-            ))
-        })?
-        .map_err(|e| {
-            terror::Error::dns_lookup_error(format!(
-                "dns resolution failed for {hostname}:{port}: {e}"
-            ))
-        })?
-        .next()
-        .ok_or_else(|| {
-            terror::Error::dns_lookup_error(format!("no addresses found for {hostname}:{port}"))
-        })?;
+        let host = hostname.to_owned();
+        let addrs = self
+            .core
+            .offload
+            .run(async move {
+                let lookup = tokio::net::lookup_host((host, port));
+                match tokio::time::timeout(Duration::from_secs(dns_timeout), lookup).await {
+                    Ok(Ok(it)) => Ok(it.collect::<Vec<SocketAddr>>()),
+                    Ok(Err(e)) => Err(e.to_string()),
+                    Err(_) => Err(String::new()),
+                }
+            })
+            .await;
 
-        let (conn_ready_tx, conn_ready_rx) = oneshot::channel();
+        let addr = match addrs {
+            Ok(list) => list.into_iter().next().ok_or_else(|| {
+                terror::Error::dns_lookup_error(format!("no addresses found for {hostname}:{port}"))
+            })?,
+            Err(e) if e.is_empty() => {
+                return Err(terror::Error::dns_timeout(format!(
+                    "timout during dns resolution for {hostname}:{port}"
+                )))
+            }
+            Err(e) => {
+                return Err(terror::Error::dns_lookup_error(format!(
+                    "dns resolution failed for {hostname}:{port}: {e}"
+                )))
+            }
+        };
+
+        let (reply, rx) = oneshot::channel();
         let server_name = ServerName::try_from(hostname.to_owned()).map_err(|e| {
             terror::Error::taurus_misc_error(format!("failed to parse {hostname}: {e}"))
         })?;
-        self.connector
-            .try_send((addr, server_name, conn_ready_tx))
-            .unwrap();
-        Ok(Connecting { rx: conn_ready_rx })
+
+        self.core.connects.borrow_mut().push(ConnectRequest {
+            peer: addr,
+            server_name,
+            reply,
+        });
+
+        Ok(Connecting { rx })
+    }
+
+    /// run a `Send` future on the offload pool and await it here
+    ///
+    /// ```ignore
+    /// let body = client.offload(async { tokio::fs::read("payload.bin").await }).await?;
+    /// ```
+    pub async fn offload<F>(&self, fut: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.core.offload.run(fut).await
     }
 }
 
 pub struct ClientConfig {
     client_config: rustls::ClientConfig,
     listen_on: SocketAddr,
+    endpoint: EndpointConfig,
 }
 
 impl ClientConfig {
@@ -177,7 +176,7 @@ impl ClientConfig {
             }
         };
 
-        debug!("loaded cert from {}", cert_path);
+        tracing::debug!("loaded cert from {}", cert_path);
 
         if let Err(e) = roots.add(cert) {
             panic!("fatal error adding certificate to root store: {}", e);
@@ -192,6 +191,7 @@ impl ClientConfig {
         Self {
             client_config: client_cfg,
             listen_on: "[::1]:4433".parse().unwrap(),
+            endpoint: EndpointConfig::default(),
         }
     }
 
@@ -210,89 +210,128 @@ impl ClientConfig {
         self
     }
 
-    pub async fn build(self) -> Result<Client, terror::Error> {
-        self.build_with::<io::DefaultTransmitProvider>()
+    /// every backend knob at once, for callers who care
+    pub fn with_config(mut self, config: EndpointConfig) -> Self {
+        self.endpoint = config;
+        self
     }
 
-    fn build_with<S>(self) -> Result<Client, terror::Error>
+    /// runs the provided function on a single sharded endpoint. if the provided function returns,
+    /// all currently active connections are closed gracefully and run() returns normally.
+    /// equivalent to calling spawn() and then wait() on the endpoint handle
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use quic::connection::ClientConfig;
+    ///
+    /// fn main() -> Result<(), quic::terror::Error> {
+    ///     ClientConfig::new("/path/to/cert.der")
+    ///         .with_supported_protocols(vec!["hq-29".to_owned()])
+    ///         .listen_on("[::1]:0")
+    ///         .run(|client| async move {
+    ///             let Some(conn) = client.connect("[::1]:4433".parse().unwrap()).await else {
+    ///                 eprintln!("handshake failed");
+    ///                 return;
+    ///             };
+    ///
+    ///             // reading the payload off disk would block the shard, so offload it
+    ///             let body = client
+    ///                 .offload(async { tokio::fs::read("payload.bin").await.unwrap() })
+    ///                 .await;
+    ///
+    ///             if let Ok((recv, send)) = conn.accept_bidirectional_stream().await {
+    ///                 let _ = send.write(&body, true).await;
+    ///                 let mut buf = [0u8; 1024];
+    ///                 while let Ok(Some(n)) = recv.read(&mut buf).await {
+    ///                     println!("{:?}", std::str::from_utf8(&buf[..n]));
+    ///                 }
+    ///             }
+    ///         })
+    /// }
+    /// ```
+    pub fn run<F, Fut>(self, root: F) -> Result<(), terror::Error>
     where
-        S: io::TransmitProvider,
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
     {
-        let (server_tx, _) = mpsc::channel::<Connection>(1);
-        let (ncc_tx, ncc_rx) =
-            mpsc::channel::<(SocketAddr, ServerName<'static>, oneshot::Sender<Connection>)>(64);
-        let hmac_reset_key = [0u8; 64];
+        let mut endpoint = self.spawn(root)?;
+        endpoint.wait();
+        Ok(())
+    }
 
-        let endpoint = Endpoint {
-            local_addr: self.listen_on,
-            connections: ConnectionMap::new(),
-            connection_ids: IndexMap::new(),
+    /// runs the provided function on a single sharded endpoint. run returns the [`ShardedEnpoint`]
+    /// immediately.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use quic::connection::ClientConfig;
+    /// use quic::terror::Error;
+    ///
+    /// fn main() -> Result<(), quic::terror::Error> {
+    ///     let mut endpoint = ClientConfig::new("/path/to/cert.der")
+    ///         .with_supported_protocols(vec!["hq-29".to_owned()])
+    ///         .listen_on("[::1]:0")
+    ///         .spawn(|client| async move {
+    ///             let Some(conn) = client.connect("[::1]:4433".parse().unwrap()).await else {
+    ///                 eprintln!("handshake failed");
+    ///                 return;
+    ///             };
+    ///
+    ///             // reading the payload off disk would block the shard, so offload it
+    ///             let body = client
+    ///                 .offload(async { tokio::fs::read("payload.bin").await.unwrap() })
+    ///                 .await;
+    ///
+    ///             if let Ok((recv, send)) = conn.accept_bidirectional_stream().await {
+    ///                 let _ = send.write(&body, true).await;
+    ///                 let mut buf = [0u8; 1024];
+    ///                 while let Ok(Some(n)) = recv.read(&mut buf).await {
+    ///                     println!("{:?}", std::str::from_utf8(&buf[..n]));
+    ///                 }
+    ///             }
+    ///         })?;
+    ///     // do some work here
+    ///     let test = 1 + 2;
+    ///
+    ///     // await endpoint completion
+    ///     endpoint.wait();
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn spawn<F, Fut>(self, root: F) -> Result<ShardedEndpoint, terror::Error>
+    where
+        F: FnOnce(Client) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let hmac_reset_key = [0u8; 64];
+        let config = Arc::new(ShardConfig {
+            is_server: false,
             server_config: None,
             client_config: Some(Arc::new(self.client_config)),
-            hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
-            nc_tx: server_tx,
-            ncc_rx,
-            ncc_tx: IndexMap::new(),
-            timers: DelayQueue::new(),
-            timer_keys: IndexMap::new(),
-        };
+            hmac: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
+            endpoint: self.endpoint,
+            handler: None,
+        });
 
-        io::event_loop::<S>(self.listen_on, 1500, 8, 8, endpoint);
+        let root: endpoint::RootFn = Box::new(move |c| Box::pin(root(c)));
 
-        Ok(Client { connector: ncc_tx })
+        let endpoint = endpoint::spawn(self.listen_on, config, Some(root)).map_err(|e| {
+            terror::Error::taurus_misc_error(format!("failed to start endpoint: {e}"))
+        })?;
+
+        Ok(endpoint)
     }
 }
 
 // server impl
 
-struct Acceptor {
-    rx: mpsc::Receiver<Connection>,
-}
-
-impl Acceptor {
-    async fn accept(&mut self) -> Option<Connection> {
-        self.rx.recv().await
-    }
-}
-
-pub struct Server {
-    acceptor: Acceptor,
-    pub address: SocketAddr,
-}
-
-impl Server {
-    /// pollable for incoming connections as a server. returns the established connection. If
-    /// [`None`] is returned, an error occured during connection establishment.
-    ///
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use quic::connection::ServerConfig;
-    ///
-    /// async fn run_server() {
-    ///     let mut server = quic::connection::ServerConfig::new(
-    ///         "[::1]:4433", "/path/to/cert.der", "/path/to/key.der",
-    ///     )
-    ///     .with_supported_protocols(vec!["hq-29".to_owned()])
-    ///     .build()
-    ///     .await
-    ///     .unwrap();
-    ///
-    ///     while let Some(connection) = server.accept().await {
-    ///         println!("connected!");
-    ///     }
-    /// }
-    ///
-    /// ```
-    pub async fn accept(&mut self) -> Option<Connection> {
-        self.acceptor.accept().await
-    }
-}
-
 pub struct ServerConfig {
     server_config: rustls::ServerConfig,
     address: SocketAddr,
+    endpoint: EndpointConfig,
 }
 
 impl ServerConfig {
@@ -310,7 +349,7 @@ impl ServerConfig {
                 }
             };
 
-        debug!("loaded cert from {} and key from {}", cert_path, key_path);
+        tracing::debug!("loaded cert from {} and key from {}", cert_path, key_path);
 
         let server_cfg = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -322,6 +361,7 @@ impl ServerConfig {
         ServerConfig {
             server_config: server_cfg,
             address: addr.parse().unwrap(),
+            endpoint: EndpointConfig::default(),
         }
     }
 
@@ -330,561 +370,537 @@ impl ServerConfig {
         self
     }
 
-    pub async fn build(self) -> Result<Server, terror::Error> {
-        self.build_with::<io::DefaultTransmitProvider>()
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.endpoint.workers = workers.max(1);
+        self
     }
 
-    fn build_with<S>(self) -> Result<Server, terror::Error>
-    where
-        S: io::TransmitProvider,
-    {
-        let (new_connection_tx, new_connection_rx) = mpsc::channel::<Connection>(64);
-        let (_, ncc_rx) = mpsc::channel::<(SocketAddr, ServerName, oneshot::Sender<Connection>)>(1);
-        let hmac_reset_key = [0u8; 64];
+    /// every backend knob at once, for callers who care
+    pub fn with_config(mut self, config: EndpointConfig) -> Self {
+        self.endpoint = config;
+        self
+    }
 
-        let endpoint = Endpoint {
-            local_addr: self.address,
-            connections: ConnectionMap::new(),
-            connection_ids: IndexMap::new(),
+    /// run `handler` for every established connection and block until shutdown. as its a server it
+    /// will continue to listen so this method will never return on its own, only via forceful
+    /// process termination. equivalent to calling spawn() and wait() on the endpoint handle
+    ///
+    /// `handler` is cloned into every shard and invoked on the shard that owns the connection
+    /// the moment its handshake completes. the future it returns is therefore `!Send` and spends
+    /// its whole life on one core, next to the connection state it touches
+    ///
+    /// one handler task runs per connection. within a connection, spawn a task per stream with
+    /// [`Connection::spawn`] so that a slow stream does not stall the accept loop
+    ///
+    /// the handler shares its thread with the packet loop for every other connection on that core.
+    /// anything slow, e.g. a database call, a file read, heavy CPU, should go through
+    /// [`Connection::offload`] or [`Connection::offload_blocking`], or those connections stall
+    /// the others. see the module docs for the full rule. the watchdog will warn you when a turn
+    /// overruns
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use quic::connection::ServerConfig;
+    /// use quic::terror::Error;
+    ///
+    /// fn main() -> Result<(), quic::terror::Error> {
+    ///     ServerConfig::new("[::1]:4433", "/path/to/cert.der", "/path/to/key.der")
+    ///         .with_supported_protocols(vec!["hq-29".to_owned()])
+    ///         .with_workers(4) // one shard per core
+    ///         .run(|conn| async move {
+    ///             // this future runs on the shard that owns `conn`
+    ///             println!("{:?} connected", conn.application_protocol());
+    ///
+    ///             while let Ok((recv, send)) = conn.accept_bidirectional_stream().await {
+    ///                 // one task per stream
+    ///                 conn.spawn(|conn| async move {
+    ///                     let mut buf = [0u8; 1024];
+    ///                     while let Ok(Some(n)) = recv.read(&mut buf).await {
+    ///                         let _ = send.write(&buf[..n], false).await;
+    ///                     }
+    ///                 });
+    ///             }
+    ///         })
+    /// }
+    /// ```
+    pub fn run<F, Fut>(self, handler: F) -> Result<(), terror::Error>
+    where
+        F: Fn(Connection) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let mut endpoint = self.spawn(handler)?;
+        endpoint.wait();
+        Ok(())
+    }
+
+    /// does the same as run(), only that it immediately returns and gives control over the endpoint
+    /// handle. as its a server, it will continue to listen until either shutdown is called or the
+    /// process exits. the endpoint handle will shutdown all shards when dropped.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use quic::connection::ServerConfig;
+    /// use quic::terror::Error;
+    ///
+    /// fn main() -> Result<(), quic::terror::Error> {
+    ///     let mut endpoint = ServerConfig::new("[::1]:4433", "/path/to/cert.der", "/path/to/key.der")
+    ///         .with_supported_protocols(vec!["hq-29".to_owned()])
+    ///         .with_workers(4) // one shard per core
+    ///         .spawn(|conn| async move {
+    ///             // this future runs on the shard that owns `conn`
+    ///             println!("{:?} connected", conn.application_protocol());
+    ///
+    ///             while let Ok((recv, send)) = conn.accept_bidirectional_stream().await {
+    ///                 // one task per stream
+    ///                 conn.spawn(|conn| async move {
+    ///                     let mut buf = [0u8; 1024];
+    ///                     while let Ok(Some(n)) = recv.read(&mut buf).await {
+    ///                         let _ = send.write(&buf[..n], false).await;
+    ///                     }
+    ///                 });
+    ///             }
+    ///         })?;
+    ///     // do some work
+    ///     let test = 1 + 2;
+    ///
+    ///     // wait and shutdown endpoint
+    ///     endpoint.sync_shutdown();
+    ///
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn spawn<F, Fut>(self, handler: F) -> Result<ShardedEndpoint, terror::Error>
+    where
+        F: Fn(Connection) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let hmac_reset_key = [0u8; 64];
+        let handler: Handler = Arc::new(move |conn| Box::pin(handler(conn)));
+
+        let config = Arc::new(ShardConfig {
+            is_server: true,
             server_config: Some(Arc::new(self.server_config)),
             client_config: None,
-            hmac_reset_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
-            nc_tx: new_connection_tx,
-            ncc_rx,
-            ncc_tx: IndexMap::new(),
-            timers: DelayQueue::new(),
-            timer_keys: IndexMap::new(),
-        };
+            hmac: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &hmac_reset_key),
+            endpoint: self.endpoint,
+            handler: Some(handler),
+        });
 
-        io::event_loop::<S>(self.address, 1500, 8, 8, endpoint);
+        let endpoint = endpoint::spawn(self.address, config, None).map_err(|e| {
+            terror::Error::taurus_misc_error(format!("failed to start endpoint: {e}"))
+        })?;
 
-        Ok(Server {
-            address: self.address,
-            acceptor: Acceptor {
-                rx: new_connection_rx,
-            },
-        })
+        Ok(endpoint)
     }
 }
 
-// internal impl
+/// mirrors the wakers struct inside the stream manager. stores actual task wakers that are fired if
+/// an event is emitted in the endpoint after a packet is processed
+#[derive(Default)]
+pub(crate) struct StreamWakers {
+    /// if accepting/initiating a stream was blocked
+    pub streams: [Option<std::task::Waker>; 4],
 
-intrusive_adapter!(ConnectionAdapter = Arc<LockedInner>: LockedInner { direct_link => RBTreeAtomicLink });
-impl<'a> KeyAdapter<'a> for ConnectionAdapter {
-    type Key = cid::Id;
-    fn get_key(&self, x: &'a LockedInner) -> cid::Id {
-        x.internal_id
-    }
+    /// if reading from a stream was blocked
+    pub read: FxHashMap<u64, std::task::Waker>,
+
+    /// if writing to a stream was blocked
+    pub write: FxHashMap<u64, std::task::Waker>,
+
+    /// if a stream is finished, so fin bit set and all data sent and ack'ed
+    pub finished: FxHashMap<u64, std::task::Waker>,
 }
 
-intrusive_adapter!(TransmissionPendingAdapter = Arc<LockedInner>:
-    LockedInner { transmission_link => LinkedListAtomicLink });
+/// holds connection state. only ever touched by the shard that owns it
+pub(crate) struct ConnState {
+    /// internal connection id used for lookup
+    pub internal_id: cid::Id,
 
-intrusive_adapter!(ConnectionClosedAdapter = Arc<LockedInner>:
-    LockedInner { closed_link => LinkedListAtomicLink });
+    /// quic state machine
+    pub inner: RefCell<Inner>,
 
-struct ConnectionMap {
-    // main connection list, sorted by connection id
-    core: RBTree<ConnectionAdapter>,
+    /// handle to the owning shard
+    pub core: Rc<ShardCore>,
 
-    // holds all connections which have a pending transmission
-    transmission_pending: LinkedList<TransmissionPendingAdapter>,
+    /// slab key, set right after insertion
+    pub key: Cell<usize>,
 
-    // holds all closed connections, aka finished either gracefull or by termination
-    closed: LinkedList<ConnectionClosedAdapter>,
+    /// true while the connection sits in the egress queue
+    pub queued: Cell<bool>,
+
+    /// stream wakers to enable async on stream events
+    pub wakers: RefCell<StreamWakers>,
+
+    /// cached from inner, for easy stream type construction
+    pub side: u8,
 }
 
-impl ConnectionMap {
-    pub fn new() -> Self {
+impl ConnState {
+    pub(crate) fn new(inner: Inner, id: cid::Id, core: Rc<ShardCore>) -> Self {
+        let side = inner.side as u8;
         Self {
-            core: RBTree::new(ConnectionAdapter::new()),
-            transmission_pending: LinkedList::new(TransmissionPendingAdapter::new()),
-            closed: LinkedList::new(ConnectionClosedAdapter::new()),
-        }
-    }
-
-    pub fn find_existing(&mut self, id: &cid::Id) -> Option<Cursor<'_, ConnectionAdapter>> {
-        let c = self.core.find(id);
-
-        if c.is_null() {
-            return None;
-        }
-
-        Some(c)
-    }
-}
-
-pub(crate) struct Endpoint {
-    // local address the sockets are bound to
-    local_addr: SocketAddr,
-
-    // owns the actual connection objects
-    connections: ConnectionMap,
-
-    // internal connection id map, maps from external to internal id to support multiple external
-    // ids to avoid reinserting and/or cloning the connection inside intrusive collections
-    connection_ids: IndexMap<cid::Id, cid::Id>,
-
-    // server config for rustls
-    server_config: Option<Arc<rustls::ServerConfig>>,
-
-    // client config for rustls
-    client_config: Option<Arc<rustls::ClientConfig>>,
-
-    // RFC 2104, used to generate reset tokens from connection ids
-    hmac_reset_key: ring::hmac::Key,
-
-    // channel for sending new connections. server only
-    nc_tx: mpsc::Sender<Connection>,
-
-    // channel for receiving new connecting attempts. client only
-    ncc_rx: mpsc::Receiver<(SocketAddr, ServerName<'static>, oneshot::Sender<Connection>)>,
-
-    // channels for sending new connections once ready. client only. uses internal id as key.
-    ncc_tx: IndexMap<cid::Id, oneshot::Sender<Connection>>,
-
-    // one entry per connection with a live deadline, keyed by same internal id
-    timers: DelayQueue<cid::Id>,
-
-    // internal id to delay queue key for each internal id for easier access
-    timer_keys: IndexMap<cid::Id, Key>,
-}
-
-impl Endpoint {
-    pub fn recv(&mut self, mut recv_ref: thingbuf::mpsc::RecvRef<'_, Packet>) {
-        if recv_ref.data.is_empty() {
-            warn!("Received empty datagram");
-            return;
-        }
-
-        let local = recv_ref.local;
-        let peer = recv_ref.peer;
-
-        info!("Received {:?} bytes from {:?}", recv_ref.data.len(), peer);
-
-        let mut partial_decode = match Header::from_bytes(&recv_ref.data, 8) {
-            Ok(h) => h,
-            Err(error) => {
-                error!("error while decoding header: {}", error);
-                return;
-            }
-        };
-
-        debug!("I: {}", &partial_decode);
-
-        let mut conn_ptr: Option<Arc<LockedInner>> = None;
-        let mut events: Vec<InnerEvent> = Vec::new();
-
-        if let Some(internal_id) = self.connection_ids.get(&partial_decode.dcid) {
-            if let Some(cursor) = self.connections.find_existing(internal_id) {
-                debug!("found connection");
-
-                let arc_li = cursor.clone_pointer().unwrap();
-                conn_ptr = Some(arc_li.clone());
-                let mut conn = arc_li.lock();
-
-                if let Err(error) = conn.recv(&mut recv_ref.data, &mut partial_decode, local, peer) {
-                    error!("error processing datagram: {}", error);
-                }
-
-                events = conn.poll_events();
-            }
-        } else {
-            // if we dont recgnise the dcid, assume its an inital packet
-            let server_config = self.server_config.clone().unwrap();
-            match Inner::accept(
-                &mut recv_ref.data,
-                peer,
-                local,
-                server_config,
-                &self.hmac_reset_key,
-            ) {
-                Ok((inner, cid)) => {
-                    debug!("accepted new connection");
-                    let a_inner = Arc::new(LockedInner::from_inner(inner, cid));
-                    conn_ptr = Some(a_inner.clone());
-                    self.connections.core.insert(a_inner.clone());
-                    self.connection_ids.insert(cid, cid);
-                }
-                Err(err) => {
-                    error!("error processing initial packet: {}", err);
-                }
-            };
-        }
-
-        if let Some(c_ptr) = conn_ptr {
-            for event in events {
-                match event {
-                    InnerEvent::ConnectionEstablished => {
-                        let sapi = c_ptr.clone();
-                        let sender = self.nc_tx.clone();
-
-                        if self.server_config.is_some() {
-                            tokio::spawn(async move {
-                                if let Err(e) = sender.send(Connection { api: sapi }).await {
-                                    error!("error sending new connection: {}", e);
-                                }
-                            });
-                        }
-
-                        let capi = c_ptr.clone();
-                        let id = capi.internal_id;
-
-                        if self.client_config.is_some() {
-                            if let Some(sender) = self.ncc_tx.swap_remove(&capi.internal_id) {
-                                tokio::spawn(async move {
-                                    if sender.send(Connection { api: capi }).is_err() {
-                                        error!("error sending new connection with id: {}", id);
-                                    }
-                                });
-                            } else {
-                                error!("missing connection channel for client connection for original dcid {}", id);
-                            }
-                        }
-                    }
-                    InnerEvent::NewConnectionId(ncid) => {
-                        self.connection_ids.insert(ncid, c_ptr.internal_id);
-                    }
-                    InnerEvent::RetireConnectionId(cid) => {
-                        self.connection_ids.swap_remove(&cid);
-                    }
-                    InnerEvent::ClosedByPeer => {
-                        self.set_next_timeout(c_ptr.internal_id, None);
-
-                        if c_ptr.direct_link.is_linked() {
-                            unsafe {
-                                self.connections
-                                    .core
-                                    .cursor_mut_from_ptr(Arc::as_ptr(&c_ptr))
-                                    .remove();
-                            }
-                        }
-
-                        if c_ptr.transmission_link.is_linked() {
-                            unsafe {
-                                self.connections
-                                    .transmission_pending
-                                    .cursor_mut_from_ptr(Arc::as_ptr(&c_ptr))
-                                    .remove();
-                            }
-                        }
-
-                        self.connections.closed.push_back(c_ptr.clone());
-                    }
-                }
-            }
-
-            // enqueue connection into pending transmissions
-            if !c_ptr.transmission_link.is_linked() && !c_ptr.closed_link.is_linked() {
-                self.connections.transmission_pending.push_back(c_ptr.clone());
-            }
-        }
-    }
-
-    pub async fn iterate_transmission_pending<F, Fut>(
-        &mut self,
-        send_queues: Arc<[io::SendQueue]>,
-        mut f: F,
-    ) where
-        F: FnMut(Arc<LockedInner>, io::SendQueue) -> Fut,
-        Fut: Future<Output = bool> + Send + 'static,
-    {
-        let mut fut = Vec::new();
-        {
-            let mut current = self.connections.transmission_pending.front_mut();
-
-            while !current.is_null() {
-                let node = current.as_cursor().clone_pointer().unwrap();
-
-                let send_queue = match send_queues.iter().find(|s| s.remaining() > 0) {
-                    Some(s) => s,
-                    None => break,
-                };
-
-                fut.push(f(node.clone(), send_queue.clone()));
-
-                // fetch events that may occur during packet fetching
-                let mut inner = node.lock();
-                let post_fetch_events = inner.poll_events();
-
-                for event in post_fetch_events {
-                    if let InnerEvent::NewConnectionId(id) = event {
-                        self.connection_ids
-                            .insert(inner.cidm.get_initial_scid_unchecked(), id);
-                    }
-                }
-
-                drop(inner);
-
-                current.move_next();
-            }
-        }
-
-        let results = futures::future::join_all(fut).await;
-
-        // collect (id, deadline) while holding the cursor, then set next timeout after dropping it
-        let mut rearm: Vec<(cid::Id, Option<Instant>)> = Vec::with_capacity(results.len());
-        {
-            let mut it = self.connections.transmission_pending.front_mut();
-            let mut i = 0;
-            while !it.is_null() && i < results.len() {
-                let node = it.as_cursor().clone_pointer().unwrap();
-                rearm.push((node.internal_id, node.lock().timeout()));
-                if results[i] { it.remove(); } else { it.move_next(); }
-                i += 1;
-            }
-        }
-
-        for (id, deadline) in rearm {
-            self.set_next_timeout(id, deadline);
-        }
-    }
-
-    /// polls possible wakeups of a connection which is either proactive sending/connecting or a
-    /// timeout from congestion control, ack delay or similar
-    pub fn poll_wakeups(&mut self, cx: &mut std::task::Context<'_>) -> Poll<bool> {
-        let mut wake = false;
-
-        if self.client_config.is_some() {
-            match self.ncc_rx.poll_recv(cx) {
-                Poll::Ready(Some((dest_addr, server_name, ready_sender))) => {
-                    let cc = self.client_config.clone().unwrap();
-                    match Inner::connect(self.local_addr, dest_addr, server_name, cc, &self.hmac_reset_key) {
-                        Ok((inner, cid)) => {
-                            // cid is here the scid which will be reused as dcid for at least
-                            // the first packet from the peer. it is also used as our internal id
-                            let a = Arc::new(LockedInner::from_inner(inner, cid));
-                            self.connections.core.insert(a.clone());
-                            self.connection_ids.insert(cid, cid);
-                            self.ncc_tx.insert(cid, ready_sender);
-                            self.connections.transmission_pending.push_back(a);
-                            wake = true;
-                        }
-                        Err(err) => {
-                            error!("failed to setup connection to {dest_addr}: {err}");
-                        }
-                    }
-                }
-                Poll::Ready(None) => error!("fatal error receiving connection attempt"),
-                Poll::Pending => (),
-            }
-        }
-
-        if let Poll::Ready(Some(expired)) = self.timers.poll_expired(cx) {
-            let id = expired.into_inner();
-            self.timer_keys.swap_remove(&id);
-            if let Some(a) = self.connections.find_existing(&id).and_then(|c| c.clone_pointer()) {
-                a.lock().handle_timeout(std::time::Instant::now());
-                if !a.transmission_link.is_linked() && !a.closed_link.is_linked() {
-                    self.connections.transmission_pending.push_back(a);
-                }
-                wake = true;
-            }
-        }
-
-        // TODO proactive data sending from application
-        if wake { Poll::Ready(true) } else { Poll::Pending }
-    }
-
-    fn set_next_timeout(&mut self, id: cid::Id, deadline: Option<Instant>) {
-        match deadline {
-            Some(dl) => {
-                let at = TokioInstant::from_std(dl);
-                match self.timer_keys.get(&id).copied() {
-                    Some(key) => self.timers.reset_at(&key, at),
-                    None => {
-                        let key = self.timers.insert_at(id, at);
-                        self.timer_keys.insert(id, key);
-                    }
-                }
-            }
-            None => {
-                if let Some(key) = self.timer_keys.swap_remove(&id) {
-                    self.timers.remove(&key);
-                }
-            }
-        }
-    }
-}
-
-pub(crate) struct LockedInner {
-    // actual connection implementation
-    inner: Mutex<Inner>,
-
-    // internal connection id used for lookup
-    internal_id: cid::Id,
-
-    // rbtree link to main connection container
-    direct_link: RBTreeAtomicLink,
-
-    // links to rbtree containing all connections that are ready to transmit
-    transmission_link: LinkedListAtomicLink,
-
-    // links to list containing all closed connections
-    closed_link: LinkedListAtomicLink,
-}
-
-impl LockedInner {
-    pub fn from_inner(inner: Inner, id: cid::Id) -> Self {
-        Self {
-            inner: Mutex::new(inner),
             internal_id: id,
-            direct_link: RBTreeAtomicLink::default(),
-            transmission_link: LinkedListAtomicLink::default(),
-            closed_link: LinkedListAtomicLink::default(),
+            inner: RefCell::new(inner),
+            core,
+            key: Cell::new(usize::MAX),
+            queued: Cell::new(false),
+            wakers: RefCell::new(StreamWakers::default()),
+            side,
         }
     }
 
-    pub fn lock(&self) -> parking_lot::lock_api::MutexGuard<'_, parking_lot::RawMutex, Inner> {
-        self.inner.lock()
+    /// queue this connection for pending egress
+    #[inline]
+    pub(crate) fn mark_pending(&self) {
+        if !self.queued.replace(true) {
+            self.core.pending.borrow_mut().push_back(self.key.get());
+        }
+    }
+
+    /// wakes all saved wakers
+    pub(crate) fn wake_all(&self) {
+        let mut w = self.wakers.borrow_mut();
+        for s in w.streams.iter_mut() {
+            if let Some(k) = s.take() {
+                k.wake();
+            }
+        }
+        for (_, k) in w.read.drain() {
+            k.wake();
+        }
+        for (_, k) in w.write.drain() {
+            k.wake();
+        }
+        for (_, k) in w.finished.drain() {
+            k.wake();
+        }
     }
 }
 
-impl ConnectionApi for LockedInner {
-    fn poll_recv(
+/// a handle to one connection
+pub struct Connection {
+    pub(crate) state: Rc<ConnState>,
+}
+
+impl Connection {
+    /// asynchronously accepts a new bidirectional stream
+    ///
+    /// ```ignore
+    /// while let Ok((recv, send)) = connection.accept_bidirectional_stream().await {
+    ///     connection.spawn(async move {
+    ///         let mut buf = [0u8; 1024];
+    ///         while let Ok(Some(n)) = recv.read(&mut buf).await {
+    ///             let _ = send.write(&buf[..n], false).await;
+    ///         }
+    ///     });
+    /// }
+    /// ```
+    pub async fn accept_bidirectional_stream(
         &self,
-        cx: &mut std::task::Context,
-        s_id: &u64,
-        buf: &mut [u8],
-    ) -> Poll<Result<Option<usize>, terror::Error>> {
-        let mut conn = self.inner.lock();
-        let bytes_read = conn.stream_read(s_id, buf, cx.waker().clone())?;
-
-        match bytes_read {
-            Some(0) => Poll::Pending,
-            _ => Poll::Ready(Ok(bytes_read)),
-        }
+    ) -> Result<(stream::RecvStream, stream::SendStream), terror::Error> {
+        let id = future::poll_fn(|cx| self.poll_accept(cx, 0x00)).await?;
+        Ok((
+            stream::RecvStream::new(id, self.clone()),
+            stream::SendStream::new(id, self.clone()),
+        ))
     }
 
-    fn poll_send(
+    /// asynchronously accepts a new unirectional stream
+    ///
+    /// ```ignore
+    /// while let Ok(recv) = connection.accept_unirectional_stream().await {
+    ///     connection.spawn(async move {
+    ///         let mut buf = [0u8; 1024];
+    ///         while let Ok(Some(n)) = recv.read(&mut buf).await {
+    ///             println!("read {n} bytes");
+    ///         }
+    ///     });
+    /// }
+    /// ```
+    pub async fn accept_unidirectional_stream(&self) -> Result<stream::RecvStream, terror::Error> {
+        let id = future::poll_fn(|cx| self.poll_accept(cx, 0x02)).await?;
+        Ok(stream::RecvStream::new(id, self.clone()))
+    }
+
+    /// initiates a new bidirectional stream, may need to wait if the peers advertised max streams
+    /// are fully utilized
+    ///
+    /// ```ignore
+    /// let Ok((send, _recv)) = connection.open_bidirectional_stream().await else {
+    ///     eprintln!("could not open stream");
+    ///     return;
+    /// };
+    ///
+    /// let bytes = "Hello World!".as_bytes();
+    /// match send.write(bytes, true).await {
+    ///     Ok(written) => println!("wrote {written} bytes to stream!"),
+    ///     Err(e) => eprintln!("write failed: {e}"),
+    /// }
+    ///
+    /// let mut buf = [0u8; 1024];
+    /// if let Ok(Some(n)) = recv.read(&mut buf).await {
+    ///     println!("read {n} bytes");
+    /// }
+    /// ```
+    pub async fn open_bidirectional_stream(
         &self,
-        _cx: &mut std::task::Context,
-        s_id: &u64,
-        buf: &[u8],
-        fin: bool,
-    ) -> Poll<Result<usize, terror::Error>> {
-        let mut conn = self.inner.lock();
-        Poll::Ready(conn.stream_write(*s_id, buf, fin))
+    ) -> Result<(stream::SendStream, stream::RecvStream), terror::Error> {
+        let id = future::poll_fn(|cx| self.poll_open(cx, 0x00)).await?;
+        Ok((stream::SendStream::new(id, self.clone()), stream::RecvStream::new(id, self.clone())))
     }
 
-    fn poll_accept(
-        &self,
-        cx: &mut std::task::Context,
-        stream_t: u64,
-        arc: Connection,
-    ) -> Poll<Result<(Option<stream::RecvStream>, Option<stream::SendStream>), terror::Error>> {
-        let mut conn = self.inner.lock();
-
-        if let Some(id) = conn.stream_accept(stream_t, cx.waker().clone()) {
-            let mut ss: Option<stream::SendStream> = None;
-            let rs: Option<stream::RecvStream> = Some(stream::RecvStream::new(id, arc.clone()));
-
-            if stream_t == 0x00 {
-                ss = Some(stream::SendStream::new(id, arc.clone()))
-            }
-
-            return Poll::Ready(Ok((rs, ss)));
-        }
-
-        Poll::Pending
+    /// initiates a new unirectional stream, may need to wait if the peers advertised max streams
+    /// are fully utilized
+    ///
+    /// ```ignore
+    /// let Ok((send, _recv)) = connection.open_bidirectional_stream().await else {
+    ///     eprintln!("could not open stream");
+    ///     return;
+    /// };
+    ///
+    /// let bytes = "Hello World!".as_bytes();
+    /// match send.write(bytes, true).await {
+    ///     Ok(written) => println!("wrote {written} bytes to stream!"),
+    ///     Err(e) => eprintln!("write failed: {e}"),
+    /// }
+    /// ```
+    pub async fn open_unidirectional_stream(&self) -> Result<stream::SendStream, terror::Error> {
+        let id = future::poll_fn(|cx| self.poll_open(cx, 0x02)).await?;
+        Ok(stream::SendStream::new(id, self.clone()))
     }
 
-    fn close(&self, ec: u64, _reason: Option<&str>) {
-        // TODO reason
-        let mut conn = self.inner.lock();
-        conn.apec = Some(ec);
-        conn.state = ConnectionState::Closing;
+    /// spawn a task on the shard that owns this connection
+    ///
+    /// used to fork per-stream work so a slow stream cannot stall the handler's accept loop.
+    /// the task is owned by the connection: when the connection closes, it is cancelled and dropped
+    ///
+    /// ```ignore
+    /// while let Ok((recv, send)) = conn.accept_bidirectional_stream().await {
+    ///     conn.spawn(async move {
+    ///         let mut buf = [0u8; 1024];
+    ///         while let Ok(Some(n)) = recv.read(&mut buf).await {
+    ///             let _ = send.write(&buf[..n], false).await;
+    ///         }
+    ///     });
+    /// }
+    /// ```
+    pub fn spawn<F, Fut>(&self, f: F)
+    where
+        F: FnOnce(Connection) -> Fut,
+        Fut: Future<Output = ()> + 'static,
+    {
+        let conn = self.clone();
+        let task = self.state.core.exec.spawn(f(conn));
+        self.state
+            .core
+            .spawned
+            .borrow_mut()
+            .push((self.state.key.get(), task));
     }
 
-    fn application_protocol(&self) -> Option<String> {
-        if let Some(alp) = self.inner.lock().tls_session.alpn_protocol() {
+    /// run a `Send` future on the offload pool and await its result here
+    ///
+    /// ```ignore
+    /// let rows = conn.offload(async move { pool.query(&sql).await }).await?;
+    /// let resp = conn.offload(async move { request::get(url).await }).await?;
+    /// ```
+    pub async fn offload<F>(&self, fut: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.state.core.offload.run(fut).await
+    }
+
+    /// run blocking work on the offload pool and await its result here
+    ///
+    /// ```ignore
+    /// let hash = conn.offload_blocking(move || argon2::hash(&password)).await;
+    /// let file = conn.offload_blocking(move || std::fs::read("big.bin")).await?;
+    /// ```
+    pub async fn offload_blocking<T, F>(&self, f: F) -> T
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.state.core.offload.blocking(f).await
+    }
+
+    /// closes the connection. you may provide an error code or a reason. set the error code to 0 to
+    /// indicate no error for a graceful teardown.
+    pub async fn close(&self, ec: u64, reason: Option<&str>) {
+        tracing::info!(cid = %self.state.internal_id, error_code = ec, reason = reason, "closing connection");
+        self.state.inner.borrow_mut().begin_close(ec, reason);
+        self.state.mark_pending();
+    }
+
+    /// returns the negotiated application protocol. will return [`None`] during handshake
+    pub fn application_protocol(&self) -> Option<String> {
+        if let Some(alp) = self.state.inner.borrow().tls_session.alpn_protocol() {
             return Some(String::from_utf8(alp.to_vec()).unwrap());
         }
         None
     }
 
-    fn keep_alive(&self, _enable: bool) {
+    pub fn keep_alive(&self, _enable: bool) {
         todo!("Connection keep alive has not yet been implemented");
     }
 
-    fn zero_rtt(&self, _enable: bool) {
+    pub fn zero_rtt(&self, _enable: bool) {
         todo!("zero_rtt enabling/disabling has not yet been implemented");
     }
-}
 
-pub struct Connection {
-    pub(crate) api: Arc<dyn ConnectionApi>,
-}
-
-impl Connection {
-    pub async fn accept_bidirectional_stream(
+    pub(crate) fn poll_recv(
         &self,
-    ) -> Result<(stream::RecvStream, stream::SendStream), terror::Error> {
-        let s = future::poll_fn(|cx| self.api.poll_accept(cx, 0x00, self.clone())).await?;
-        Ok((s.0.unwrap(), s.1.unwrap()))
+        cx: &mut Context,
+        s_id: &u64,
+        buf: &mut [u8],
+    ) -> Poll<Result<Option<usize>, terror::Error>> {
+        let bytes_read = {
+            let mut conn = self.state.inner.borrow_mut();
+            if conn.is_closing() || conn.is_closed() {
+                return match conn.apec.unwrap_or(0) {
+                    0 => Poll::Ready(Ok(None)),
+                    code => Poll::Ready(Err(terror::Error::connection_closed(format!(
+                        "connection closed with: {}",
+                        code
+                    )))),
+                };
+            }
+            match conn.stream_read(s_id, buf) {
+                Ok(b) => b,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        };
+
+        match bytes_read {
+            Some(0) => {
+                self.state
+                    .wakers
+                    .borrow_mut()
+                    .read
+                    .insert(*s_id, cx.waker().clone());
+                Poll::Pending
+            }
+            _ => {
+                self.state.mark_pending();
+                Poll::Ready(Ok(bytes_read))
+            }
+        }
     }
 
-    pub async fn accept_unidirectional_stream(&self) -> Result<stream::RecvStream, terror::Error> {
-        let s = future::poll_fn(|cx| self.api.poll_accept(cx, 0x02, self.clone())).await?;
-        Ok(s.0.unwrap())
-    }
-
-    pub async fn open_bidirectional_stream(
+    pub(crate) fn poll_finished(
         &self,
-    ) -> Result<(stream::RecvStream, stream::SendStream), terror::Error> {
-        todo!()
+        cx: &mut Context,
+        s_id: &u64,
+    ) -> Poll<Result<(), terror::Error>> {
+        let res = {
+            let conn = self.state.inner.borrow_mut();
+            conn.stream_finished(s_id)
+        };
+
+        if res {
+            return Poll::Ready(Ok(()));
+        }
+
+        tracing::trace!("entering poll_finished");
+
+        self.state
+            .wakers
+            .borrow_mut()
+            .finished
+            .insert(*s_id, cx.waker().clone());
+
+        Poll::Pending
     }
 
-    pub async fn open_unidirectional_stream(&self) -> Result<stream::RecvStream, terror::Error> {
-        todo!()
+    pub(crate) fn poll_send(
+        &self,
+        cx: &mut Context,
+        s_id: &u64,
+        buf: &[u8],
+        fin: bool,
+    ) -> Poll<Result<usize, terror::Error>> {
+        let res = {
+            let mut conn = self.state.inner.borrow_mut();
+            conn.stream_write(*s_id, buf, fin)
+        };
+
+        self.state.mark_pending();
+        match res {
+            Ok(0) if !buf.is_empty() => {
+                // local backpressure: buffer full
+                self.state
+                    .wakers
+                    .borrow_mut()
+                    .write
+                    .insert(*s_id, cx.waker().clone());
+                Poll::Pending
+            }
+            other => Poll::Ready(other),
+        }
     }
 
-    pub async fn close(&self, ec: u64, reason: Option<&str>) {
-        self.api.close(ec, reason);
+    fn poll_accept(&self, cx: &mut Context, stream_t: u64) -> Poll<Result<u64, terror::Error>> {
+        let mut conn = self.state.inner.borrow_mut();
+
+        if conn.is_closing() || conn.is_closed() {
+            if let Some(ec) = conn.apec {
+                return Poll::Ready(Err(terror::Error::connection_closed(format!(
+                    "connection closed with: {}",
+                    ec
+                ))));
+            };
+        }
+
+        if let Some(id) = conn.stream_accept(stream_t) {
+            tracing::debug!(cid = %self.state.internal_id, stream = id, kind = stream_t, "new stream accepted");
+            return Poll::Ready(Ok(id));
+        }
+
+        let idx = (stream_t | ((self.state.side as u64) ^ 0x01)) as usize;
+        let mut w = self.state.wakers.borrow_mut();
+        match &w.streams[idx] {
+            Some(existing) if !existing.will_wake(cx.waker()) => {
+                return Poll::Ready(Err(terror::Error::concurrent_accept(
+                    "two tasks awaiting the same stream type",
+                )));
+            }
+            _ => w.streams[idx] = Some(cx.waker().clone()),
+        }
+
+        Poll::Pending
     }
 
-    pub fn application_protocol(&self) -> Option<String> {
-        self.api.application_protocol()
+    fn poll_open(&self, cx: &mut Context, stream_t: u64) -> Poll<Result<u64, terror::Error>> {
+        let mut conn = self.state.inner.borrow_mut();
+
+        if conn.is_closing() || conn.is_closed() {
+            if let Some(ec) = conn.apec {
+                return Poll::Ready(Err(terror::Error::connection_closed(format!(
+                    "connection closed with: {}",
+                    ec
+                ))));
+            };
+        }
+
+        if let Some(id) = conn.stream_open(stream_t) {
+            tracing::debug!(cid = %self.state.internal_id, stream = id, kind = stream_t, "new stream opened");
+            return Poll::Ready(Ok(id));
+        }
+
+        let idx = (stream_t | (self.state.side as u64)) as usize;
+        self.state.wakers.borrow_mut().streams[idx] = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
 impl Clone for Connection {
     fn clone(&self) -> Self {
         Self {
-            api: self.api.clone(),
+            state: self.state.clone(),
         }
     }
 }
-
-pub(crate) trait ConnectionApi: Send + Sync {
-    fn poll_recv(
-        &self,
-        cx: &mut std::task::Context,
-        id: &u64,
-        buf: &mut [u8],
-    ) -> Poll<Result<Option<usize>, terror::Error>>;
-
-    fn poll_send(
-        &self,
-        cx: &mut std::task::Context,
-        id: &u64,
-        buf: &[u8],
-        fin: bool,
-    ) -> Poll<Result<usize, terror::Error>>;
-
-    fn poll_accept(
-        &self,
-        cx: &mut std::task::Context,
-        _stream_t: u64,
-        _arc: Connection,
-    ) -> Poll<Result<(Option<stream::RecvStream>, Option<stream::SendStream>), terror::Error>>;
-
-    fn close(&self, ec: u64, reason: Option<&str>);
-
-    fn application_protocol(&self) -> Option<String>;
-
-    fn keep_alive(&self, enable: bool);
-
-    fn zero_rtt(&self, enable: bool);
-}
-

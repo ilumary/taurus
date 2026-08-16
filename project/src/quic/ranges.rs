@@ -52,6 +52,13 @@ impl RangeSet {
         self.insert(val..=val);
     }
 
+    pub fn len(&self) -> usize {
+        match self {
+            RangeSet::Inline(set) => set.inner.len(),
+            RangeSet::BTree(set) => set.inner.len(),
+        }
+    }
+
     /// remove all tracked values strictly below `val`
     pub fn remove_below(&mut self, val: u64) {
         match self {

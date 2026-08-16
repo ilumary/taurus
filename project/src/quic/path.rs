@@ -6,7 +6,7 @@ use std::{
 use smallvec::SmallVec;
 
 use crate::{
-    cc::{CongestionController, UnlimitedWindow},
+    cc::{CongestionController, UnlimitedWindow, SentPacket, SentFrame},
     packet::AckFrame
 };
 
@@ -110,9 +110,9 @@ pub struct Path {
     /// current validated mtu for this path
     mtu: usize,
     /// candidate size of an in-flight PMTU probe, if any
-    mtu_probe: Option<usize>,
+    //mtu_probe: Option<usize>,
     /// (space, packet number) of the in-flight PMTU probe
-    mtu_probe_pn: Option<(usize, u64)>,
+    //mtu_probe_pn: Option<(usize, u64)>,
 
     // TODO make configurable per path
     /// per-path cc
@@ -139,8 +139,8 @@ impl Path {
             validation_deadline: None,
             received_challenges: SmallVec::new(),
             mtu: MIN_DATAGRAM,
-            mtu_probe: None,
-            mtu_probe_pn: None,
+            //mtu_probe: None,
+            //mtu_probe_pn: None,
             cc: CongestionController::new(UnlimitedWindow),
             bytes_received: 0,
             bytes_sent: 0,
@@ -156,12 +156,11 @@ impl Path {
         size: usize,
         ack_eliciting: bool,
         now: Instant,
+        frames: SmallVec<[SentFrame; 2]>,
     ) {
         self.bytes_sent = self.bytes_sent.saturating_add(size as u64);
         self.last_sent = Some(now);
-        if ack_eliciting {
-            self.cc.on_packet_sent(space, pn, size, now);
-        }
+        self.cc.on_packet_sent(space, pn, size, now, ack_eliciting, frames);
     }
 
     pub fn on_datagram_received(&mut self, size: usize, now: Instant) {
@@ -174,25 +173,27 @@ impl Path {
         space: usize,
         ack: &AckFrame,
         now: Instant,
-    ) -> (Vec<u64>, Vec<u64>) {
+    ) -> (Vec<SentPacket>, Vec<SentPacket>) {
         let (acked, lost) = self.cc.on_ack_received(space, ack, now);
 
         // resolve an in-flight PMTU probe
-        if let Some((pspace, ppn)) = self.mtu_probe_pn {
+        // TODO replace with Optional on SentPacket maybe which tracks the values
+        // because saerching every acked and lost packet for PMTU probe is a bit wasteful
+        /*if let Some((pspace, ppn)) = self.mtu_probe_pn {
             if pspace == space {
-                if acked.contains(&ppn) {
+                if acked.iter().any(|p| p.0 == ppn) {
                     if let Some(size) = self.mtu_probe.take() {
                         if size > self.mtu {
                             self.mtu = size;
                         }
                     }
                     self.mtu_probe_pn = None;
-                } else if lost.contains(&ppn) {
+                } else if lost.iter().any(|p| p.0 == ppn) {
                     self.mtu_probe = None;
                     self.mtu_probe_pn = None;
                 }
             }
-        }
+        }*/
 
         (acked, lost)
     }
@@ -204,7 +205,7 @@ impl Path {
 
     /// drive the cc's loss timer. on a PTO while validating, a fresh PATH_CHALLENGE is
     /// requested so the probe carries new data
-    pub fn on_loss_detection_timeout(&mut self, now: Instant) -> Vec<u64> {
+    pub fn on_loss_detection_timeout(&mut self, now: Instant) -> Vec<SentPacket> {
         let lost = self.cc.on_loss_detection_timeout(now);
         if lost.is_empty() && self.is_validating() {
             self.validation_requested = true;
@@ -239,6 +240,10 @@ impl Path {
             // abandon after 3 × PTO
             self.validation_deadline = Some(now + self.cc.pto().saturating_mul(3));
         }
+    }
+
+    pub fn close_timeout(&self, now: Instant) -> Instant {
+        now + self.cc.pto().saturating_mul(3)
     }
 
     /// mark the path validated without a challenge
@@ -318,20 +323,9 @@ impl Path {
         self.received_challenges.pop()
     }
 
-    /// record a PMTU probe of `size` bytes just sent as packet `pn` in `space`.
+    /// record a PMTU probe of `size` bytes just sent as packet `pn` in `space`
     pub fn on_mtu_probe_sent(&mut self, size: usize, space: usize, pn: u64) {
-        self.mtu_probe = Some(size);
-        self.mtu_probe_pn = Some((space, pn));
-    }
-
-    #[inline]
-    pub fn mtu_probe(&self) -> Option<usize> {
-        self.mtu_probe
-    }
-
-    #[inline]
-    pub fn current_mtu(&self) -> usize {
-        self.mtu
+        todo!()
     }
 
     /// whether reachability is confirmed
@@ -774,15 +768,15 @@ mod tests {
         let now = Instant::now();
 
         path.on_datagram_received(100, now);
-        assert_eq!(path.send_budget(), 300, "3x received, capped by mtu");
+        assert_eq!(path.send_budget(), 300);
 
         path.request_validation();
         let data = challenge(1);
         path.add_challenge_sent(data, MIN_DATAGRAM - 1, now);
-        assert!(path.send_budget() <= 300, "still anti-amp limited while validating");
+        assert!(path.send_budget() <= 300);
 
         assert_eq!(path.on_response_received(data), ResponseOutcome::Reachable);
-        assert_eq!(path.send_budget(), path.current_mtu(), "anti-amp lifted");
+        assert_eq!(path.send_budget(), MIN_DATAGRAM);
         assert!(path.needs_mtu_validation());
     }
 

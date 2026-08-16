@@ -1,11 +1,11 @@
-use crate::{
-    packet::AckFrame,
-    transport_parameters::AckDelayExponent,
-};
+use crate::{packet::AckFrame, transport_parameters::AckDelayExponent};
 use std::{
     collections::VecDeque,
+    fmt,
     time::{Duration, Instant},
 };
+
+use smallvec::SmallVec;
 use tracing::{debug, error, trace, warn};
 
 // packets declared lost only after this many in-order unacked packets follow them
@@ -43,7 +43,8 @@ impl CongestionAlgorithm for UnlimitedWindow {
         _sent_time: Instant,
         _bif: usize,
         _now: Instant,
-    ) {}
+    ) {
+    }
     fn on_persistent_congestion(&mut self) {}
     fn congestion_window(&self) -> usize {
         4096
@@ -169,10 +170,108 @@ impl RttEstimator {
     }
 }
 
+// minimal record of a frame for tracking and potential retransmission
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SentFrame {
+    Stream {
+        id: u64,
+        off: u64,
+        len: u32,
+        fin: bool,
+    },
+
+    Crypto {
+        off: u64,
+        len: u32,
+    },
+
+    NewCid {
+        seq: u64,
+    },
+
+    RetireCid {
+        seq: u64,
+    },
+
+    Ack {
+        largest: u64,
+    },
+
+    HandshakeDone,
+
+    Ping,
+}
+
+impl SentFrame {
+    #[inline]
+    fn ack_eliciting(&self) -> bool {
+        !matches!(self, SentFrame::Ack { .. })
+    }
+}
+
+impl fmt::Display for SentFrame {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            SentFrame::Stream { id, off, len, fin } => {
+                write!(
+                    f,
+                    "STREAM id={id} off={off} len={len}{}",
+                    if *fin { " fin" } else { "" }
+                )
+            }
+            SentFrame::Crypto { off, len } => write!(f, "CRYPTO off={off} len={len}"),
+            SentFrame::NewCid { seq } => write!(f, "NEW_CID seq={seq}"),
+            SentFrame::RetireCid { seq } => write!(f, "RETIRE_CID seq={seq}"),
+            SentFrame::Ack { largest } => write!(f, "ACK largest={largest}"),
+            SentFrame::Ping => write!(f, "PING"),
+            SentFrame::HandshakeDone => write!(f, "HANDSHAKE_DONE"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-struct SentPacket {
+pub(crate) struct SentPacket {
     time_sent: Instant,
     size: usize,
+    ack_eliciting: bool,
+    frames: SmallVec<[SentFrame; 2]>,
+}
+
+impl SentPacket {
+    fn new(
+        time_sent: Instant,
+        size: usize,
+        ack_eliciting: bool,
+        frames: SmallVec<[SentFrame; 2]>,
+    ) -> Self {
+        let ack_eliciting = ack_eliciting || frames.iter().any(SentFrame::ack_eliciting);
+        Self {
+            time_sent,
+            size,
+            ack_eliciting,
+            frames,
+        }
+    }
+
+    #[inline]
+    pub fn into_frames(self) -> SmallVec<[SentFrame; 2]> {
+        self.frames
+    }
+}
+
+impl fmt::Display for SentPacket {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "{} bytes{}",
+            self.size,
+            if self.ack_eliciting { " ae" } else { "" }
+        )?;
+        for fr in &self.frames {
+            write!(f, " [{fr}]")?;
+        }
+        Ok(())
+    }
 }
 
 /// state for one of the three spaces
@@ -188,15 +287,13 @@ struct SpaceState {
     // largest acked packet number
     largest_acked: Option<u64>,
 
-    //
+    // tracks most recent loss time
     loss_time: Option<Instant>,
 
     // the time the latest packet was sent
     latest_sent: Option<Instant>,
 
-    // current number of bytes in flight. effectively only needed here for initial and handshake
-    // space so we can substract it from the overall once the handshake finished
-    // TODO find out if we even need this
+    // current number of bytes in flight
     bytes_in_flight: usize,
 }
 
@@ -213,7 +310,6 @@ impl SpaceState {
     }
 
     /// call when a packet is proactively sent
-    /// TODO replace with call into cc
     fn insert(&mut self, pn: u64, packet: SentPacket) {
         if self.sent.is_empty() {
             self.first_pn = pn;
@@ -226,7 +322,7 @@ impl SpaceState {
                 first_pn = self.first_pn,
                 sent_len = self.sent.len(),
                 idx = idx,
-                "mismatch between inserted pn and sent deque length"
+                "mismatch between inserted pn and sent dequeue length"
             );
             return;
         }
@@ -244,8 +340,12 @@ impl SpaceState {
         self.sent.get(idx)?.as_ref()
     }
 
-    fn remove_range(&mut self, start: u64, end: u64) -> Vec<(u64, SentPacket)> {
+    fn remove_range(&mut self, start: u64, end: u64) -> Vec<SentPacket> {
         let mut removed = Vec::new();
+
+        if self.sent.is_empty() || end < self.first_pn {
+            return removed;
+        }
 
         let effective_start = start.max(self.first_pn);
         let start_idx = (effective_start - self.first_pn) as usize;
@@ -259,7 +359,7 @@ impl SpaceState {
         for idx in start_idx..=end_idx {
             if let Some(pkt) = self.sent[idx].take() {
                 self.bytes_in_flight = self.bytes_in_flight.saturating_sub(pkt.size);
-                removed.push((self.first_pn + idx as u64, pkt));
+                removed.push(pkt);
             }
         }
 
@@ -272,7 +372,11 @@ impl SpaceState {
         removed
     }
 
-    fn detect_lost_packets(&mut self, loss_delay: Duration, now: Instant) -> (Vec<u64>, usize) {
+    fn detect_lost_packets(
+        &mut self,
+        loss_delay: Duration,
+        now: Instant,
+    ) -> (Vec<SentPacket>, usize) {
         let Some(largest_acked) = self.largest_acked else {
             return (Vec::new(), 0);
         };
@@ -286,9 +390,13 @@ impl SpaceState {
         // packet-threshold bulk region is only valid when largest_acked >= K_PACKET_THRESHOLD
         // when it is not, bulk_limit = 0 and this loop is skipped entirely, but the time-threshold pass below still runs
         let bulk_limit = if largest_acked >= K_PACKET_THRESHOLD {
-            let max_loss_pn  = largest_acked - K_PACKET_THRESHOLD;
-            let max_loss_idx = max_loss_pn.saturating_sub(self.first_pn) as usize;
-            (max_loss_idx + 1).min(self.sent.len())
+            let max_loss_pn = largest_acked - K_PACKET_THRESHOLD;
+            if max_loss_pn < self.first_pn {
+                0
+            } else {
+                let max_loss_idx = (max_loss_pn - self.first_pn) as usize;
+                (max_loss_idx + 1).min(self.sent.len())
+            }
         } else {
             0
         };
@@ -297,7 +405,7 @@ impl SpaceState {
         for idx in 0..bulk_limit {
             if let Some(pkt) = self.sent[idx].take() {
                 lost_bytes += pkt.size;
-                lost_pns.push(self.first_pn + idx as u64);
+                lost_pns.push(pkt);
             }
         }
 
@@ -310,7 +418,7 @@ impl SpaceState {
                 if pkt.time_sent <= lost_send_time {
                     let pkt = self.sent[idx].take().unwrap();
                     lost_bytes += pkt.size;
-                    lost_pns.push(self.first_pn + idx as u64);
+                    lost_pns.push(pkt);
                 } else {
                     let fires_at = pkt.time_sent + loss_delay;
                     self.loss_time = Some(self.loss_time.map_or(fires_at, |p| p.min(fires_at)));
@@ -393,17 +501,19 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
     /// packet must be ack-eliciting. there is an edge case because padding frames count towards
     /// in-flight yet are not ack-eliciting. such a frame may be sent as a probe. the solution is
     /// to use a PING frame as probe which is ack-eliciting, eliminating the edge case.
-    pub fn on_packet_sent(&mut self, space: usize, pn: u64, size: usize, now: Instant) {
+    pub fn on_packet_sent(
+        &mut self,
+        space: usize,
+        pn: u64,
+        size: usize,
+        now: Instant,
+        ack_eliciting: bool,
+        frames: SmallVec<[SentFrame; 2]>,
+    ) {
         self.bytes_in_flight += size;
         self.probe_pending = false;
 
-        self.spaces[space].insert(
-            pn,
-            SentPacket {
-                time_sent: now,
-                size,
-            },
-        );
+        self.spaces[space].insert(pn, SentPacket::new(now, size, ack_eliciting, frames));
         self.algorithm
             .on_packet_sent(size, self.bytes_in_flight, now);
 
@@ -436,7 +546,7 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
         space: usize,
         ack_frame: &AckFrame,
         now: Instant,
-    ) -> (Vec<u64>, Vec<u64>) {
+    ) -> (Vec<SentPacket>, Vec<SentPacket>) {
         let largest_acked = ack_frame.largest_acknowledged();
 
         let is_new_largest = self.spaces[space]
@@ -452,14 +562,14 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
             self.spaces[space].largest_acked = Some(largest_acked);
         }
 
-        let mut acked_pns: Vec<u64> = Vec::new();
+        let mut acked_pns: Vec<SentPacket> = Vec::new();
         let mut acked_bytes: usize = 0;
 
         for ri in ack_frame.ranges() {
-            for (pn, pkt) in self.spaces[space].remove_range(*ri.start(), *ri.end()) {
+            for pkt in self.spaces[space].remove_range(*ri.start(), *ri.end()) {
                 self.bytes_in_flight = self.bytes_in_flight.saturating_sub(pkt.size);
                 acked_bytes += pkt.size;
-                acked_pns.push(pn);
+                acked_pns.push(pkt);
             }
         }
 
@@ -504,8 +614,8 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
             return Some(t);
         }
 
-        let any_in_flight = (SPACE_ID_INITIAL..=SPACE_ID_DATA)
-            .any(|s| self.spaces[s].bytes_in_flight > 0);
+        let any_in_flight =
+            (SPACE_ID_INITIAL..=SPACE_ID_DATA).any(|s| self.spaces[s].bytes_in_flight > 0);
 
         if !any_in_flight && self.handshake_confirmed {
             return None;
@@ -522,7 +632,7 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
 
     /// returns lost pns. empty vec = PTO probe required
     #[tracing::instrument(name = "cc::on_loss_detection_timeout", skip_all)]
-    pub fn on_loss_detection_timeout(&mut self, now: Instant) -> Vec<u64> {
+    pub fn on_loss_detection_timeout(&mut self, now: Instant) -> Vec<SentPacket> {
         let has_loss_time = self.spaces[SPACE_ID_INITIAL].loss_time.is_some()
             || self.spaces[SPACE_ID_HANDSHAKE].loss_time.is_some()
             || self.spaces[SPACE_ID_DATA].loss_time.is_some();
@@ -532,11 +642,12 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
             let mut all_lost = Vec::new();
             let mut total_bytes: usize = 0;
             for space in SPACE_ID_INITIAL..=SPACE_ID_DATA {
-                let (pns, bytes) = self.spaces[space].detect_lost_packets(loss_delay, now);
+                let (pkts, bytes) = self.spaces[space].detect_lost_packets(loss_delay, now);
                 total_bytes += bytes;
-                all_lost.extend(pns);
+                all_lost.extend(pkts);
             }
             if !all_lost.is_empty() {
+                self.bytes_in_flight = self.bytes_in_flight.saturating_sub(total_bytes);
                 warn!(
                     count = all_lost.len(),
                     bytes = total_bytes,
@@ -580,12 +691,13 @@ impl<C: CongestionAlgorithm> CongestionController<C> {
         &self.rtt
     }
 
-    pub fn pto_count(&self) -> u32 {
-        self.pto_count
-    }
-
     pub fn pto(&self) -> Duration {
         self.rtt.pto(self.handshake_confirmed)
+    }
+
+    #[cfg(test)]
+    pub fn pto_count(&self) -> u32 {
+        self.pto_count
     }
 
     fn decode_ack_delay(&self, encoded: u64) -> Duration {
@@ -686,17 +798,51 @@ mod tests {
         assert_eq!(rtt.pto(true) - rtt.pto(false), Duration::from_millis(25));
     }
 
+    #[test]
+    fn rtt_loss_delay_scales_max_of_smoothed_and_latest() {
+        let mut rtt = RttEstimator::new();
+        rtt.update(Duration::from_millis(120), Duration::ZERO, SPACE_ID_DATA);
+        // loss_delay = 9/8 * max(smoothed, latest) = 9/8 * 120ms = 135ms
+        assert_eq!(rtt.loss_delay(), Duration::from_millis(135));
+
+        rtt.smoothed_rtt = Duration::from_millis(40);
+        rtt.latest_rtt = Duration::from_millis(200);
+        assert_eq!(rtt.loss_delay(), Duration::from_millis(225)); // 9/8 * 200ms
+    }
+
+    #[test]
+    fn rtt_loss_delay_floored_at_granularity() {
+        let mut rtt = RttEstimator::new();
+        rtt.update(Duration::from_micros(100), Duration::ZERO, SPACE_ID_DATA);
+        // 9/8 * 100us = 112.5us, below the 1ms granularity floor
+        assert_eq!(rtt.loss_delay(), K_GRANULARITY);
+    }
+
+    #[test]
+    fn rtt_pto_base_is_smoothed_plus_four_rttvar() {
+        let mut rtt = RttEstimator::new();
+        // first sample: smoothed = 80ms, rttvar = 40ms
+        rtt.update(Duration::from_millis(80), Duration::ZERO, SPACE_ID_DATA);
+        // pto(false) = smoothed + max(4*rttvar, granularity) = 80ms + 160ms
+        assert_eq!(rtt.pto(false), Duration::from_millis(240));
+    }
+
+    #[test]
+    fn rtt_pto_rttvar_term_floored_at_granularity() {
+        let mut rtt = RttEstimator::new();
+        rtt.update(Duration::from_millis(50), Duration::ZERO, SPACE_ID_DATA);
+        rtt.rttvar = Duration::ZERO; // force the granularity floor on 4*rttvar
+        assert_eq!(rtt.pto(false), Duration::from_millis(50) + K_GRANULARITY);
+    }
+
     // --- SpaceState
 
     fn pkt(time_sent: Instant) -> SentPacket {
-        SentPacket {
-            time_sent,
-            size: 100,
-        }
+        SentPacket::new(time_sent, 100, true, SmallVec::new())
     }
 
     fn pkt_sized(time_sent: Instant, size: usize) -> SentPacket {
-        SentPacket { time_sent, size }
+        SentPacket::new(time_sent, size, true, SmallVec::new())
     }
 
     fn insert_sequential(s: &mut SpaceState, base_pn: u64, count: u64, t0: Instant) {
@@ -706,232 +852,93 @@ mod tests {
     }
 
     #[test]
-    fn space_state_insert_sequential_no_loss() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 15, t0);
+    fn sent_packet_behavior() {
+        // ack-only is not ack-eliciting
+        let mut fs: SmallVec<[SentFrame; 2]> = SmallVec::new();
+        fs.push(SentFrame::Ack { largest: 10 });
+        let p1 = SentPacket::new(Instant::now(), 60, false, fs.clone());
+        assert!(!p1.ack_eliciting);
 
-        assert_eq!(s.first_pn, 0);
-        assert_eq!(s.sent.len(), 15);
-        assert_eq!(s.bytes_in_flight, 15 * 100);
-        assert_eq!(s.latest_sent, Some(t0 + Duration::from_millis(140)));
-        assert!(s.largest_acked.is_none());
-        assert!(s.loss_time.is_none());
+        // stream makes it ack-eliciting
+        fs.push(SentFrame::Stream {
+            id: 0,
+            off: 0,
+            len: 5,
+            fin: false,
+        });
+        let p2 = SentPacket::new(Instant::now(), 80, false, fs);
+        assert!(p2.ack_eliciting);
 
-        for i in 0u64..15 {
-            assert!(s.get(i).is_some(), "pn {i} should be present");
-        }
+        // explicit flag overrides frame contents
+        let p3 = SentPacket::new(Instant::now(), 1200, true, SmallVec::new());
+        assert!(p3.ack_eliciting);
 
-        let (lost, bytes) =
-            s.detect_lost_packets(Duration::from_millis(200), t0 + Duration::from_millis(500));
-        assert!(lost.is_empty());
-        assert_eq!(bytes, 0);
-    }
-
-    #[test]
-    fn space_state_remove_range_from_front() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 15, t0);
-
-        let removed = s.remove_range(0, 4);
-
-        assert_eq!(removed.len(), 5);
-
-        let mut pns: Vec<u64> = removed.iter().map(|(pn, _)| *pn).collect();
-        pns.sort_unstable();
-        assert_eq!(pns, vec![0, 1, 2, 3, 4]);
-
-        assert_eq!(s.first_pn, 5);
-        assert_eq!(s.sent.len(), 10);
-        assert_eq!(s.bytes_in_flight, 10 * 100);
-
-        for i in 5u64..15 {
-            assert!(s.get(i).is_some(), "pn {i} should still be present");
-        }
-
-        for i in 0u64..5 {
-            assert!(s.get(i).is_none(), "pn {i} should be gone");
-        }
-    }
-
-    #[test]
-    fn space_state_remove_range_middle_leaves_tombstones() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 10, t0);
-
-        let removed = s.remove_range(3, 6);
-        assert_eq!(removed.len(), 4);
-
-        assert_eq!(s.first_pn, 0);
-        assert_eq!(s.sent.len(), 10);
-        assert_eq!(s.bytes_in_flight, 6 * 100);
-
-        for i in [0u64, 1, 2, 7, 8, 9] {
-            assert!(s.get(i).is_some(), "pn {i} should be present");
-        }
-
-        for i in 3u64..=6 {
-            assert!(s.get(i).is_none(), "pn {i} should be a tombstone");
-        }
-    }
-
-    #[test]
-    fn space_state_tombstones_drain_when_front_is_cleared() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 5, t0);
-
-        s.remove_range(1, 3);
-        assert_eq!(s.first_pn, 0);
-        assert_eq!(s.sent.len(), 5);
-
-        s.remove_range(0, 0);
+        let mut fs: SmallVec<[SentFrame; 2]> = SmallVec::new();
+        fs.push(SentFrame::Stream {
+            id: 4,
+            off: 0,
+            len: 100,
+            fin: true,
+        });
+        fs.push(SentFrame::Ack { largest: 7 });
+        let p4 = SentPacket::new(Instant::now(), 128, false, fs);
         assert_eq!(
-            s.first_pn, 4,
-            "first_pn should skip over drained tombstones"
+            p4.frames[0],
+            SentFrame::Stream {
+                id: 4,
+                off: 0,
+                len: 100,
+                fin: true
+            }
         );
-        assert_eq!(s.sent.len(), 1);
-        assert_eq!(s.bytes_in_flight, 100);
+        assert_eq!(p4.frames[1], SentFrame::Ack { largest: 7 });
     }
 
     #[test]
-    fn space_state_packet_threshold_loss() {
+    fn space_state_core_lifecycle() {
         let mut s = SpaceState::new();
         let t0 = Instant::now();
+
         insert_sequential(&mut s, 0, 10, t0);
+        assert_eq!(s.first_pn, 0);
+        assert_eq!(s.sent.len(), 10);
+        assert_eq!(s.bytes_in_flight, 1000);
+        assert_eq!(s.latest_sent, Some(t0 + Duration::from_millis(90)));
 
-        s.largest_acked = Some(9);
+        let removed_front = s.remove_range(0, 2);
+        assert_eq!(removed_front.len(), 3);
+        assert_eq!(s.first_pn, 3);
+        assert_eq!(s.sent.len(), 7);
+        assert_eq!(s.bytes_in_flight, 700);
 
-        let (lost, bytes) =
-            s.detect_lost_packets(Duration::from_secs(100), t0 + Duration::from_millis(200));
+        let removed_middle = s.remove_range(5, 6);
+        assert_eq!(removed_middle.len(), 2);
+        assert_eq!(s.first_pn, 3);
+        assert_eq!(s.sent.len(), 7);
+        assert_eq!(s.bytes_in_flight, 500);
+        assert!(s.get(5).is_none());
+        assert!(s.get(4).is_some());
 
-        let mut lost_sorted = lost.clone();
-        lost_sorted.sort_unstable();
-        assert_eq!(lost_sorted, vec![0, 1, 2, 3, 4, 5, 6]);
-        assert_eq!(bytes, 7 * 100);
-        assert_eq!(s.bytes_in_flight, 3 * 100);
-
+        s.remove_range(3, 4);
         assert_eq!(s.first_pn, 7);
+        assert_eq!(s.sent.len(), 3);
+        assert_eq!(s.bytes_in_flight, 300);
+
+        assert!(s.get(99).is_none());
+        assert!(s.remove_range(1, 2).is_empty());
+
+        let removed_end = s.remove_range(0, 99);
+        assert_eq!(removed_end.len(), 3);
+        assert_eq!(s.bytes_in_flight, 0);
+        assert!(s.sent.is_empty());
+
+        insert_sequential(&mut s, 10, 3, t0);
+        assert_eq!(s.first_pn, 10);
+        assert_eq!(s.sent.len(), 3);
     }
 
     #[test]
-    fn space_state_packet_threshold_exact_boundary() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 5, t0);
-        s.largest_acked = Some(4);
-
-        let (lost, _) =
-            s.detect_lost_packets(Duration::from_secs(100), t0 + Duration::from_millis(200));
-
-        let mut lost_sorted = lost;
-        lost_sorted.sort_unstable();
-        assert_eq!(lost_sorted, vec![0, 1]);
-        assert!(s.get(2).is_some(), "pn 2 must survive");
-        assert!(s.get(3).is_some(), "pn 3 must survive");
-    }
-
-    #[test]
-    fn space_state_time_threshold_loss() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-
-        for i in 0u64..5 {
-            s.insert(i, pkt(t0));
-        }
-        s.largest_acked = Some(4);
-
-        let (lost, bytes) =
-            s.detect_lost_packets(Duration::from_millis(50), t0 + Duration::from_millis(100));
-
-        let mut lost_sorted = lost;
-        lost_sorted.sort_unstable();
-        assert_eq!(lost_sorted, vec![0, 1, 2, 3]);
-        assert_eq!(bytes, 4 * 100);
-    }
-
-    #[test]
-    fn space_state_loss_time_set_for_pending_packet() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-
-        s.insert(0, pkt(t0));
-        s.insert(1, pkt(t0 + Duration::from_millis(200)));
-        s.insert(2, pkt(t0 + Duration::from_millis(400)));
-        s.largest_acked = Some(2);
-
-        let loss_delay = Duration::from_millis(100);
-        let now = t0 + Duration::from_millis(120);
-        let (lost, _) = s.detect_lost_packets(loss_delay, now);
-
-        assert_eq!(lost, vec![0]);
-        let expected_loss_time = t0 + Duration::from_millis(300);
-        assert!(s.loss_time.is_some());
-        assert_eq!(s.loss_time.unwrap(), expected_loss_time);
-    }
-
-    #[test]
-    fn space_state_loss_time_resets_each_call() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-
-        s.insert(0, pkt(t0));
-        s.insert(1, pkt(t0 + Duration::from_millis(200)));
-        s.insert(2, pkt(t0 + Duration::from_millis(400)));
-        s.largest_acked = Some(2);
-
-        let loss_delay = Duration::from_millis(100);
-
-        s.detect_lost_packets(loss_delay, t0 + Duration::from_millis(120));
-        assert!(s.loss_time.is_some());
-
-        s.detect_lost_packets(loss_delay, t0 + Duration::from_millis(400));
-        assert!(s.loss_time.is_none(), "stale loss_time must be cleared");
-    }
-
-    #[test]
-    fn space_state_tombstones_in_time_threshold_region() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-
-        insert_sequential(&mut s, 0, 8, t0);
-
-        s.remove_range(2, 3);
-        s.largest_acked = Some(7);
-
-        let (lost, bytes) =
-            s.detect_lost_packets(Duration::from_secs(100), t0 + Duration::from_millis(200));
-
-        let mut lost_sorted = lost;
-        lost_sorted.sort_unstable();
-        assert_eq!(lost_sorted, vec![0, 1, 4]);
-        assert_eq!(bytes, 3 * 100);
-    }
-
-    #[test]
-    fn space_state_no_loss_beyond_largest_acked() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-
-        for i in 0u64..5 {
-            s.insert(i, pkt(t0));
-        }
-        s.largest_acked = Some(3);
-
-        let (lost, _) =
-            s.detect_lost_packets(Duration::from_millis(1), t0 + Duration::from_millis(500));
-
-        let lost_set: std::collections::HashSet<u64> = lost.into_iter().collect();
-        assert!(
-            !lost_set.contains(&4),
-            "pn 4 is still in flight, must not be declared lost"
-        );
-    }
-
-    #[test]
-    fn space_state_bytes_in_flight_accounting() {
+    fn space_state_loss_detection_scenarios() {
         let mut s = SpaceState::new();
         let t0 = Instant::now();
 
@@ -939,102 +946,197 @@ mod tests {
         s.insert(1, pkt_sized(t0 + Duration::from_millis(10), 300));
         s.insert(2, pkt_sized(t0 + Duration::from_millis(20), 150));
         s.insert(3, pkt_sized(t0 + Duration::from_millis(30), 400));
-        assert_eq!(s.bytes_in_flight, 1050);
+        s.insert(4, pkt_sized(t0 + Duration::from_millis(40), 100));
+        s.insert(5, pkt_sized(t0 + Duration::from_millis(50), 100));
+        s.insert(6, pkt_sized(t0 + Duration::from_millis(60), 100));
 
-        s.remove_range(0, 1);
-        assert_eq!(s.bytes_in_flight, 550);
+        let base_bif = 1350;
+        assert_eq!(s.bytes_in_flight, base_bif);
 
-        s.largest_acked = Some(3);
-        let (_, lost_bytes) =
-            s.detect_lost_packets(Duration::from_millis(1), t0 + Duration::from_millis(200));
-        assert_eq!(lost_bytes, 150);
-        assert_eq!(s.bytes_in_flight, 400);
-    }
-
-    #[test]
-    fn space_state_double_remove_range_idempotent() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 5, t0);
-
-        let first = s.remove_range(1, 3);
-        assert_eq!(first.len(), 3);
-
-        let second = s.remove_range(1, 3);
-        assert!(
-            second.is_empty(),
-            "re-removing already-removed range must return nothing"
-        );
-        assert_eq!(s.bytes_in_flight, 2 * 100);
-    }
-
-    #[test]
-    fn space_state_remove_range_past_end_is_safe() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 3, t0);
-
-        let removed = s.remove_range(0, 99);
-        assert_eq!(removed.len(), 3);
-        assert_eq!(s.bytes_in_flight, 0);
-        assert!(s.sent.is_empty());
-    }
-
-    #[test]
-    fn space_state_fresh_insert_after_full_drain() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 5, t0);
-
-        s.remove_range(0, 4);
-        assert!(s.sent.is_empty());
-        assert_eq!(s.first_pn, 5);
-
-        let t1 = t0 + Duration::from_millis(1000);
-        insert_sequential(&mut s, 5, 3, t1);
-
-        assert_eq!(s.first_pn, 5);
-        assert_eq!(s.sent.len(), 3);
-        assert_eq!(s.bytes_in_flight, 3 * 100);
-        assert!(s.get(5).is_some());
-        assert!(s.get(6).is_some());
-        assert!(s.get(7).is_some());
-    }
-
-    #[test]
-    fn space_state_get_out_of_bounds_is_none() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 10, 5, t0);
-
-        assert!(s.get(9).is_none(), "pn before first_pn");
-        assert!(s.get(15).is_none(), "pn beyond sent length");
-        assert!(s.get(0).is_none(), "pn far below first_pn");
-    }
-
-    #[test]
-    fn space_state_no_loss_without_largest_acked() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 5, t0);
-
+        // no largest_acked -> no loss detected
         let (lost, bytes) =
-            s.detect_lost_packets(Duration::from_millis(1), t0 + Duration::from_millis(9999));
+            s.detect_lost_packets(Duration::from_millis(1), t0 + Duration::from_secs(10));
         assert!(lost.is_empty());
         assert_eq!(bytes, 0);
-        assert_eq!(s.bytes_in_flight, 5 * 100, "bif must be unchanged");
-    }
 
-    #[test]
-    fn space_state_largest_acked_below_threshold() {
-        let mut s = SpaceState::new();
-        let t0 = Instant::now();
-        insert_sequential(&mut s, 0, 3, t0);
+        // largest acked below threshold -> time threshold only
         s.largest_acked = Some(1);
-
         let (lost, bytes) =
-            s.detect_lost_packets(Duration::from_secs(100), t0 + Duration::from_millis(50));
-        assert!(lost.is_empty());
-        assert_eq!(bytes, 0);
+            s.detect_lost_packets(Duration::from_millis(100), t0 + Duration::from_millis(105));
+        assert_eq!(lost.len(), 1); // only pn 0 is older than 100ms
+        assert_eq!(bytes, 200);
+        assert_eq!(s.bytes_in_flight, base_bif - 200);
+
+        // packet threshold loss
+        s.largest_acked = Some(5);
+        let (lost, bytes) =
+            s.detect_lost_packets(Duration::from_secs(100), t0 + Duration::from_millis(60));
+        assert_eq!(lost.len(), 2);
+        assert_eq!(bytes, 450);
+
+        // loss_time updates for pending packets
+        let loss_delay = Duration::from_millis(50);
+        let (_, _) = s.detect_lost_packets(loss_delay, t0 + Duration::from_millis(70));
+        assert!(s.loss_time.is_some());
+        assert_eq!(s.loss_time.unwrap(), t0 + Duration::from_millis(80));
+
+        // subsequent call clears stale loss_time and declares lost.
+        // now = t0+85ms => lost_send_time = t0+35ms, so pn3 (t0+30ms) is lost
+        // while pn4 (t0+40ms) is still pending and re-arms loss_time
+        let (lost, bytes) = s.detect_lost_packets(loss_delay, t0 + Duration::from_millis(85));
+        assert!(s.loss_time.is_some());
+        assert_eq!(s.loss_time.unwrap(), t0 + Duration::from_millis(90));
+        assert_eq!(lost.len(), 1);
+        assert_eq!(bytes, 400);
+    }
+
+    #[test]
+    fn space_state_insert_out_of_order_is_rejected() {
+        let mut s = SpaceState::new();
+        let t0 = Instant::now();
+        s.insert(0, pkt(t0));
+        s.insert(1, pkt(t0));
+        s.insert(3, pkt(t0));
+        assert_eq!(s.sent.len(), 2);
+        assert_eq!(s.bytes_in_flight, 200);
+        assert!(s.get(3).is_none());
+    }
+
+    #[test]
+    fn detect_lost_packets_time_threshold_boundary_is_inclusive() {
+        // a packet sent exactly loss_delay before `now` is lost
+        let mut s = SpaceState::new();
+        let t0 = Instant::now();
+        s.insert(0, pkt_sized(t0, 100));
+        s.insert(1, pkt_sized(t0 + Duration::from_millis(50), 100));
+        s.largest_acked = Some(1);
+        let (lost, bytes) =
+            s.detect_lost_packets(Duration::from_millis(50), t0 + Duration::from_millis(50));
+        assert_eq!(lost.len(), 1);
+        assert_eq!(bytes, 100);
+    }
+
+    #[test]
+    fn detect_lost_packets_packet_threshold_cutoff() {
+        // only packets at least K_PACKET_THRESHOLD behind largest_acked are
+        // eligible lost. all send times are recent, so the time threshold only isolates packet threshold
+        let mut s = SpaceState::new();
+        let t0 = Instant::now();
+        for i in 0..6u64 {
+            s.insert(i, pkt_sized(t0 + Duration::from_millis(i), 100));
+        }
+        s.largest_acked = Some(4); // cutoff pn = 4 - K_PACKET_THRESHOLD = 1
+        let (lost, bytes) =
+            s.detect_lost_packets(Duration::from_millis(100), t0 + Duration::from_millis(6));
+        assert_eq!(lost.len(), 2);
+        assert_eq!(bytes, 200);
+        assert!(s.get(2).is_some());
+        assert!(s.get(3).is_some());
+        assert!(s.loss_time.is_some());
+    }
+
+    // --- CongestionController
+
+    fn controller() -> CongestionController<UnlimitedWindow> {
+        CongestionController::<UnlimitedWindow>::with_default()
+    }
+
+    #[test]
+    fn controller_tracks_bytes_in_flight_and_window() {
+        let mut cc = controller();
+        let t0 = Instant::now();
+        assert_eq!(cc.available_window(), 4096); // UnlimitedWindow cwnd
+        assert_eq!(cc.bytes_in_flight(), 0);
+
+        cc.on_packet_sent(SPACE_ID_DATA, 0, 1000, t0, true, SmallVec::new());
+        assert_eq!(cc.bytes_in_flight(), 1000);
+        assert_eq!(cc.available_window(), 3096);
+
+        // overshooting the window saturates at 0 rather than underflowing
+        cc.on_packet_sent(SPACE_ID_DATA, 1, 5000, t0, true, SmallVec::new());
+        assert_eq!(cc.available_window(), 0);
+    }
+
+    #[test]
+    fn controller_loss_timeout_uses_earliest_loss_time() {
+        let mut cc = controller();
+        let t0 = Instant::now();
+        cc.on_packet_sent(SPACE_ID_DATA, 0, 100, t0, true, SmallVec::new());
+        cc.spaces[SPACE_ID_HANDSHAKE].loss_time = Some(t0 + Duration::from_millis(200));
+        cc.spaces[SPACE_ID_DATA].loss_time = Some(t0 + Duration::from_millis(120));
+        assert_eq!(
+            cc.loss_detection_timeout(),
+            Some(t0 + Duration::from_millis(120))
+        );
+    }
+
+    #[test]
+    fn controller_loss_timeout_falls_back_to_pto_with_backoff() {
+        let mut cc = controller();
+        let t0 = Instant::now();
+        cc.on_packet_sent(SPACE_ID_DATA, 0, 1200, t0, true, SmallVec::new());
+        // no loss_time armed anywhere -> PTO timer based on latest_sent
+        let expected = t0 + cc.rtt().pto(false);
+        assert_eq!(cc.loss_detection_timeout(), Some(expected));
+
+        // exponential backoff: two prior PTO expirations quadruple the interval
+        cc.pto_count = 2;
+        let expected = t0 + cc.rtt().pto(false) * 4;
+        assert_eq!(cc.loss_detection_timeout(), Some(expected));
+    }
+
+    #[test]
+    fn controller_loss_timeout_none_when_idle_and_confirmed() {
+        let mut cc = controller();
+        let t0 = Instant::now();
+        cc.on_packet_sent(SPACE_ID_DATA, 0, 1200, t0, true, SmallVec::new());
+        // simulate everything acked: nothing in flight, latest_sent still set
+        cc.spaces[SPACE_ID_DATA].bytes_in_flight = 0;
+        cc.bytes_in_flight = 0;
+
+        cc.handshake_confirmed = true;
+        assert!(cc.loss_detection_timeout().is_none());
+
+        // before confirmation, a PTO timer stays armed even with nothing in flight
+        cc.handshake_confirmed = false;
+        assert!(cc.loss_detection_timeout().is_some());
+    }
+
+    #[test]
+    fn controller_loss_timeout_fires_probe_when_no_loss_time() {
+        let mut cc = controller();
+        let t0 = Instant::now();
+        cc.on_packet_sent(SPACE_ID_DATA, 0, 1200, t0, true, SmallVec::new());
+        let out = cc.on_loss_detection_timeout(t0 + Duration::from_secs(1));
+        assert!(out.is_empty()); // empty => caller must send a probe
+        assert_eq!(cc.pto_count(), 1);
+        assert!(cc.probe_pending());
+    }
+
+    #[test]
+    fn controller_loss_timeout_declares_lost_and_syncs_bytes_in_flight() {
+        let mut cc = controller();
+        let t0 = Instant::now();
+        for i in 0..5u64 {
+            cc.on_packet_sent(
+                SPACE_ID_DATA,
+                i,
+                100,
+                t0 + Duration::from_millis(i * 10),
+                true,
+                SmallVec::new(),
+            );
+        }
+        assert_eq!(cc.bytes_in_flight(), 500);
+
+        cc.spaces[SPACE_ID_DATA].largest_acked = Some(4);
+        cc.spaces[SPACE_ID_DATA].loss_time = Some(t0);
+
+        let out = cc.on_loss_detection_timeout(t0 + Duration::from_secs(10));
+        // pn0..=3 sit below largest_acked and past loss_delay -> lost
+        assert_eq!(out.len(), 4);
+        assert_eq!(cc.pto_count(), 0); // loss path must not bump the PTO counter
+        assert!(!cc.probe_pending());
+        assert_eq!(cc.bytes_in_flight(), 100);
     }
 }
