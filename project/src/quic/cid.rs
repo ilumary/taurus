@@ -22,8 +22,9 @@ const ISSUED_CID_LEN: usize = 0x08;
 const ROTATE_AFTER: Duration = Duration::from_secs(5 * 60);
 const ROTATE_AFTER_BYTES: u64 = 16 * 1024 * 1024;
 
-const MAX_CID_RETIREMENTS_IN_FLIGHT: usize = 0x04;
-const MAX_NEW_CIDS_IN_FLIGHT: usize = 0x04;
+/// inflight limits
+const MAX_CID_RETIREMENTS_IN_FLIGHT: u64 = 0x04;
+const MAX_NEW_CIDS_IN_FLIGHT: u64 = 0x04;
 
 #[derive(Copy, Clone, Default)]
 pub struct Id {
@@ -173,6 +174,12 @@ pub struct ConnectionIdManager {
     pending_retire: VecDeque<u64>,
     // scid sqns awaiting a NEW_CONNECTION_ID retransmit
     pending_new: SmallVec<[u64; 4]>,
+
+    // NEW_CONNECTION_ID frames in flight
+    nc_inflight: u64,
+
+    // RETIRE_CONNECTION_ID frames in flight
+    rc_inflight: u64,
 }
 
 impl ConnectionIdManager {
@@ -216,6 +223,8 @@ impl ConnectionIdManager {
             immediate: false,
             pending_retire: VecDeque::new(),
             pending_new: SmallVec::new(),
+            nc_inflight: 0,
+            rc_inflight: 0,
         }
     }
 
@@ -275,6 +284,11 @@ impl ConnectionIdManager {
     #[inline]
     pub fn retry_scid(&self) -> Option<&Id> {
         self.retry_scid.as_ref()
+    }
+
+    #[inline]
+    pub fn original_dcid(&self) -> Option<&Id> {
+        self.original_dcid.as_ref()
     }
 
     #[inline]
@@ -452,7 +466,9 @@ impl ConnectionIdManager {
     pub fn next_new_cid_len(&self, now: Instant) -> usize {
         let sqn = match self.pending_new.last() {
             Some(&sqn) => sqn,
-            None if self.should_issue_cid(now) => self.scid_base + self.scids.len() as u64,
+            None if self.nc_inflight < MAX_NEW_CIDS_IN_FLIGHT && self.should_issue_cid(now) => {
+                self.scid_base + self.scids.len() as u64
+            }
             None => return 0,
         };
 
@@ -510,8 +526,8 @@ impl ConnectionIdManager {
     #[inline]
     pub fn next_retire_cid_len(&self) -> usize {
         match self.pending_retire.front() {
-            Some(&sqn) => 1 + varint_len(sqn),
-            None => 0,
+            Some(&sqn) if self.rc_inflight < MAX_CID_RETIREMENTS_IN_FLIGHT => 1 + varint_len(sqn),
+            _ => 0,
         }
     }
 
@@ -542,6 +558,26 @@ impl ConnectionIdManager {
         if !self.pending_new.contains(&sqn) {
             self.pending_new.push(sqn);
         }
+    }
+
+    #[inline]
+    pub fn ack_new_connection_id_frame(&mut self) {
+        self.nc_inflight = self.nc_inflight.saturating_sub(1);
+    }
+
+    #[inline]
+    pub fn ack_retire_connection_id_frame(&mut self) {
+        self.rc_inflight = self.rc_inflight.saturating_sub(1);
+    }
+
+    #[inline]
+    pub fn add_new_connection_id_frame(&mut self) {
+        self.nc_inflight += 1;
+    }
+
+    #[inline]
+    pub fn add_retire_connection_id_frame(&mut self) {
+        self.rc_inflight += 1;
     }
 
     pub fn on_retire_cid_lost(&mut self, sqn: u64) {

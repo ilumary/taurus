@@ -44,24 +44,6 @@ GSO/GRO are opt-in and off by default. Enabling gro on a kernel older than 5.0 i
 > **Note**
 > Windows is not supported.
 
-## Testing
-
-Most of QUIC's key features in my implementation are split into logical domains, each in their own module. These include, but are not limited to, connection ids, socket io, streams, packet header functions, transport parameters, congestion control, and flow control. Each functional module is tested extensively through unit tests to ensure it complies with the standard. Run them via:
-
-```bash
-$ cd taurus/project/ && cargo test
-```
-
-## Documentation
-
-I am currently working on an extensive documentation for the whole API and important code parts including examples. You can acces the documentation via:
-
-```bash
-$ cd taurus/project/ && cargo build && cargo doc
-```
-
-There are numerous decisions I made to ensure the library runs as fast as possible on both a mac and on various unix systems. I have decided to document them in ARCHITECTURE.md.
-
 ## Extensions
 
 Once the basic QUIC spec is implemented and taurus fully complies with [RFC 9000](https://datatracker.ietf.org/doc/rfc9000), [RFC 9001](https://datatracker.ietf.org/doc/rfc9001), [RFC 9002](https://datatracker.ietf.org/doc/rfc9002), and [RFC 8999](https://datatracker.ietf.org/doc/rfc8999), the following extensions are planned:
@@ -73,10 +55,6 @@ Once the basic QUIC spec is implemented and taurus fully complies with [RFC 9000
 * QUIC ACK Frequency, [draft](https://datatracker.ietf.org/doc/draft-ietf-quic-ack-frequency/)
 * QUIC multipath [draft](https://datatracker.ietf.org/doc/draft-ietf-quic-multipath/)
 * QUIC BDP frames [draft](https://datatracker.ietf.org/doc/draft-kuhn-quic-bdpframe-extension/)
-
-## Contributing
-
-Feel free to open a <a href="https://github.com/ilumary/taurus/pulls">pull request</a> or report an <a href="https://github.com/ilumary/taurus/issues">issue</a>. All contributions are welcome!
 
 ## Build
 
@@ -119,6 +97,28 @@ You can find both a [`server`](./project/examples/server.rs) and a [`client`](./
 ```
 
 You may also use an external QUIC implementation as Client. I recommend [quinn](https://github.com/quinn-rs/quinn).
+
+## Testing
+
+Most of QUIC's key features in my implementation are split into logical domains, each in their own module. These include, but are not limited to, connection ids, socket io, streams, packet header functions, transport parameters, congestion control, and flow control. Each functional module is tested extensively through unit tests to ensure it complies with the standard. Run them via:
+
+```bash
+$ cd taurus/project/ && cargo test
+```
+
+## Documentation
+
+I am currently working on an extensive documentation for the whole API and important code parts including examples. You can acces the documentation via:
+
+```bash
+$ cd taurus/project/ && cargo build && cargo doc
+```
+
+There are numerous decisions I made to ensure the library runs as fast as possible on both a mac and on various unix systems. I have decided to document them in ARCHITECTURE.md.
+
+## Contributing
+
+Feel free to open a <a href="https://github.com/ilumary/taurus/pulls">pull request</a> or report an <a href="https://github.com/ilumary/taurus/issues">issue</a>. All contributions are welcome!
 
 ## Collaborators
 

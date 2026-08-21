@@ -9,19 +9,27 @@ use crate::{
 };
 
 trait IOHandler<T> {
-    fn encode(value: &T, buf: &mut OctetsMut) -> Result<(), octets::BufferTooShortError>;
-    fn decode(buf: &mut Octets) -> Result<T, octets::BufferTooShortError>;
+    fn encode(value: &T, buf: &mut OctetsMut) -> Result<(), terror::Error>;
+    fn decode(buf: &mut Octets) -> Result<T, terror::Error>;
 }
 
 impl IOHandler<Id> for Id {
-    fn encode(value: &Id, buf: &mut OctetsMut) -> Result<(), octets::BufferTooShortError> {
+    fn encode(value: &Id, buf: &mut OctetsMut) -> Result<(), terror::Error> {
         buf.put_varint(value.len() as u64)?;
         buf.put_bytes(value.as_slice())?;
         Ok(())
     }
 
-    fn decode(buf: &mut Octets) -> Result<Id, octets::BufferTooShortError> {
+    fn decode(buf: &mut Octets) -> Result<Id, terror::Error> {
         let length = buf.get_varint()?;
+
+        if length > MAX_CID_SIZE as u64 {
+            return Err(terror::Error::quic_transport_error(
+                "connection id longer than 20 bytes",
+                terror::QuicTransportError::TransportParameterError,
+            ));
+        }
+
         Ok(Id::from_slice(
             buf.get_bytes(length.try_into().unwrap())?.as_ref(),
         ))
@@ -46,14 +54,14 @@ impl From<u64> for VarInt {
 }
 
 impl IOHandler<VarInt> for VarInt {
-    fn encode(value: &VarInt, buf: &mut OctetsMut) -> Result<(), octets::BufferTooShortError> {
+    fn encode(value: &VarInt, buf: &mut OctetsMut) -> Result<(), terror::Error> {
         let length = varint_len(value.value) as u64;
         buf.put_varint(length)?;
         buf.put_varint(value.value)?;
         Ok(())
     }
 
-    fn decode(buf: &mut Octets) -> Result<VarInt, octets::BufferTooShortError> {
+    fn decode(buf: &mut Octets) -> Result<VarInt, terror::Error> {
         let _ = buf.get_varint()?;
         Ok(Self {
             value: buf.get_varint()?,
@@ -62,24 +70,22 @@ impl IOHandler<VarInt> for VarInt {
 }
 
 impl IOHandler<StatelessResetToken> for StatelessResetToken {
-    fn encode(
-        token: &StatelessResetToken,
-        buf: &mut OctetsMut,
-    ) -> Result<(), octets::BufferTooShortError> {
-        //stateless_reset_token is always 16 bytes long
+    fn encode(token: &StatelessResetToken, buf: &mut OctetsMut) -> Result<(), terror::Error> {
+        // stateless_reset_token is always 16 bytes long
         buf.put_varint(0x10)?;
         buf.put_bytes(&token.token)?;
         Ok(())
     }
 
-    fn decode(buf: &mut Octets) -> Result<StatelessResetToken, octets::BufferTooShortError> {
+    fn decode(buf: &mut Octets) -> Result<StatelessResetToken, terror::Error> {
         let length = buf.get_varint()?;
-        if length == 16 {
-            return Ok(StatelessResetToken::from(
-                buf.get_bytes(length.try_into().unwrap())?.to_vec(),
+        if length != 16 {
+            return Err(terror::Error::quic_transport_error(
+                "stateless reset token must be 16 bytes",
+                terror::QuicTransportError::TransportParameterError,
             ));
         }
-        Err(octets::BufferTooShortError)
+        Ok(StatelessResetToken::from(buf.get_bytes(16)?.to_vec()))
     }
 }
 
@@ -107,14 +113,11 @@ impl PreferredAddressData {
 }
 
 impl IOHandler<PreferredAddressData> for PreferredAddressData {
-    fn decode(_buf: &mut Octets) -> Result<PreferredAddressData, octets::BufferTooShortError> {
+    fn decode(_buf: &mut Octets) -> Result<PreferredAddressData, terror::Error> {
         todo!()
     }
 
-    fn encode(
-        pa: &PreferredAddressData,
-        buf: &mut OctetsMut,
-    ) -> Result<(), octets::BufferTooShortError> {
+    fn encode(pa: &PreferredAddressData, buf: &mut OctetsMut) -> Result<(), terror::Error> {
         buf.put_varint(0x000d)?;
         buf.put_varint(pa.len() as u64)?;
 
@@ -146,11 +149,22 @@ trait TransportParameter: Sized {
 
     type ValueType;
 
+    fn const_id(&self) -> usize {
+        Self::ID
+    }
+
     fn get_value(&self) -> &Self::ValueType;
 
     fn decode(buf: &mut Octets) -> Result<Self, terror::Error>;
 
     fn encode(&self, buf: &mut OctetsMut) -> Result<(), terror::Error>;
+
+    fn encode_value(&self, buf: &mut OctetsMut) -> Result<(), terror::Error>
+    where
+        Self::ValueType: IOHandler<Self::ValueType>,
+    {
+        <Self::ValueType as IOHandler<Self::ValueType>>::encode(self.get_value(), buf)
+    }
 }
 
 macro_rules! transport_parameter {
@@ -271,7 +285,7 @@ transport_parameter!(OriginalDestinationConnectionId, 0x00, Id);
 
 impl OriginalDestinationConnectionId {
     fn validate(self) -> Result<Self, terror::Error> {
-        if self.value.len() > MAX_CID_SIZE && self.value.len() > 0 {
+        if self.value.is_empty() {
             return Err(terror::Error::quic_transport_error(
                 "malformed, badly formatted or absent original destination connection id",
                 terror::QuicTransportError::TransportParameterError,
@@ -440,7 +454,7 @@ transport_parameter!(InitialSourceConnectionId, 0x0f, Id);
 
 impl InitialSourceConnectionId {
     fn validate(self) -> Result<Self, terror::Error> {
-        if self.value.len() > MAX_CID_SIZE && !self.value.is_empty() {
+        if self.value.is_empty() {
             return Err(terror::Error::quic_transport_error(
                 "malformed, badly formatted or absent initial source connection id",
                 terror::QuicTransportError::TransportParameterError,
@@ -454,7 +468,7 @@ transport_parameter!(RetrySourceConnectionId, 0x10, Id);
 
 impl RetrySourceConnectionId {
     fn validate(self) -> Result<Self, terror::Error> {
-        if self.value.len() > MAX_CID_SIZE && !self.value.is_empty() {
+        if self.value.is_empty() {
             return Err(terror::Error::quic_transport_error(
                 "malformed, badly formatted or absent retry source connection id",
                 terror::QuicTransportError::TransportParameterError,
@@ -483,13 +497,24 @@ impl MinAckDelay {
     }
 }*/
 
+fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), terror::Error> {
+    if slot.is_some() {
+        return Err(terror::Error::quic_transport_error(
+            "duplicate transport parameter",
+            terror::QuicTransportError::TransportParameterError,
+        ));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
 //RFC 9000 Section 18.2
 //TODO expand to RFC 9287 & draft-ietf-quic-ack-frequency
 #[derive(Default)]
 pub struct TransportConfig {
-    pub original_destination_connection_id: OriginalDestinationConnectionId,
+    pub original_destination_connection_id: Option<OriginalDestinationConnectionId>,
     pub max_idle_timeout: MaxIdleTimeout,
-    pub stateless_reset_token: StatelessResetTokenTP,
+    pub stateless_reset_token: Option<StatelessResetTokenTP>,
     pub max_udp_payload_size: MaxUdpPayloadSize,
     pub initial_max_data: InitialMaxData,
     pub initial_max_stream_data_bidi_local: InitialMaxStreamDataBidiLocal,
@@ -500,11 +525,10 @@ pub struct TransportConfig {
     pub ack_delay_exponent: AckDelayExponent,
     pub max_ack_delay: MaxAckDelay,
     pub disable_active_migration: DisableActiveMigration,
-    pub preferred_address: PreferredAddress,
+    pub preferred_address: Option<PreferredAddress>,
     pub active_connection_id_limit: ActiveConnectionIdLimit,
-    pub initial_source_connection_id: InitialSourceConnectionId,
-    pub retry_source_connection_id: RetrySourceConnectionId,
-
+    pub initial_source_connection_id: Option<InitialSourceConnectionId>,
+    pub retry_source_connection_id: Option<RetrySourceConnectionId>,
     //Params outside of RFC 9000
     //pub grease: Grease,
     //pub max_datagram_frame_size: MaxDatagramFrameSize,
@@ -523,12 +547,15 @@ impl TransportConfig {
         let mut b = octets::Octets::with_slice(buf);
         while let Ok(id) = b.get_varint() {
             match id {
-                0x00 => {
-                    self.original_destination_connection_id =
-                        OriginalDestinationConnectionId::decode(&mut b)?
-                }
+                0x00 => set_once(
+                    &mut self.original_destination_connection_id,
+                    OriginalDestinationConnectionId::decode(&mut b)?,
+                )?,
                 0x0001 => self.max_idle_timeout = MaxIdleTimeout::decode(&mut b)?,
-                0x0002 => self.stateless_reset_token = StatelessResetTokenTP::decode(&mut b)?,
+                0x0002 => set_once(
+                    &mut self.stateless_reset_token,
+                    StatelessResetTokenTP::decode(&mut b)?,
+                )?,
                 0x0003 => self.max_udp_payload_size = MaxUdpPayloadSize::decode(&mut b)?,
                 0x0004 => self.initial_max_data = InitialMaxData::decode(&mut b)?,
                 0x0005 => {
@@ -547,15 +574,21 @@ impl TransportConfig {
                 0x000a => self.ack_delay_exponent = AckDelayExponent::decode(&mut b)?,
                 0x000b => self.max_ack_delay = MaxAckDelay::decode(&mut b)?,
                 0x000c => self.disable_active_migration = DisableActiveMigration::decode(&mut b)?,
+                0x000d => set_once(
+                    &mut self.preferred_address,
+                    PreferredAddress::decode(&mut b)?,
+                )?,
                 0x000e => {
                     self.active_connection_id_limit = ActiveConnectionIdLimit::decode(&mut b)?
                 }
-                0x000f => {
-                    self.initial_source_connection_id = InitialSourceConnectionId::decode(&mut b)?
-                }
-                0x0010 => {
-                    self.retry_source_connection_id = RetrySourceConnectionId::decode(&mut b)?
-                }
+                0x000f => set_once(
+                    &mut self.initial_source_connection_id,
+                    InitialSourceConnectionId::decode(&mut b)?,
+                )?,
+                0x0010 => set_once(
+                    &mut self.retry_source_connection_id,
+                    RetrySourceConnectionId::decode(&mut b)?,
+                )?,
                 //0x00b6 => self.grease = Grease::decode(&mut b)?,
                 //0x0020 => self.max_datagram_frame_size = MaxDatagramFrameSize::decode(&mut b)?,
                 //0x2ab2 => self.grease_quic_bit = GreaseQuicBit::decode(&mut b)?,
@@ -572,22 +605,34 @@ impl TransportConfig {
         Ok(())
     }
 
-    pub fn encode(&self, _side: rustls::Side) -> Result<Vec<u8>, terror::Error> {
+    pub fn encode(&self, side: rustls::Side) -> Result<Vec<u8>, terror::Error> {
         let mut vec = vec![0u8; 1024];
         let written: usize;
-
         {
             let mut buf = OctetsMut::with_slice(&mut vec);
-
             macro_rules! write_tp {
+                (server $name:ident) => {
+                    if side == rustls::Side::Server {
+                        if let Some(p) = &self.$name {
+                            buf.put_varint(p.const_id() as u64)?;
+                            p.encode_value(&mut buf)?;
+                        }
+                    }
+                };
+                (opt $name:ident) => {
+                    if let Some(p) = &self.$name {
+                        buf.put_varint(p.const_id() as u64)?;
+                        p.encode_value(&mut buf)?;
+                    }
+                };
                 ($name:ident) => {
                     self.$name.encode(&mut buf)?;
                 };
             }
 
-            write_tp!(original_destination_connection_id);
+            write_tp!(server original_destination_connection_id);
             write_tp!(max_idle_timeout);
-            write_tp!(stateless_reset_token);
+            write_tp!(server stateless_reset_token);
             write_tp!(max_udp_payload_size);
             write_tp!(initial_max_data);
             write_tp!(initial_max_stream_data_bidi_local);
@@ -598,22 +643,13 @@ impl TransportConfig {
             write_tp!(ack_delay_exponent);
             write_tp!(max_ack_delay);
             write_tp!(disable_active_migration);
-            write_tp!(preferred_address);
+            write_tp!(server preferred_address);
             write_tp!(active_connection_id_limit);
-            write_tp!(initial_source_connection_id);
-            write_tp!(retry_source_connection_id);
-
-            //other transport params only after GREASE
-            //write_tp!(grease);
-            //write_tp!(max_datagram_frame_size);
-            //write_tp!(grease_quic_bit);
-            //write_tp!(min_ack_delay);
-
+            write_tp!(opt initial_source_connection_id);
+            write_tp!(server retry_source_connection_id);
             written = buf.off();
         }
-
         vec.resize(written, 0x00);
-
         Ok(vec)
     }
 
@@ -621,9 +657,7 @@ impl TransportConfig {
         (
             self.initial_max_data.get().get(),
             self.initial_max_stream_data_bidi_local.get().get(),
-            self.initial_max_stream_data_bidi_remote
-                .get()
-                .get(),
+            self.initial_max_stream_data_bidi_remote.get().get(),
             self.initial_max_stream_data_uni.get().get(),
             self.initial_max_streams_bidi.get().get(),
             self.initial_max_streams_uni.get().get(),
@@ -638,21 +672,19 @@ mod tests {
     #[test]
     fn test_transport_parameter_encoding() {
         let tpc = TransportConfig {
-            //grease: Grease::from(true),
-            //min_ack_delay: MinAckDelay::try_from(VarInt::from(1000)).unwrap(),
             ack_delay_exponent: AckDelayExponent::try_from(VarInt::from(5)).unwrap(),
-            original_destination_connection_id: OriginalDestinationConnectionId::try_from(
-                Id::from_slice(&[0xab, 0xab, 0xab, 0xab]),
-            )
-            .unwrap(),
+            original_destination_connection_id: Some(
+                OriginalDestinationConnectionId::try_from(Id::from_slice(&[
+                    0xab, 0xab, 0xab, 0xab,
+                ]))
+                .unwrap(),
+            ),
             ..TransportConfig::default()
         };
 
         let result = tpc.encode(rustls::Side::Server).unwrap();
 
-        let expected = vec![
-            0x00, 0x04, 0xab, 0xab, 0xab, 0xab, 0x0a, 0x01, 0x05,
-        ];
+        let expected = vec![0x00, 0x04, 0xab, 0xab, 0xab, 0xab, 0x0a, 0x01, 0x05];
 
         assert_eq!(result, expected);
     }
@@ -678,10 +710,97 @@ mod tests {
 
         assert_eq!(tpc.max_idle_timeout.get().get(), 10000);
         assert_eq!(
-            tpc.initial_source_connection_id.get().as_slice(),
+            tpc.initial_source_connection_id
+                .as_ref()
+                .unwrap()
+                .get()
+                .as_slice(),
             &vec![0x03, 0x25, 0x05, 0xd0, 0x49, 0x6f, 0x4c, 0x31]
         );
         assert_eq!(tpc.active_connection_id_limit.get().get(), 5);
-        //assert!(tpc.grease.get());
+    }
+
+    #[test]
+    fn round_trip_server_params() {
+        let cfg = TransportConfig {
+            original_destination_connection_id: Some(
+                OriginalDestinationConnectionId::try_from(Id::from_slice(&[
+                    0x01, 0x02, 0x03, 0x04,
+                ]))
+                .unwrap(),
+            ),
+            initial_source_connection_id: Some(
+                InitialSourceConnectionId::try_from(Id::from_slice(&[0xaa, 0xbb])).unwrap(),
+            ),
+            initial_max_data: InitialMaxData::try_from(VarInt::from(1_000_000)).unwrap(),
+            active_connection_id_limit: ActiveConnectionIdLimit::try_from(VarInt::from(8)).unwrap(),
+            ..TransportConfig::default()
+        };
+
+        let bytes = cfg.encode(rustls::Side::Server).unwrap();
+        let decoded = TransportConfig::decode(&bytes).unwrap();
+
+        assert_eq!(
+            decoded
+                .original_destination_connection_id
+                .as_ref()
+                .unwrap()
+                .get()
+                .as_slice(),
+            &[0x01, 0x02, 0x03, 0x04]
+        );
+        assert_eq!(
+            decoded
+                .initial_source_connection_id
+                .as_ref()
+                .unwrap()
+                .get()
+                .as_slice(),
+            &[0xaa, 0xbb]
+        );
+        assert_eq!(decoded.initial_max_data.get().get(), 1_000_000);
+        assert_eq!(decoded.active_connection_id_limit.get().get(), 8);
+    }
+
+    #[test]
+    fn client_omits_server_only_params() {
+        let cfg = TransportConfig {
+            original_destination_connection_id: Some(
+                OriginalDestinationConnectionId::try_from(Id::from_slice(&[0x01, 0x02])).unwrap(),
+            ),
+            initial_source_connection_id: Some(
+                InitialSourceConnectionId::try_from(Id::from_slice(&[0x09])).unwrap(),
+            ),
+            ..TransportConfig::default()
+        };
+
+        let decoded = TransportConfig::decode(&cfg.encode(rustls::Side::Client).unwrap()).unwrap();
+
+        assert!(
+            decoded.original_destination_connection_id.is_none(),
+            "server-only param must not be emitted by a client"
+        );
+        assert_eq!(
+            decoded
+                .initial_source_connection_id
+                .as_ref()
+                .unwrap()
+                .get()
+                .as_slice(),
+            &[0x09]
+        );
+    }
+
+    #[test]
+    fn oversize_connection_id_is_rejected() {
+        let mut raw = vec![0x00, 0x15];
+        raw.extend(std::iter::repeat(0xcd).take(21));
+        assert!(TransportConfig::decode(&raw).is_err());
+    }
+
+    #[test]
+    fn duplicate_parameter_is_rejected() {
+        let raw = vec![0x0f, 0x01, 0xaa, 0x0f, 0x01, 0xbb];
+        assert!(TransportConfig::decode(&raw).is_err());
     }
 }

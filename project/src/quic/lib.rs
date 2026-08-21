@@ -255,13 +255,14 @@ impl Inner {
             cid::ConnectionIdManager::as_server(head.scid.unwrap(), head.dcid, 4, hmac_reset_key);
 
         let mut tpc = TransportConfig {
-            original_destination_connection_id: OriginalDestinationConnectionId::try_from(
+            original_destination_connection_id: Some(OriginalDestinationConnectionId::try_from(
                 head.dcid,
-            )?,
-            initial_source_connection_id: InitialSourceConnectionId::try_from(initial_scid)?,
-            stateless_reset_token: StatelessResetTokenTP::try_from(srt)?,
+            )?),
+            initial_source_connection_id: Some(InitialSourceConnectionId::try_from(initial_scid)?),
+            stateless_reset_token: Some(StatelessResetTokenTP::try_from(srt)?),
             max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
             active_connection_id_limit: ActiveConnectionIdLimit::try_from(VarInt::from(4))?,
+            // TODO retry_source_connection_id, preferred_address
             ..TransportConfig::default()
         };
 
@@ -337,11 +338,8 @@ impl Inner {
         let (cim, dcid, scid) = cid::ConnectionIdManager::as_client(4);
 
         let mut tpc = TransportConfig {
-            original_destination_connection_id: OriginalDestinationConnectionId::try_from(dcid)?,
-            initial_source_connection_id: InitialSourceConnectionId::try_from(scid)?,
-            stateless_reset_token: StatelessResetTokenTP::try_from(
-                token::StatelessResetToken::new(hmac_reset_key, &scid),
-            )?,
+            original_destination_connection_id: None, // server-only; never set on a client
+            initial_source_connection_id: Some(InitialSourceConnectionId::try_from(scid)?),
             max_udp_payload_size: MaxUdpPayloadSize::try_from(VarInt::from(1472))?,
             active_connection_id_limit: ActiveConnectionIdLimit::try_from(VarInt::from(4))?,
             ..TransportConfig::default()
@@ -352,7 +350,7 @@ impl Inner {
         let mut sm = StreamManager::new(smc, Side::Client as u8);
         sm.fill_initial_local_tpc(&mut tpc)?;
 
-        let data = tpc.encode(Side::Server)?;
+        let data = tpc.encode(Side::Client)?;
 
         let conn = RustlsConnection::Client(
             rustls::quic::ClientConnection::new(
@@ -984,6 +982,12 @@ impl Inner {
                             .received_pns
                             .remove_below(largest + 1);
                     }
+                    cc::SentFrame::NewCid { .. } => {
+                        self.cidm.ack_new_connection_id_frame();
+                    }
+                    cc::SentFrame::RetireCid { .. } => {
+                        self.cidm.ack_retire_connection_id_frame();
+                    }
                     _ => (),
                 }
             }
@@ -1031,36 +1035,67 @@ impl Inner {
 
         if self.remote_tpc.is_none() {
             if let Some(raw) = self.tls_session.quic_transport_parameters() {
-                match TransportConfig::decode(raw) {
-                    Ok(tpc) => self.remote_tpc = Some(tpc),
-                    Err(e) => {
-                        return Err(e);
-                    }
-                }
-
+                let tpc = TransportConfig::decode(raw)?;
+                self.remote_tpc = Some(tpc);
                 let rtpc = self.remote_tpc.as_ref().unwrap();
 
-                // register stream limits in stream manager
-                let (imd, imsdbl, imsdbr, imsdu, imsb, imsu) = rtpc.get_initial_limits();
+                let tp_err = |m: &'static str| {
+                    terror::Error::quic_transport_error(
+                        m,
+                        terror::QuicTransportError::TransportParameterError,
+                    )
+                };
+                let is_server = self.side == Side::Server;
 
+                // initial scid: both sides, must be present and equal the peer's actual initial scid
+                match rtpc.initial_source_connection_id.as_ref() {
+                    Some(iscid) if iscid.get() == self.cidm.get_dcid() => {}
+                    Some(_) => return Err(tp_err("initial_source_connection_id mismatch")),
+                    None => return Err(tp_err("missing initial_source_connection_id")),
+                }
+
+                // original dcid: client-only, server must reject if a client sent one
+                match (&rtpc.original_destination_connection_id, is_server) {
+                    (Some(_), true) => {
+                        return Err(tp_err("client sent original_destination_connection_id"))
+                    }
+                    (Some(odcid), false) => {
+                        let local_odcid = self.cidm.original_dcid().ok_or_else(|| {
+                            terror::Error::fatal("client has no original dcid to validate against")
+                        })?;
+                        if odcid.get() != local_odcid {
+                            return Err(tp_err("original_destination_connection_id mismatch"));
+                        }
+                    }
+                    (None, false) => {
+                        return Err(tp_err("missing original_destination_connection_id"))
+                    }
+                    (None, true) => {}
+                }
+
+                // stateless_reset_token: server-only, client stores it, server rejects
+                if let Some(_srt) = rtpc.stateless_reset_token.as_ref() {
+                    if is_server {
+                        return Err(tp_err("client sent stateless_reset_token"));
+                    }
+                    // TODO(client) register `_srt` as the reset token for the server's active handshake cid
+                }
+
+                // stream / flow-control limits
+                let (imd, imsdbl, imsdbr, imsdu, imsb, imsu) = rtpc.get_initial_limits();
                 self.sm.set_initial_data_limits(imsdbl, imsdbr, imsdu);
                 self.sm.set_max_data(imd);
                 self.sm.set_max_streams_bidi(imsb);
                 self.sm.set_max_streams_uni(imsu);
 
-                // the peers initial_source_connection_id should have been saved as our first dcid
-                if rtpc.initial_source_connection_id.get() != self.cidm.get_dcid() {
-                    return Err(terror::Error::quic_transport_error(
-                        "scids from packet header and transport parameters differ",
-                        terror::QuicTransportError::TransportParameterError,
-                    ));
+                // active_connection_id_limit
+                let acidl = rtpc.active_connection_id_limit.get().get();
+                if acidl < 2 {
+                    return Err(tp_err("active_connection_id_limit below 2"));
                 }
+                self.cidm.set_peer_cid_limit(acidl);
 
-                // set peers connection id limit
-                self.cidm
-                    .set_peer_cid_limit(rtpc.active_connection_id_limit.get().get());
-
-                // set congestion control values
+                // congestion control
                 self.paths
                     .active_mut()
                     .cc_mut()
@@ -1068,6 +1103,11 @@ impl Inner {
                 self.paths.active_mut().cc_mut().set_max_ack_delay(
                     std::time::Duration::from_millis(rtpc.max_ack_delay.get().get()),
                 );
+
+                // TODO max_udp_payload_size
+                // TODO max_idle_timeout
+                // TODO disable_active_migration
+                // TODO preferred_address
             }
         }
 
@@ -1431,6 +1471,7 @@ impl Inner {
                         tracing::trace!(%id, sqn, rpt, "encoded NEW_CONNECTION_ID frame: {:?}", &buf.buf()[start..buf.off()]);
                         self.events.push(InnerEvent::NewConnectionId(id));
                         frames.push(cc::SentFrame::NewCid { seq: sqn });
+                        self.cidm.add_new_connection_id_frame();
                         ack_eliciting = true;
                     }
                 }
@@ -1449,6 +1490,7 @@ impl Inner {
                         &buf.buf()[start..buf.off()]
                     );
                     frames.push(cc::SentFrame::RetireCid { seq: sqn });
+                    self.cidm.add_retire_connection_id_frame();
                     ack_eliciting = true;
                 }
 
@@ -1486,8 +1528,7 @@ impl Inner {
 
                 // create MAX_DATA for connection, buffer req: frame code (1) + max max_data (8)
                 if self.sm.nearly_full()
-                    && buf.cap()
-                        >= 0x01 + varint_len(self.sm.max_data() + fc::MAX_WINDOW_CONNECTION)
+                    && buf.cap() > varint_len(self.sm.max_data() + fc::MAX_WINDOW_CONNECTION)
                 {
                     let n_md = self.sm.upgrade_max_data();
                     let start = buf.off();
