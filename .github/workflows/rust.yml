@@ -1,22 +1,17 @@
-name: Rust
-
-on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
-
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   build:
-
-    runs-on: ubuntu-latest
-
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-poll,  flags: "" }
+          - { os: ubuntu-latest, name: linux-uring, flags: "--features uring_backend" }
+          - { os: macos-latest,  name: macos-poll,  flags: "" }
+    name: build (${{ matrix.name }})
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Build
-      run: cd project && cargo build --verbose
+      run: cd project && cargo build --verbose ${{ matrix.flags }}
     - name: Run tests
-      run: cd project && cargo test --verbose
+      run: cd project && cargo test --verbose ${{ matrix.flags }}

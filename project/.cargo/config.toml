@@ -1,0 +1,4 @@
+[alias]
+bu = "build --features uring_backend"
+tu = "test --features uring_backend"
+cu = "check --features uring_backend"

@@ -14,13 +14,13 @@ This repository contains my bachelor thesis from Heinrich-Heine Universität Dü
 
 ## Key Features
 
-The QUIC library is still under active development and some features are not yet implemented. As I lack the resources of the likes of Amazon, Cloudflare and co, and I am actively studying and working, development may only progress slowly. The API may undergo breaking changes regularly until I reach a stable state. The following features are implemented:
+The QUIC library is still under active development and some features are not yet implemented. Also, it is not yet published on crates.io because I feel like there is a lot more to be dont until the library is ready. As I lack the resources of the likes of Amazon, Cloudflare and co, and I am actively studying and working, development may only progress slowly. The API may undergo breaking changes regularly until I reach a stable state. The following features are implemented:
 
 * QUIC 1-RTT handshake
 * QUIC stream implementation
 * QUIC flow control
 * QUIC congestion control
-* Sophisticated io layer ontop of core lib with fast paths for macos and linux, polling backend for linux and macos, io_uring backend for linux (wip), gso/gro support under both linux backends, custom runtime, offload thread pool and sharded endpoint design for server applications
+* Sophisticated io layer ontop of core lib with fast paths for macos and linux, polling backend for linux and macos, io_uring backend for linux, gso/gro support under both linux backends, custom runtime, offload thread pool and sharded endpoint design for server applications
 * Full TLS 1.3 integration using <a href="https://github.com/rustls/rustls">rustls</a>
 * Server and Client API (see docs)
 
@@ -37,7 +37,7 @@ Taurus targets Linux and macOS.
 | Default backend                       | 3.9            |
 | Default backend, gso enabled          | 4.18           |
 | Default backend, gro enabled          | 5.0            |
-| `uring_backend` feature (wip)         | 6.0            |
+| `uring_backend` feature               | 6.0            |
 
 GSO/GRO are opt-in and off by default. Enabling gro on a kernel older than 5.0 is handled silently. Enabling gso on a kernel older than 4.18 will produce as a send error.
 
@@ -68,7 +68,7 @@ $ cd taurus/project/ && cargo build
 
 ### Custom Features
 
-#### io_uring (wip)
+#### io_uring
 
 By default the library uses a portable (p)poll + sendmmsg/recvmmsg polling based io backend that runs on both linux and macOS. On linux you can opt into an io_uring backend instead by enabling the uring_backend feature. Its implicitly linux only and requires linux 6.0 or newer, since teardown relies on synchronous cancellation (IORING_REGISTER_SYNC_CANCEL). I chose to make it optional as it had a lot of vulnerabilities since it was introduced. Enable it like this:
 

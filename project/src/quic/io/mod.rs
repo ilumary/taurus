@@ -1,9 +1,9 @@
 pub(crate) mod buffer;
 
-/*#[cfg(feature = "uring_backend")]
+#[cfg(feature = "uring_backend")]
 mod uring;
 #[cfg(feature = "uring_backend")]
-pub(crate) use uring::Io;*/
+pub(crate) use uring::Io;
 
 #[cfg(not(feature = "uring_backend"))]
 mod poll_io;
@@ -11,13 +11,10 @@ mod poll_io;
 pub(crate) use poll_io::Io;
 
 use std::{
-    cell::{Cell, RefCell},
     io,
     net::SocketAddr,
     os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    rc::Rc,
     sync::Arc,
-    time::Instant,
 };
 
 /// configuration for the backend
@@ -30,7 +27,7 @@ pub struct BatchConfig {
     pub send_slots: usize,
 
     /// bytes of send ring storage. must hold several batches of the largest send,
-    /// which is `max_gso_segments * mtu` once gso is on
+    /// which is `max_gso_segments * mtu` to support gso
     pub send_ring: usize,
 
     /// maximum number of datagrams yielded by a single receive
@@ -282,7 +279,7 @@ pub fn bind(addr: SocketAddr, config: &BatchConfig, waker: CrossThreadWaker) -> 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::time::{Instant, Duration};
 
     pub use buffer::RecvBuf;
 

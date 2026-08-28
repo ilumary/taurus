@@ -1,8 +1,19 @@
-use super::*;
+use std::{
+    io,
+    rc::Rc,
+    net::SocketAddr,
+    time::Instant,
+    cell::{Cell, RefCell, UnsafeCell},
+    collections::VecDeque,
+    os::unix::io::AsRawFd
+};
 
-use std::{cell::UnsafeCell, collections::VecDeque, os::unix::io::AsRawFd};
-
-use crate::io::buffer::{RecvBuf, RecvPool, SendBatch, SendPool};
+use crate::io::{
+    addr_to_storage, bind_reuseport,
+    buffer::{RecvBuf, RecvPool, SendBatch, SendPool},
+    ecn_from_control, storage_to_addr, BatchConfig, Capabilities, CmsgBuf, CrossThreadWaker,
+    MAX_GSO_BYTES, MAX_GSO_SEGMENTS,
+};
 
 // macOS and iOS private SPI for batched receive. not in `libc`
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -35,7 +46,7 @@ struct SendMeta {
     name: libc::sockaddr_storage,
     namelen: libc::socklen_t,
 
-    /// UDP_SEGMENT size for a GSO batch, 0 for a single datagram (linux only)
+    /// GSO segment size, 0 for a single datagram (linux only)
     seg: u32,
 }
 
