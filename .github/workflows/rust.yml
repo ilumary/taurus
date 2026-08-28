@@ -19,7 +19,7 @@ jobs:
           - { os: macos-latest,  name: macos-poll,  flags: "" }
     name: build (${{ matrix.name }})
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - name: Build
       run: cd project && cargo build --verbose ${{ matrix.flags }}
     - name: Run tests
